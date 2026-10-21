@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   approveB2BOrder,
+  settleB2BOrder,
   createB2BOrder,
   fetchB2BOrders,
   fetchB2BPortal,
@@ -242,6 +243,18 @@ function B2BShopLive() {
     }
   };
 
+  // v8.1: 월말 정산·세금계산서 주문을 결제 완료로 확정 (관리자만)
+  const settleOrder = async (order) => {
+    if (!window.confirm(`${order.order_number} 주문의 정산(입금)을 확인했나요? '결제 완료'로 바꿉니다.`)) return;
+    try {
+      const updated = await settleB2BOrder(order.order_id);
+      await reloadPurchases();
+      setNotice(`${updated.order_number} 주문을 정산 완료 처리했습니다.`);
+    } catch (requestError) {
+      setError(requestError.response?.data?.detail || "정산 완료 처리하지 못했습니다.");
+    }
+  };
+
   const payOrder = async (order) => {
     try {
       const result = await prepareB2BPayment(order.order_id);
@@ -443,7 +456,7 @@ function B2BShopLive() {
         <section className="b2b-orders-view"><div className="b2b-view-heading"><div><h2>기관 주문 내역</h2><p>주문 품목을 다시 담아 반복 발주할 수 있습니다.</p></div><div className="b2b-refill-badge">소모품 재구매 주기 관리 {refillProducts.length}종</div></div>
           <div className="b2b-refill-strip"><div><strong>소모품 재구매 확인</strong><span>{refillProducts.map((product) => product.name).join(" · ") || "등록된 소모품이 없습니다."}</span></div><button type="button" className="btn ghost sm" disabled={!refillProducts.length} onClick={() => refillProducts.forEach((product) => addToCart(product))}>소모품 담기</button></div>
           {!recentOrders.length && <div className="b2b-empty">아직 저장된 주문이 없습니다. 상품 발주 후 이곳에서 주문 상태를 확인하세요.</div>}
-          {recentOrders.map((order) => <OrderRow key={order.order_id} order={order} canApprove={false} onStatus={changeOrderStatus} onPay={payOrder} onReorder={reorder} onQuote={() => setQuote({ items: order.items.map((item) => ({ ...item, unitPrice: item.unit_price })), total: order.total, createdAt: order.created_at, paymentMethod: order.payment_method })} />)}
+          {recentOrders.map((order) => <OrderRow key={order.order_id} order={order} canApprove={false} onStatus={changeOrderStatus} onPay={payOrder} onSettle={isOwner ? settleOrder : null} onReorder={reorder} onQuote={() => setQuote({ items: order.items.map((item) => ({ ...item, unitPrice: item.unit_price })), total: order.total, createdAt: order.created_at, paymentMethod: order.payment_method })} />)}
         </section>
       )}
 
@@ -453,11 +466,11 @@ function B2BShopLive() {
   );
 }
 
-function OrderRow({ order, canApprove, onStatus, onReorder, onQuote, onPay }) {
+function OrderRow({ order, canApprove, onStatus, onReorder, onQuote, onPay, onSettle }) {
   const statusLabels = { PENDING_APPROVAL: "승인 대기", AWAITING_PAYMENT: "결제 대기", SETTLEMENT_PENDING: "정산 대기", PAID: "결제 완료", REJECTED: "반려" };
   const statusLabel = statusLabels[order.status] || order.status;
   const statusClass = order.status === "PENDING_APPROVAL" ? "pending" : ["PAID", "SETTLEMENT_PENDING"].includes(order.status) ? "approved" : "rejected";
-  return <article className="b2b-order-row"><div className="b2b-order-main"><div className="b2b-order-meta"><strong>{order.order_number}</strong><span>{formatDate(order.created_at)}</span><span className={`b2b-status ${statusClass}`}>{statusLabel}</span></div><strong className="b2b-order-title">{order.items.map((item) => `${item.name} ${item.quantity}${item.unit}`).join(" · ")}</strong><span className="b2b-order-detail">{order.class_name} · {order.payment_method}</span></div><div className="b2b-order-end"><strong>{money(order.total)}</strong><div><button type="button" className="btn ghost sm" onClick={onQuote}>견적 보기</button>{onReorder && <button type="button" className="btn ghost sm" onClick={() => onReorder(order)}>다시 주문</button>}{order.status === "AWAITING_PAYMENT" && onPay && <button type="button" className="btn sm" onClick={() => onPay(order)}>카카오페이 결제</button>}{order.status === "PENDING_APPROVAL" && canApprove && <><button type="button" className="btn sm" onClick={() => onStatus(order.order_id, "APPROVED")}>승인</button><button type="button" className="btn danger sm" onClick={() => onStatus(order.order_id, "REJECTED")}>반려</button></>}</div></div></article>;
+  return <article className="b2b-order-row"><div className="b2b-order-main"><div className="b2b-order-meta"><strong>{order.order_number}</strong><span>{formatDate(order.created_at)}</span><span className={`b2b-status ${statusClass}`}>{statusLabel}</span></div><strong className="b2b-order-title">{order.items.map((item) => `${item.name} ${item.quantity}${item.unit}`).join(" · ")}</strong><span className="b2b-order-detail">{order.class_name} · {order.payment_method}</span></div><div className="b2b-order-end"><strong>{money(order.total)}</strong><div><button type="button" className="btn ghost sm" onClick={onQuote}>견적 보기</button>{onReorder && <button type="button" className="btn ghost sm" onClick={() => onReorder(order)}>다시 주문</button>}{order.status === "AWAITING_PAYMENT" && onPay && <button type="button" className="btn sm" onClick={() => onPay(order)}>카카오페이 결제</button>}{order.status === "SETTLEMENT_PENDING" && onSettle && <button type="button" className="btn sm" onClick={() => onSettle(order)}>정산 완료</button>}{order.status === "PENDING_APPROVAL" && canApprove && <><button type="button" className="btn sm" onClick={() => onStatus(order.order_id, "APPROVED")}>승인</button><button type="button" className="btn danger sm" onClick={() => onStatus(order.order_id, "REJECTED")}>반려</button></>}</div></div></article>;
 }
 
 function QuoteDocument({ quote, academy }) {

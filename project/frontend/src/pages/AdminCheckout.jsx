@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-// ✨ 수정, 삭제 API 함수를 추가로 불러옵니다.
-import { fetchInvoices, fetchPayments, kakaoReady, fetchMembers, createInvoice, updateInvoice, deleteInvoice } from "../api";
+import {
+  fetchInvoices, fetchPayments, kakaoReady, fetchMembers, createInvoice, updateInvoice, deleteInvoice,
+  markInvoicePaid, bulkCreateInvoices, fetchClasses, errorText, localToday,
+} from "../api";
+
+const METHOD_LABEL = { CASH: "현금", TRANSFER: "계좌이체", CARD: "카드(현장)", KAKAOPAY: "카카오페이" };
 
 const won = (n) => (n != null ? `₩${Number(n).toLocaleString()}` : "₩0");
 const formatDate = (value) => value ? new Date(value).toLocaleDateString("ko-KR") : "-";
@@ -15,6 +19,11 @@ export default function AdminCheckout() {
   const [statusFilter, setStatusFilter] = useState("UNPAID");
   const [invoiceForm, setInvoiceForm] = useState({ member_id: "", item_name: "수강료", amount: "", due_date: "" });
   const [isCreating, setIsCreating] = useState(false);
+  // v8.1 현장 수납 / 월 청구 일괄 발행
+  const [payingInvoice, setPayingInvoice] = useState(null);   // { invoice, method }
+  const [classes, setClasses] = useState([]);
+  const [bulkForm, setBulkForm] = useState(() => ({ item_name: `${new Date().getMonth() + 1}월 수강료`, class_id: "", amount: "", due_date: "" }));
+  const [bulkBusy, setBulkBusy] = useState(false);
 
   // ✨ 청구서 수정(Edit)을 위한 상태 관리
   const [editingInvoice, setEditingInvoice] = useState(null);
@@ -37,6 +46,7 @@ export default function AdminCheckout() {
         fetchPayments(),
         fetchMembers({ status: "ACTIVE" }),
       ]);
+      fetchClasses().then((c) => setClasses(Array.isArray(c) ? c : [])).catch(() => setClasses([]));
       setAllInvoices(Array.isArray(invoices) ? invoices : []);
       setPayments(Array.isArray(listPayments) ? listPayments : []);
       setMembers(Array.isArray(membersData) ? membersData : []);
@@ -81,8 +91,8 @@ export default function AdminCheckout() {
 
   const overdueCount = useMemo(() => {
     if (!Array.isArray(unpaidInvoices)) return 0;
-    const today = new Date();
-    return unpaidInvoices.filter((inv) => inv.due_date && new Date(inv.due_date) < today).length;
+    const today = localToday();
+    return unpaidInvoices.filter((inv) => inv.due_date && inv.due_date < today).length;
   }, [unpaidInvoices]);
 
   const handlePay = async (invoice) => {
@@ -166,6 +176,39 @@ export default function AdminCheckout() {
     }
   };
 
+  // 현장 수납(현금·이체·카드 단말기) — 금액은 서버가 청구서 값으로 확정
+  const handleMarkPaid = async () => {
+    if (!payingInvoice) return;
+    try {
+      await markInvoicePaid(payingInvoice.invoice.invoice_id, { method: payingInvoice.method });
+      setPayingInvoice(null);
+      await loadData();
+    } catch (err) {
+      alert(errorText(err, "수납 처리하지 못했습니다."));
+    }
+  };
+
+  const handleBulkCreate = async () => {
+    if (!bulkForm.item_name.trim()) return setError("청구 항목을 입력하세요.");
+    const target = bulkForm.class_id ? classes.find((c) => String(c.class_id) === String(bulkForm.class_id))?.name : "재원생 전체";
+    if (!window.confirm(`${target}에게 '${bulkForm.item_name}' 청구서를 발행할까요?\n같은 항목의 미납 청구서가 이미 있는 학생은 건너뜁니다.`)) return;
+    setBulkBusy(true); setError("");
+    try {
+      const result = await bulkCreateInvoices({
+        item_name: bulkForm.item_name.trim(), class_id: bulkForm.class_id ? Number(bulkForm.class_id) : null,
+        amount: bulkForm.amount ? Number(bulkForm.amount) : null, due_date: bulkForm.due_date || null,
+      });
+      alert(`청구서 ${result.created}건 · ${won(result.total_amount)} 발행` +
+        (result.skipped_existing ? `\n이미 같은 미납 청구서가 있어 건너뜀 ${result.skipped_existing}명` : "") +
+        (result.skipped_no_fee ? `\n수강료 미설정으로 건너뜀 ${result.skipped_no_fee}명 (설정 → 결제 정보에서 반별 수강료 입력)` : ""));
+      await loadData();
+    } catch (err) {
+      setError(errorText(err, "청구서를 발행하지 못했습니다."));
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
   const recentPayments = useMemo(() => {
     if (!Array.isArray(payments)) return [];
     return payments.slice(0, 8);
@@ -175,8 +218,8 @@ export default function AdminCheckout() {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 16, marginBottom: 20 }}>
         <div>
-          <h2 className="page-title" style={{ marginBottom: 2 }}>원격결제 관리</h2>
-          <p className="page-subtitle" style={{ margin: 0 }}>실제 결제 이력과 현재 미납 청구서를 한 곳에서 확인합니다.</p>
+          <h2 className="page-title" style={{ marginBottom: 2 }}>수납·청구 관리</h2>
+          <p className="page-subtitle" style={{ margin: 0 }}>청구서 발행(개별·일괄), 카카오페이 원격결제, 현장 수납을 한 곳에서 처리합니다. 발행·납부 시 학부모 포털로 알림이 갑니다.</p>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button className="btn sm ghost" onClick={loadData} disabled={loading}>
@@ -258,7 +301,7 @@ export default function AdminCheckout() {
           </div>
         </div>
 
-        {/* 결제 현황 요약 영역 (기존 유지) */}
+        {/* 결제 현황 요약 + 월 청구 일괄 발행 */}
         <div className="card">
           <div className="card-head">
             <h3 className="card-title">결제 현황 요약</h3>
@@ -286,6 +329,22 @@ export default function AdminCheckout() {
               </div>
               <div className="right">{Array.isArray(payments) ? won(payments.reduce((sum, p) => sum + (p.amount || 0), 0)) : "-"}</div>
             </div>
+          </div>
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px dashed var(--border)" }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>🧾 월 청구 일괄 발행</div>
+            <div className="card-sub" style={{ marginBottom: 10 }}>금액을 비우면 설정의 반별 수강료(없으면 기본 수강료)로 학생마다 계산합니다.</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <input className="input" value={bulkForm.item_name} onChange={(e) => setBulkForm({ ...bulkForm, item_name: e.target.value })} placeholder="청구 항목" />
+              <select className="input" value={bulkForm.class_id} onChange={(e) => setBulkForm({ ...bulkForm, class_id: e.target.value })}>
+                <option value="">재원생 전체</option>
+                {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name}</option>)}
+              </select>
+              <input className="input" type="number" min="1" value={bulkForm.amount} onChange={(e) => setBulkForm({ ...bulkForm, amount: e.target.value })} placeholder="금액(비우면 자동)" />
+              <input className="input" type="date" value={bulkForm.due_date} onChange={(e) => setBulkForm({ ...bulkForm, due_date: e.target.value })} title="납부 기한" />
+            </div>
+            <button className="btn" style={{ marginTop: 10, width: "100%" }} onClick={handleBulkCreate} disabled={bulkBusy || loading}>
+              {bulkBusy ? "발행 중…" : "일괄 발행"}
+            </button>
           </div>
         </div>
       </div>
@@ -329,7 +388,7 @@ export default function AdminCheckout() {
             <div style={{ display: "grid", gap: 12 }}>
               {filteredInvoices.map((invoice) => {
                 const due = invoice.due_date ? formatDate(invoice.due_date) : "기한 없음";
-                const isOverdue = invoice.due_date ? new Date(invoice.due_date) < new Date() : false;
+                const isOverdue = invoice.status === "UNPAID" && invoice.due_date ? invoice.due_date < localToday() : false;
                 return (
                   <div key={invoice.invoice_id} className="list-row" style={{ alignItems: "center" }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -341,7 +400,7 @@ export default function AdminCheckout() {
                       <div style={{ fontWeight: 700, marginBottom: 6 }}>{won(invoice.amount)}</div>
 
                       <div style={{ display: "flex", gap: 4, justifyContent: "flex-end", marginBottom: 8 }}>
-                        <div className={`badge ${isOverdue ? "danger" : "warning"} no-dot`} style={{ marginRight: "auto" }}>
+                        <div className={`badge ${invoice.status === "PAID" ? "success" : isOverdue ? "danger" : "warning"} no-dot`} style={{ marginRight: "auto" }}>
                           {isOverdue ? "연체" : invoice.status === "PAID" ? "납부완료" : "미납"}
                         </div>
                         {/* ✨ 상태가 미납일 때만 수정/삭제 버튼 표시 */}
@@ -353,9 +412,14 @@ export default function AdminCheckout() {
                         )}
                       </div>
 
-                      <button className="btn outline sm" style={{ width: "100%" }} onClick={() => handlePay(invoice)} disabled={invoice.status === "PAID"}>
-                        {invoice.status === "PAID" ? "결제 완료" : "결제 링크 열기"}
-                      </button>
+                      {invoice.status === "PAID" ? (
+                        <button className="btn outline sm" style={{ width: "100%" }} disabled>결제 완료</button>
+                      ) : (
+                        <div style={{ display: "flex", gap: 4 }}>
+                          <button className="btn sm" style={{ flex: 1 }} onClick={() => setPayingInvoice({ invoice, method: "CASH" })} title="현금·계좌이체·카드 단말기로 받은 경우">현장 수납</button>
+                          <button className="btn outline sm" style={{ flex: 1 }} onClick={() => handlePay(invoice)} title="카카오페이 결제창 열기">카카오페이</button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -382,7 +446,7 @@ export default function AdminCheckout() {
                 <div key={payment.payment_id} className="list-row" style={{ flexWrap: "wrap", gap: 10 }}>
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div className="title">{payment.member_name || "알 수 없음"}</div>
-                    <div className="meta">{payment.method} · {payment.payment_type}</div>
+                    <div className="meta">{METHOD_LABEL[payment.method] || payment.method || "-"} · {payment.note || payment.payment_type}</div>
                   </div>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontWeight: 700 }}>{won(payment.amount)}</div>
@@ -396,6 +460,29 @@ export default function AdminCheckout() {
       </div>
 
       {/* ✨ 청구서 수정용 모달(Modal) */}
+      {payingInvoice && (
+        <div className="modal-backdrop" onClick={() => setPayingInvoice(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
+            <h3>현장 수납 처리</h3>
+            <p className="meta" style={{ marginBottom: 12 }}>
+              {payingInvoice.invoice.member_name} · {payingInvoice.invoice.item_name} · <b>{won(payingInvoice.invoice.amount)}</b><br />
+              실제로 돈을 받은 뒤에 눌러 주세요. 결제 이력에 기록되고 학부모에게 납부 확인 알림이 갑니다.
+            </p>
+            <div className="segmented" style={{ marginBottom: 12 }}>
+              {["CASH", "TRANSFER", "CARD"].map((m) => (
+                <button key={m} type="button" className={payingInvoice.method === m ? "active" : ""} onClick={() => setPayingInvoice({ ...payingInvoice, method: m })}>
+                  {METHOD_LABEL[m]}
+                </button>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={() => setPayingInvoice(null)}>취소</button>
+              <button className="btn" onClick={handleMarkPaid}>{METHOD_LABEL[payingInvoice.method]} 수납 완료</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {editingInvoice && (
         <div className="modal-backdrop" onClick={() => setEditingInvoice(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>

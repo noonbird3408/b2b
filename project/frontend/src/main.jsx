@@ -17,6 +17,7 @@ const AdminCheckout = lazy(() => import("./pages/AdminCheckout.jsx"));
 const Shop = lazy(() => import("./pages/Shop.jsx"));
 const B2BShop = lazy(() => import("./pages/B2BShopLive.jsx"));
 const ParentPortal = lazy(() => import("./pages/ParentPortal.jsx"));
+const Kiosk = lazy(() => import("./pages/Kiosk.jsx"));
 
 const Loading = () => <div className="auth-loading">화면을 불러오는 중입니다.</div>;
 
@@ -31,6 +32,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(
           <Route path="/checkout" element={<ParentPortal />} />
           {/* 관리자 */}
           <Route path="/b2b-shop" element={<B2BShop />} />
+          {/* 출석 키오스크 (관리자·직원 세션으로 연 태블릿 — 전체 화면이라 Layout 밖) */}
+          <Route path="/kiosk" element={<Kiosk />} />
           <Route element={<Layout />}>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/members" element={<Members />} />

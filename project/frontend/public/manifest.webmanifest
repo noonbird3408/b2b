@@ -1,0 +1,11 @@
+{
+  "name": "시설 통합 관리 시스템",
+  "short_name": "시설관리",
+  "description": "학원·체육관·도장 통합 관리 — 출석 키오스크, 학부모 포털",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#3B82F6",
+  "lang": "ko",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

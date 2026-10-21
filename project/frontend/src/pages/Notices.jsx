@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
-// 💡 fetchAcademyInfo(학원 정보를 가져오는 API)를 추가로 임포트합니다. 실제 API 명칭에 맞게 수정하세요.
-import { fetchNotices, createNotice, updateNotice, deleteNotice, fetchAcademyInfo } from "../api";
-import { analyzeDataWithAI } from "../api";
+import { fetchNotices, createNotice, updateNotice, deleteNotice, fetchAcademyInfo, fetchClasses, analyzeDataWithAI, errorText } from "../api";
 
 const CATEGORY_LABEL = { GENERAL: "일반", EVENT: "행사", URGENT: "긴급" };
 const CATEGORY_BADGE = { GENERAL: "gray", EVENT: "primary", URGENT: "danger" };
@@ -12,18 +10,30 @@ export default function Notices({ role = "owner" }) {
   const [showManageModal, setShowManageModal] = useState(false);
   const [editNotice, setEditNotice] = useState(null);
   const [error, setError] = useState(null);
+  const [classes, setClasses] = useState([]);
+  const [classFilter, setClassFilter] = useState("");   // "" 전체 / "general" 전체 공지만 / class_id
 
   const load = () => {
-    fetchNotices().then(setNotices).catch((e) => setError(e.message));
+    fetchNotices().then(setNotices).catch((e) => setError(errorText(e, "공지를 불러오지 못했습니다.")));
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    fetchClasses().then((c) => setClasses(Array.isArray(c) ? c : [])).catch(() => setClasses([]));
+  }, []);
+
+  const visibleNotices = notices.filter((n) => !classFilter
+    || (classFilter === "general" ? !n.class_id : String(n.class_id) === String(classFilter)));
 
   // 단일 삭제
   const onDelete = async (id) => {
     if (!confirm("이 공지사항을 삭제하시겠습니까?")) return;
-    await deleteNotice(id);
-    load();
+    try {
+      await deleteNotice(id);
+      load();
+    } catch (e) {
+      setError(errorText(e, "공지를 삭제하지 못했습니다."));
+    }
   };
 
   // 다중 삭제 (Promise.all을 사용해 여러 개의 삭제 요청을 동시에 처리)
@@ -52,11 +62,16 @@ export default function Notices({ role = "owner" }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: "16px" }}>
         <div>
           <h2 className="page-title" style={{ marginBottom: "8px" }}>공지사항</h2>
-          <p className="page-subtitle" style={{ margin: 0 }}>시설 운영 공지를 작성하고 관리합니다.</p>
+          <p className="page-subtitle" style={{ margin: 0 }}>전체 공지는 모든 학부모에게, 반 공지는 그 반 학부모에게만 보입니다. 읽음 수는 학부모 포털에서 열어 본 수입니다.</p>
         </div>
 
         {role === "owner" && (
-          <div style={{ display: "flex", gap: "8px" }}>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <select className="select" value={classFilter} onChange={(e) => setClassFilter(e.target.value)} aria-label="공지 대상 필터">
+              <option value="">모든 공지</option>
+              <option value="general">전체 공지만</option>
+              {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name} 공지</option>)}
+            </select>
             <button className="btn outline" onClick={() => setShowManageModal(true)}>⚙️ 공지 관리</button>
             <button className="btn" onClick={() => { setEditNotice(null); setShowModal(true); }}>+ 새 공지 작성</button>
           </div>
@@ -65,11 +80,11 @@ export default function Notices({ role = "owner" }) {
 
       {error && <div className="error-banner">{error}</div>}
 
-      {notices.length === 0 ? (
+      {visibleNotices.length === 0 ? (
         <div className="empty">등록된 공지사항이 없습니다.</div>
       ) : (
         <div className="notice-list">
-          {notices.map((n) => (
+          {visibleNotices.map((n) => (
             <div key={n.notice_id} className={`notice-item ${n.is_pinned ? "pinned" : ""}`}>
               <div className="notice-meta">
                 <span className={`badge ${CATEGORY_BADGE[n.category] || "gray"} no-dot`}>
@@ -78,9 +93,15 @@ export default function Notices({ role = "owner" }) {
                 {n.is_pinned && (
                   <span style={{ color: "var(--primary)", fontWeight: 600 }}>📌 고정</span>
                 )}
+                <span className="badge gray no-dot">{n.class_name ? `🎯 ${n.class_name}` : "전체"}</span>
                 <span>{n.author}</span>
                 <span>·</span>
                 <span className="num">{(n.created_at || "").slice(0, 10)}</span>
+                {role === "owner" && (
+                  <span className="num" title="읽은 학부모 수 / 공지를 받는 학부모 수" style={{ color: "var(--text-3)" }}>
+                    · 읽음 {n.read_count}/{n.target_count}
+                  </span>
+                )}
                 <div style={{ flex: 1 }} />
 
                 {role === "owner" && (
@@ -100,6 +121,7 @@ export default function Notices({ role = "owner" }) {
       {showModal && (
         <NoticeModal
           initialData={editNotice}
+          classes={classes}
           onClose={handleCloseModal}
           onCreated={() => { handleCloseModal(); load(); }}
         />
@@ -236,10 +258,13 @@ function ManageNoticesModal({ notices, onClose, onEdit, onDelete, onDeleteMultip
 // =====================================================================
 // 공지 작성/수정 모달 (✨ DB 기반 학원 정보 연동 및 AI 초안 도우미)
 // =====================================================================
-function NoticeModal({ initialData, onClose, onCreated }) {
-  const [form, setForm] = useState(initialData || {
+function NoticeModal({ initialData, classes = [], onClose, onCreated }) {
+  const [form, setForm] = useState(() => initialData ? {
+    title: initialData.title, content: initialData.content, author: initialData.author, category: initialData.category,
+    is_pinned: initialData.is_pinned, class_id: initialData.class_id || "", notify_parents: false,
+  } : {
     title: "", content: "",
-    author: "관리자", category: "GENERAL", is_pinned: false,
+    author: "관리자", category: "GENERAL", is_pinned: false, class_id: "", notify_parents: true,
   });
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
@@ -248,19 +273,14 @@ function NoticeModal({ initialData, onClose, onCreated }) {
   const [rawText, setRawText] = useState("");
   const [aiGenerating, setAiGenerating] = useState(false);
 
-  // 💡 작성해주신 로컬스토리지 초기화 코드를 그대로 사용합니다.
-  const [academyInfo] = useState(() => {
-    const saved = localStorage.getItem("app_academy_info");
-    return saved ? JSON.parse(saved) : {
-      name: "한빛학원",
-      branch: "강남캠퍼스",
-      principal: "김선생님",
-      role: "관리자",
-      phone: "010-1234-5678",
-      address: "서울시 강남구 테헤란로 123",
-      logo: ""
-    };
-  });
+  // 기관 정보는 서버 설정에서 읽음 (기존: 브라우저 저장값 또는 가짜 기본값 '한빛학원')
+  const [academyInfo, setAcademyInfo] = useState(null);
+  useEffect(() => {
+    fetchAcademyInfo().then((info) => {
+      setAcademyInfo(info);
+      if (!initialData && info?.principal) setForm((f) => (f.author === "관리자" ? { ...f, author: info.principal } : f));
+    }).catch(() => setAcademyInfo(null));
+  }, [initialData]);
 
   const update = (k, v) => setForm((f) => ({ ...f, [k]: v }));
 
@@ -298,8 +318,9 @@ function NoticeModal({ initialData, onClose, onCreated }) {
     `;
 
     try {
-      // 💡 로컬스토리지에서 읽어온 academyInfo 객체를 그대로 제미나이에 넘겨줍니다.
-      const response = await analyzeDataWithAI(prompt, academyInfo);
+      // 기관 이름·지점·대표 연락처만 넘김 (학생·학부모 개인정보 없음)
+      const facility = academyInfo ? { name: academyInfo.name, branch: academyInfo.branch, phone: academyInfo.phone, facilityType: academyInfo.facilityType } : null;
+      const response = await analyzeDataWithAI(prompt, facility);
 
       let cleanJsonString = response.trim();
       if (cleanJsonString.startsWith("```")) {
@@ -318,7 +339,7 @@ function NoticeModal({ initialData, onClose, onCreated }) {
 
     } catch (e) {
       console.error("AI 초안 가공 실패:", e);
-      setErr("AI 초안 생성 중 오류가 발생했습니다. 직접 입력하시거나 잠시 후 다시 시도해 주세요.");
+      setErr(`AI 초안을 만들지 못했습니다 (${e.message}). 직접 입력해 주세요.`);
     } finally {
       setAiGenerating(false);
     }
@@ -326,15 +347,16 @@ function NoticeModal({ initialData, onClose, onCreated }) {
 
   const submit = async () => {
     setSubmitting(true); setErr(null);
+    const payload = { ...form, class_id: form.class_id ? Number(form.class_id) : null };
     try {
       if (initialData) {
-        await updateNotice(initialData.notice_id, form);
+        await updateNotice(initialData.notice_id, payload);
       } else {
-        await createNotice(form);
+        await createNotice(payload);
       }
       onCreated();
     } catch (e) {
-      setErr(e?.response?.data?.detail || e.message);
+      setErr(errorText(e, "공지를 저장하지 못했습니다."));
     } finally {
       setSubmitting(false);
     }
@@ -410,10 +432,23 @@ function NoticeModal({ initialData, onClose, onCreated }) {
           />
         </div>
         <div className="form-row">
+          <label>공지 대상</label>
+          <select className="select" value={form.class_id} onChange={(e) => update("class_id", e.target.value)}>
+            <option value="">전체 학부모</option>
+            {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name} 학부모만</option>)}
+          </select>
+        </div>
+        <div className="form-row" style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
             <input type="checkbox" checked={form.is_pinned} onChange={(e) => update("is_pinned", e.target.checked)} />
             상단 고정
           </label>
+          {!initialData && (
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input type="checkbox" checked={form.notify_parents} onChange={(e) => update("notify_parents", e.target.checked)} />
+              학부모에게 알림 보내기
+            </label>
+          )}
         </div>
 
         <div className="modal-actions">

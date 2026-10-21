@@ -1,9 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   createParentComment, fetchMe, fetchParentAttendances, fetchParentChildren, fetchParentComments,
   fetchParentNotices, fetchParentPosts, likeParentPost, linkParentChild, signOut, unlinkParentChild,
+  fetchParentSummary, fetchParentNotifications, markParentNotificationsRead, markParentNoticesRead,
+  fetchParentAssignments, assignmentFileUrl, errorText,
 } from "../api";
+import Lightbox, { PhotoGrid } from "../components/Lightbox";
+import { NOTIFICATION_META, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import Checkout from "./Checkout";
 
 /* =====================================================================
@@ -66,7 +70,19 @@ const PARENT_CSS = `
 .comment-form{display:flex;gap:6px;}.comment-form .input{flex:1;}
 .form-2col{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;}
 .form-2col .input{min-width:0;}
-@media (max-width:520px){.form-2col{grid-template-columns:minmax(0,1fr);gap:0;}.public-card{padding:20px;}.att-stats{grid-template-columns:repeat(2,1fr);}.parent-tab{padding:12px 10px;font-size:13px;}}
+.today-chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:700;padding:3px 9px;border-radius:9999px;background:var(--surface-2);color:var(--text-2);}
+.today-chip.in{background:var(--success-soft,#dcfce7);color:var(--success-text,#166534);}
+.today-chip.late{background:var(--warning-soft,#fef3c7);color:#92400e;}
+.today-chip.absent{background:var(--danger-soft);color:var(--danger-text);}
+.bell{position:relative;background:none;border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer;font-size:16px;margin-left:auto;}
+.bell .dot{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;border-radius:9999px;background:var(--danger);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;padding:0 4px;}
+.notif-panel{position:absolute;top:58px;right:16px;width:min(360px,92vw);max-height:70vh;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 30px rgba(0,0,0,.15);z-index:20;}
+.notif-item{display:flex;gap:10px;padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;text-align:left;background:none;border-left:none;border-right:none;border-top:none;width:100%;color:inherit;}
+.notif-item.unread{background:var(--primary-soft);}
+.tag{font-size:11px;font-weight:700;padding:1px 7px;border-radius:9999px;background:var(--primary-soft);color:var(--primary-text,var(--primary));}
+.tag.new{background:var(--danger);color:#fff;}
+.toast-p{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;z-index:30;max-width:90vw;box-shadow:0 8px 20px rgba(0,0,0,.25);}
+@media (max-width:520px){.public-header{padding:10px 12px;gap:8px;}.public-header .back-btn{padding:6px 9px;font-size:12px;white-space:nowrap;}.public-header .bell{padding:5px 8px;}.ph-title{font-size:14px;}.ph-sub{display:none;}.form-2col{grid-template-columns:minmax(0,1fr);gap:0;}.public-card{padding:20px;}.att-stats{grid-template-columns:repeat(2,1fr);}.parent-tab{padding:12px 10px;font-size:13px;}}
 `;
 
 const ATT_LABEL = { PRESENT: "출석", LATE: "지각", ABSENT: "결석" };
@@ -105,12 +121,48 @@ function ChildAttendance({ child }) {
         ))}
         {!att.items.length && <span className="sub">최근 30일 출결 기록이 없습니다.</span>}
       </div>
-      <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>출석률 = 기간 내 출결 기록 중 출석 비율</div>
+      <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>출석률 = 최근 30일 출결 기록 중 (출석 + 지각) 비율</div>
     </div>
   );
 }
 
-function ChildrenTab({ kids, onChanged }) {
+function TodayChip({ today }) {
+  if (!today) return <span className="today-chip">오늘 아직 등원 전</span>;
+  if (today.status === "ABSENT") return <span className="today-chip absent">오늘 결석</span>;
+  if (today.check_out_time) return <span className="today-chip in">🏠 {today.check_out_time} 하원</span>;
+  return <span className={`today-chip ${today.status === "LATE" ? "late" : "in"}`}>🟢 {today.check_in_time || ""} 등원{today.status === "LATE" ? "(지각)" : ""}</span>;
+}
+
+const SUB_LABEL = { NONE: "확인 전", SUBMITTED: "제출 완료", LATE: "지각 제출", MISSING: "미제출" };
+
+function AssignmentsSection() {
+  const [rows, setRows] = useState(null);
+  useEffect(() => { fetchParentAssignments().then(setRows).catch(() => setRows([])); }, []);
+  if (!rows || rows.length === 0) return null;
+  return (
+    <div className="public-card" style={{ width: "100%" }}>
+      <h2>📝 과제</h2>
+      <div className="sub">자녀가 수강하는 반의 최근 과제입니다. 제출 확인은 선생님이 표시합니다.</div>
+      {rows.map((a) => (
+        <div className="inv-row" key={a.assignment_id} style={{ alignItems: "flex-start" }}>
+          <div className="body">
+            <div className="title">{a.title} <span className="tag">{a.class_name}</span></div>
+            <div className="meta">기한 {a.due_date}{a.overdue ? " · 마감됨" : ""}</div>
+            {a.content && <div style={{ fontSize: 13, color: "var(--text-2)", marginTop: 4, whiteSpace: "pre-wrap" }}>{a.content}</div>}
+            <div className="meta" style={{ marginTop: 4 }}>
+              {a.children.map((c) => `${c.name}: ${SUB_LABEL[c.status] || c.status}`).join(" · ")}
+            </div>
+          </div>
+          {a.has_file && (
+            <a className="btn sm ghost" href={assignmentFileUrl(a.assignment_id, true)} target="_blank" rel="noreferrer" title={a.file_name || "첨부 파일"}>📎 자료</a>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChildrenTab({ kids, onChanged, onGoPay }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [error, setError] = useState("");
@@ -125,7 +177,7 @@ function ChildrenTab({ kids, onChanged }) {
       setName(""); setPhone("");
       onChanged();
     } catch (err) {
-      setError(err.response?.data?.detail || "자녀를 연결하지 못했습니다.");
+      setError(errorText(err, "자녀를 연결하지 못했습니다."));
     } finally {
       setBusy(false);
     }
@@ -144,17 +196,26 @@ function ChildrenTab({ kids, onChanged }) {
             <div className="child-card" style={{ border: 0, padding: 0 }}>
               <div className="ava">{child.name[0]}</div>
               <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 700 }}>{child.name}</div>
+                <div style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  {child.name} <TodayChip today={child.today} />
+                </div>
                 <div className="meta">{child.classes.length ? child.classes.join(" · ") : "수강 중인 수업 없음"}</div>
               </div>
               <button className="linkbtn" onClick={() => unlink(child)}>연결 해제</button>
             </div>
+            {child.unpaid_amount > 0 && (
+              <button type="button" className="linkbtn" onClick={() => onGoPay && onGoPay()}
+                style={{ display: "block", width: "100%", textAlign: "left", marginTop: 10, background: "var(--danger-soft)", color: "var(--danger-text)", fontWeight: 600 }}>
+                💳 납부할 금액 {child.unpaid_amount.toLocaleString()}원 — 결제하러 가기 →
+              </button>
+            )}
             <ChildAttendance child={child} />
           </div>
         ))}
+        {kids.length > 0 && <AssignmentsSection />}
         <form className="public-card" style={{ width: "100%" }} onSubmit={link}>
           <h2>{kids.length ? "자녀 추가 연결" : "자녀 연결하기"}</h2>
-          <div className="sub">학원에 등록된 자녀 이름과 보호자 연락처를 입력하면 이 Google 계정에 연결됩니다.</div>
+          <div className="sub">시설에 등록된 자녀 이름과 보호자 연락처를 입력하면 이 Google 계정에 연결됩니다. 연결하면 등원·하원·청구서 알림을 받을 수 있습니다.</div>
           {error && <div className="error-banner">{error}</div>}
           <div className="form-2col">
             <div className="form-row"><label>자녀 이름</label>
@@ -170,17 +231,25 @@ function ChildrenTab({ kids, onChanged }) {
 }
 
 function FeedPostCard({ post }) {
-  const [liked, setLiked] = useState(false);
+  const [liked, setLiked] = useState(Boolean(post.liked));
+  const [likeCount, setLikeCount] = useState(post.like_count || 0);
   const [open, setOpen] = useState(false);
   const [comments, setComments] = useState(null);
   const [text, setText] = useState("");
+  const [notice, setNotice] = useState("");
+  const [lightbox, setLightbox] = useState(null);
   const photos = post.photos || [];
-  const n = photos.length;
 
-  const like = () => {
-    if (liked) return;
-    setLiked(true);
-    likeParentPost(post.post_id).catch(() => setLiked(false));
+  // 좋아요는 계정당 1회, 다시 누르면 취소 (서버 결과로 확정)
+  const like = async () => {
+    const prev = { liked, likeCount };
+    setLiked(!liked); setLikeCount(likeCount + (liked ? -1 : 1));
+    try {
+      const result = await likeParentPost(post.post_id);
+      setLiked(result.liked); setLikeCount(result.like_count);
+    } catch {
+      setLiked(prev.liked); setLikeCount(prev.likeCount);
+    }
   };
   const toggleComments = async () => {
     setOpen((v) => !v);
@@ -189,36 +258,43 @@ function FeedPostCard({ post }) {
   const submit = async (e) => {
     e.preventDefault();
     if (!text.trim()) return;
-    const added = await createParentComment(post.post_id, text.trim()).catch(() => null);
-    if (added) { setComments((c) => [...(c || []), added]); setText(""); }
+    try {
+      const added = await createParentComment(post.post_id, text.trim());
+      setComments((c) => [...(c || []), added]);
+      setText("");
+      setNotice(added.pending_review ? "댓글이 자동 검토 중입니다. 관리자가 확인한 뒤 다른 분들께 보입니다." : "");
+    } catch (err) {
+      setNotice(errorText(err, "댓글을 등록하지 못했습니다."));
+    }
   };
 
   return (
     <div className="feed-post">
+      {lightbox !== null && <Lightbox photos={photos} startIndex={lightbox} onClose={() => setLightbox(null)} />}
       <div className="feed-post-head">
-        <div className="feed-ava">관</div>
+        <div className="feed-ava">{(post.author || "관")[0]}</div>
         <div style={{ flex: 1 }}>
           <div className="feed-author">{post.author}</div>
           <div className="feed-time">{relTime(post.created_at)}</div>
         </div>
       </div>
       {post.content && <div className="feed-content">{post.content}</div>}
-      {n > 0 && (
-        <div className={`feed-photos n${Math.min(n, 4)}`}>
-          {photos.slice(0, 4).map((src, i) => <img key={i} src={src} alt="" loading="lazy" />)}
-        </div>
-      )}
+      {photos.length > 0 && <div style={{ padding: "0 12px" }}><PhotoGrid photos={photos} onOpen={setLightbox} /></div>}
       <div className="feed-actions">
-        <button className={`feed-like ${liked ? "liked" : ""}`} onClick={like}>
-          {liked ? "❤️" : "🤍"} 좋아요 {post.like_count + (liked ? 1 : 0)}
+        <button className={`feed-like ${liked ? "liked" : ""}`} onClick={like} aria-pressed={liked}>
+          {liked ? "❤️" : "🤍"} 좋아요 {likeCount}
         </button>
-        <button className="feed-like" onClick={toggleComments}>💬 댓글{comments ? ` ${comments.length}` : ""}</button>
+        <button className="feed-like" onClick={toggleComments}>💬 댓글 {comments ? comments.length : (post.comment_count ?? "")}</button>
       </div>
       {open && (
         <div className="comment-box">
           {comments === null ? <span className="sub">불러오는 중…</span> : comments.map((c) => (
-            <div className="comment-row" key={c.comment_id}><b>{c.author}</b>{c.content}</div>
+            <div className="comment-row" key={c.comment_id} style={c.pending_review ? { opacity: 0.6 } : undefined}>
+              <b>{c.author}</b>{c.content}
+              {c.pending_review && <span className="tag" style={{ marginLeft: 6 }}>검토 중 · 나에게만 보임</span>}
+            </div>
           ))}
+          {notice && <div className="sub" style={{ margin: 0, color: "var(--text-2)" }}>{notice}</div>}
           <form className="comment-form" onSubmit={submit}>
             <input className="input" value={text} onChange={(e) => setText(e.target.value)} placeholder="댓글을 입력하세요" maxLength={1000} />
             <button className="btn sm" type="submit">등록</button>
@@ -229,17 +305,27 @@ function FeedPostCard({ post }) {
   );
 }
 
-function NoticesTab() {
+function NoticesTab({ onRead }) {
   const [rows, setRows] = useState(null);
-  useEffect(() => { fetchParentNotices().then(setRows).catch(() => setRows([])); }, []);
+  useEffect(() => {
+    fetchParentNotices().then((list) => {
+      setRows(list);
+      // 화면에 표시된 안 읽은 공지를 읽음으로 기록 (관리자 화면의 '읽음 N/M')
+      const unread = list.filter((n) => !n.is_read).map((n) => n.notice_id);
+      if (unread.length) markParentNoticesRead(unread).then(() => onRead && onRead()).catch(() => null);
+    }).catch(() => setRows([]));
+  }, [onRead]);
   if (rows === null) return <div className="public-body"><div className="empty">불러오는 중…</div></div>;
   return (
     <div className="public-body" style={{ alignItems: "flex-start" }}>
       <div className="notice-list" style={{ maxWidth: 600, margin: "0 auto", width: "100%" }}>
         {rows.length === 0 ? <div className="empty">공지사항이 없습니다.</div> : rows.map((n) => (
           <div className={`notice-item ${n.is_pinned ? "pinned" : ""}`} key={n.notice_id}>
-            <div className="notice-meta">
+            <div className="notice-meta" style={{ flexWrap: "wrap" }}>
+              {!n.is_read && <span className="tag new">NEW</span>}
               {n.is_pinned && <span className="badge primary no-dot">고정</span>}
+              {n.category === "URGENT" && <span className="badge danger no-dot">긴급</span>}
+              {n.class_name && <span className="tag" title={n.reason || ""}>🎯 {n.for_children?.join(", ")} · {n.class_name}</span>}
               <span>{n.author}</span><span>·</span><span>{n.created_at ? new Date(n.created_at).toLocaleDateString("ko-KR") : ""}</span>
             </div>
             <h3 className="notice-title">{n.title}</h3>
@@ -271,10 +357,64 @@ export default function ParentPortal() {
   const [tab, setTab] = useState(hasPaymentResult ? "pay" : "children");
   const [me, setMe] = useState(null);
   const [children, setChildren] = useState(null);
+  const [facility, setFacility] = useState(null);
+  const [unread, setUnread] = useState(0);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [toast, setToast] = useState(null);
+  const lastUnread = useRef(null);
 
   const loadChildren = useCallback(() => {
     fetchParentChildren().then(setChildren).catch(() => setChildren([]));
   }, []);
+
+  // 실시간 알림 (탭이 보일 때 10초마다 확인 — 등원/하원·청구서·공지·댓글 검토 결과)
+  const refreshSummary = useCallback(async () => {
+    try {
+      const summary = await fetchParentSummary();
+      setFacility(summary.facility);
+      const count = summary.unread_notifications;
+      if (lastUnread.current != null && count > lastUnread.current) {
+        const latest = await fetchParentNotifications({ unread_only: true, limit: 3 });
+        const first = latest.items[0];
+        if (first) {
+          setToast(`${NOTIFICATION_META[first.kind]?.icon || "🔔"} ${first.title}`);
+          window.setTimeout(() => setToast(null), 5000);
+          showBrowserNotification(first.title, first.body || "");
+          if (["CHECK_IN", "CHECK_OUT", "ABSENT", "INVOICE", "PAYMENT"].includes(first.kind)) loadChildren();
+        }
+      }
+      lastUnread.current = count;
+      setUnread(count);
+    } catch { /* 네트워크 오류는 다음 주기에 재시도 */ }
+  }, [loadChildren]);
+
+  const openPanel = async () => {
+    const next = !panelOpen;
+    setPanelOpen(next);
+    if (next) {
+      try {
+        setNotifications((await fetchParentNotifications({ limit: 30 })).items);
+        if (typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => null);
+      } catch { setNotifications([]); }
+    }
+  };
+
+  const clickNotification = async (n) => {
+    setPanelOpen(false);
+    if (!n.is_read) {
+      await markParentNotificationsRead({ ids: [n.notification_id] }).catch(() => null);
+      refreshSummary();
+    }
+    const target = n.link || NOTIFICATION_META[n.kind]?.parent;
+    if (target) setTab(target);
+  };
+
+  const readAll = async () => {
+    await markParentNotificationsRead({ all: true }).catch(() => null);
+    setNotifications((prev) => prev.map((x) => ({ ...x, is_read: true })));
+    refreshSummary();
+  };
 
   useEffect(() => {
     fetchMe()
@@ -282,9 +422,15 @@ export default function ParentPortal() {
         if (current.active_role !== "parent") return navigate("/");  // 역할 미선택/관리자 모드 → 역할 선택 화면
         setMe(current);
         loadChildren();
+        refreshSummary();
       })
       .catch(() => navigate("/"));
-  }, [navigate, loadChildren]);
+  }, [navigate, loadChildren, refreshSummary]);
+
+  useEffect(() => {
+    if (!me) return undefined;
+    return startVisiblePolling(refreshSummary, 10000);
+  }, [me, refreshSummary]);
 
   const logout = async () => {
     try { await signOut(); } finally { navigate("/"); }
@@ -296,13 +442,39 @@ export default function ParentPortal() {
   return (
     <div className="public-wrap">
       <style>{PARENT_CSS}</style>
-      <div className="public-header">
-        <div className="logo">학</div>
-        <div>
-          <div style={{ fontWeight: 700 }}>학부모 포털</div>
-          <div style={{ fontSize: 11, color: "var(--text-3)" }}>{me.user.name || me.user.email}</div>
+      <div className="public-header" style={{ position: "relative" }}>
+        <div className="logo" style={facility?.logo ? { background: "transparent", overflow: "hidden" } : undefined}>
+          {facility?.logo ? <img src={facility.logo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : (facility?.name || "학부모")[0]}
         </div>
-        <button className="back-btn" onClick={() => navigate("/")}>역할 변경</button>
+        <div style={{ minWidth: 0 }}>
+          <div className="ph-title" style={{ fontWeight: 700 }}>{facility?.name ? `${facility.name} 학부모 포털` : "학부모 포털"}</div>
+          <div className="ph-sub" style={{ fontSize: 11, color: "var(--text-3)" }}>
+            {me.user.name || me.user.email}{facility?.phone ? ` · 문의 ${facility.phone}` : ""}
+          </div>
+        </div>
+        <button className="bell" onClick={openPanel} aria-label={`알림 ${unread}건`}>
+          🔔{unread > 0 && <span className="dot">{unread > 99 ? "99+" : unread}</span>}
+        </button>
+        {panelOpen && (
+          <div className="notif-panel" role="dialog" aria-label="알림">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
+              <b>알림</b>
+              {unread > 0 && <button className="linkbtn" onClick={readAll}>모두 읽음</button>}
+            </div>
+            {notifications.length === 0 ? <div className="sub" style={{ padding: 16 }}>알림이 없습니다. 자녀의 등원·하원, 청구서, 공지가 여기에 표시됩니다.</div> :
+              notifications.map((n) => (
+                <button type="button" key={n.notification_id} className={`notif-item ${n.is_read ? "" : "unread"}`} onClick={() => clickNotification(n)}>
+                  <span style={{ fontSize: 18 }}>{NOTIFICATION_META[n.kind]?.icon || "🔔"}</span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: "block", fontWeight: 700, fontSize: 13 }}>{n.title}</span>
+                    {n.body && <span style={{ display: "block", fontSize: 12, color: "var(--text-2)", marginTop: 2 }}>{n.body}</span>}
+                    <span style={{ display: "block", fontSize: 11, color: "var(--text-3)", marginTop: 2 }}>{relativeTime(n.created_at)}</span>
+                  </span>
+                </button>
+              ))}
+          </div>
+        )}
+        <button className="back-btn" style={{ marginLeft: 6 }} onClick={() => navigate("/")}>역할 변경</button>
         <button className="back-btn" style={{ marginLeft: 6 }} onClick={logout}>로그아웃</button>
       </div>
       <div className="parent-tabs">
@@ -310,10 +482,11 @@ export default function ParentPortal() {
           <button key={id} className={`parent-tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>{label}</button>
         ))}
       </div>
-      {tab === "children" && <ChildrenTab kids={children} onChanged={loadChildren} />}
+      {tab === "children" && <ChildrenTab kids={children} onChanged={loadChildren} onGoPay={() => setTab("pay")} />}
       {tab === "pay" && <Checkout hasChildren={children.length > 0} onLinkChild={() => setTab("children")} />}
-      {tab === "notices" && <NoticesTab />}
+      {tab === "notices" && <NoticesTab onRead={refreshSummary} />}
       {tab === "feed" && <FeedTab />}
+      {toast && <div className="toast-p" role="status" onClick={() => { setToast(null); openPanel(); }}>{toast}</div>}
     </div>
   );
 }

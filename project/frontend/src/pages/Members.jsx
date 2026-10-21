@@ -1,12 +1,16 @@
 import React, { useEffect, useState, useMemo } from "react";
-import { fetchMembers, createMember, updateMember, deleteMember, fetchClasses, fetchEnrollmentMap } from "../api";
+import { useSearchParams } from "react-router-dom";
+import {
+  fetchMembers, createMember, updateMember, deleteMember, fetchClasses, fetchEnrollmentMap, extractStudentInfoFromImage,
+  fetchDashboardInsights, bulkCreateInvoices, notifyMemberParents, errorText, localToday,
+} from "../api";
 import { resizeImageFile } from "../utils/image";
-
-const errorMessage = (error, fallback) => error?.response?.data?.detail || error?.message || fallback;
 import MemberDetailDashboard from "./MemberDetailDashboard";
-import { extractStudentInfoFromImage } from '../api';
 
-const today = () => new Date().toISOString().slice(0, 10);
+const errorMessage = (error, fallback) => errorText(error, fallback);
+
+// [FIX] UTC 기준 날짜(오전 9시 전 '어제')가 아닌 현지 날짜
+const today = () => localToday();
 
 const ageToGrade = (age) => {
   if (age == null) return "";
@@ -22,18 +26,12 @@ const formatPaymentDay = (dateStr) => {
   return `매월 ${d.getDate()}일`;
 };
 
-const daysSince = (dateStr) => {
-  if (!dateStr) return null;
-  const ms = Date.now() - new Date(dateStr).getTime();
-  return Math.max(0, Math.floor(ms / (1000 * 60 * 60 * 24)));
-};
 
+// v8.1: 미납 = 서버의 '미납' 청구서 기준 (기존: 마지막 납부일이 30일 지났는지로 추정)
 const paymentBadge = (m) => {
-  if (m.status === "WITHDRAWN") return { cls: "gray", label: "종료" };
-  const days = daysSince(m.payment_date);
-  if (days == null || days > 60) return { cls: "danger",  label: `미납 ${days ?? "?"}일` };
-  if (days > 30) return { cls: "danger",  label: `미납 ${days}일` };
-  return { cls: "success", label: "납부 완료" };
+  if (m.status === "WITHDRAWN") return { cls: "gray", label: "퇴원" };
+  if (m.unpaid_count > 0) return { cls: "danger", label: `미납 ${m.unpaid_count}건 · ${Number(m.unpaid_amount || 0).toLocaleString()}원` };
+  return { cls: "success", label: "미납 없음" };
 };
 
 export default function Members() {
@@ -44,7 +42,13 @@ export default function Members() {
   const [statusFilter, setStatusFilter] = useState(""); 
   const [classFilter, setClassFilter] = useState(""); 
   const [gradeFilter, setGradeFilter] = useState(""); 
-  const [q, setQ] = useState("");
+  // 상단 통합 검색(⌘K)에서 /members?q=... 로 들어오면 그 검색어로 조회
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlQ = searchParams.get("q") || "";
+  const [q, setQ] = useState(urlQ);
+  const [insights, setInsights] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [bulkModal, setBulkModal] = useState(null);   // "invoice" | "notify" | null
   const [showModal, setShowModal] = useState(false);
   const [showOcrModal, setShowOcrModal] = useState(false);
   
@@ -68,7 +72,7 @@ export default function Members() {
         status: statusFilter || undefined,
         class_id: classFilter || undefined,
         grade: gradeFilter || undefined,
-        q: q || undefined
+        q: urlQ || undefined
       });
       
       let validMembers = Array.isArray(rawMemData) ? rawMemData : [];
@@ -99,7 +103,23 @@ export default function Members() {
     }
   };
   
-  useEffect(() => { load(); }, [statusFilter, classFilter, gradeFilter]);
+  useEffect(() => { setQ(urlQ); }, [urlQ]);
+  useEffect(() => { load(); setSelectedIds(new Set()); }, [statusFilter, classFilter, gradeFilter, urlQ]);
+  useEffect(() => { fetchDashboardInsights().then(setInsights).catch(() => setInsights(null)); }, []);
+
+  const applySearch = () => {
+    const next = q.trim();
+    if (next) setSearchParams({ q: next }); else setSearchParams({});
+  };
+
+  const toggleSelect = (id) => setSelectedIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const allSelected = members.length > 0 && members.every((m) => selectedIds.has(m.member_id));
+  const toggleSelectAll = () => setSelectedIds(allSelected ? new Set() : new Set(members.map((m) => m.member_id)));
+  const selectedMembers = members.filter((m) => selectedIds.has(m.member_id));
 
   const onDelete = async (id) => {
     if (!window.confirm("정말 삭제하시겠습니까? 출결·수강 기록과 미납 청구서가 함께 삭제됩니다.\n(결제 기록이 있는 학생은 삭제 대신 '퇴원'으로 바꿔 주세요.)")) return;
@@ -116,7 +136,7 @@ export default function Members() {
       alert("다운로드할 학생 데이터가 없습니다.");
       return;
     }
-    const headers = ["이름", "성별", "나이", "학년", "수강 과목", "입관일", "퇴관일", "부모님 연락처", "부모님 성함", "주소", "회비 납부일", "상태"];
+    const headers = ["이름", "성별", "나이", "학년", "수강 과목", "등록일", "퇴원일", "부모님 연락처", "부모님 성함", "주소", "회비 납부일", "상태"];
     
     const rows = members.map(m => {
       const enrolledClasses = memberClasses[m.member_id]?.join(", ") || "미수강";
@@ -126,7 +146,7 @@ export default function Members() {
         ageToGrade(m.age) || "-", enrolledClasses, m.enrollment_date, m.withdrawal_date || "-",
         m.mother_phone || m.father_phone || "-", m.mother_name || m.father_name || "-",
         m.address || "-", formatPaymentDay(m.payment_date),
-        m.status === "ACTIVE" ? "활동중" : "퇴관"
+        m.status === "ACTIVE" ? "재원" : "퇴원"
       ];
     });
 
@@ -135,25 +155,28 @@ export default function Members() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
-    link.setAttribute("download", `학생명단_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute("download", `학생명단_${today()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
+  // 통계는 서버 집계(대시보드 인사이트)와 같은 정의를 사용 — 기존 '활동중 × 0.78' 같은 추정치 제거
   const stats = useMemo(() => {
     const safeMembers = Array.isArray(members) ? members : [];
     const active = safeMembers.filter(m => m.status === "ACTIVE").length;
-    const unpaidCnt = safeMembers.filter(m => m.status === "ACTIVE" &&
-      (daysSince(m.payment_date) ?? 999) > 30).length;
-    
-    const paidCnt = active - unpaidCnt;
-    const paymentRate = active > 0 ? Math.round((paidCnt / active) * 100) : 0;
-
-    return { total: safeMembers.length, active, unpaidCnt, paymentRate };
-  }, [members]);
+    const unpaidCnt = safeMembers.filter(m => m.status === "ACTIVE" && m.unpaid_count > 0).length;
+    const todayAtt = insights?.attendance?.today;
+    return {
+      total: safeMembers.length, active, unpaidCnt,
+      todayAttended: todayAtt ? todayAtt.present + todayAtt.late : null,
+      todayExpected: todayAtt?.expected ?? null,
+      paymentRate: insights?.billing?.collection_rate ?? null,
+    };
+  }, [members, insights]);
 
   const getRateColor = (rate) => {
+    if (rate == null) return "";
     if (rate >= 80) return "success";  
     if (rate >= 50) return "warning";  
     return "danger";                   
@@ -162,7 +185,7 @@ export default function Members() {
   return (
     <>
       <h2 className="page-title">학생 관리</h2>
-      <p className="page-subtitle">전체 {stats.total}명 · 활동중 {stats.active}명</p>
+      <p className="page-subtitle">조회 {stats.total}명 · 재원 {stats.active}명{urlQ ? ` · “${urlQ}” 검색 결과` : ""}</p>
 
       {error && <div className="error-banner">{error}</div>}
 
@@ -172,19 +195,21 @@ export default function Members() {
           <div className="stat-value num">{stats.total}<span className="unit">명</span></div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label">오늘 출석</span></div>
-          <div className="stat-value num primary">{Math.round(stats.active * 0.78)}<span className="unit">명</span></div>
+          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.attendance_rate_today}>오늘 출석 ⓘ</span></div>
+          <div className="stat-value num primary">{stats.todayAttended ?? "–"}<span className="unit">명</span></div>
+          {stats.todayExpected ? <div className="stat-sub">오늘 수업 대상 {stats.todayExpected}명</div> : null}
         </div>
         <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label">회비 미납</span></div>
-          <div className="stat-value num danger">{stats.unpaidCnt}<span className="unit">건</span></div>
-          <div className="stat-sub">미납 60일 초과부터 대쉬보드에 갱신됩니다.</div>
+          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.unpaid}>미납 학생 ⓘ</span></div>
+          <div className="stat-value num danger">{stats.unpaidCnt}<span className="unit">명</span></div>
+          <div className="stat-sub">'미납' 청구서가 있는 재원생 (현재 조회 기준)</div>
         </div>
         <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label">이달 수납률</span></div>
+          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.collection_rate}>이달 수납률 ⓘ</span></div>
           <div className={`stat-value num ${getRateColor(stats.paymentRate)}`}>
-            {stats.paymentRate}<span className="unit">%</span>
+            {stats.paymentRate ?? "–"}<span className="unit">%</span>
           </div>
+          {stats.paymentRate == null && <div className="stat-sub">이번 달 발행된 청구서가 없습니다</div>}
         </div>
       </div>
 
@@ -192,10 +217,10 @@ export default function Members() {
         <div className="search-box">
           <input
             className="input"
-            placeholder="이름·전화·부모님 이름으로 검색"
+            placeholder="이름·보호자 이름·전화번호(3자리 이상) 검색 후 Enter"
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && load()}
+            onKeyDown={(e) => e.key === "Enter" && applySearch()}
           />
         </div>
         
@@ -215,9 +240,9 @@ export default function Members() {
           </select>
           
           <select className="select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-            <option value="">납부상태 ▼</option>
-            <option value="ACTIVE">활동중</option>
-            <option value="WITHDRAWN">퇴관</option>
+            <option value="">재원 상태 ▼</option>
+            <option value="ACTIVE">재원</option>
+            <option value="WITHDRAWN">퇴원</option>
           </select>
         </div>
         
@@ -229,6 +254,15 @@ export default function Members() {
         <button className="btn" onClick={() => { setEditingMember(null); setShowModal(true); }}>+ 학생 추가</button>
       </div>
 
+      {selectedIds.size > 0 && (
+        <div className="card" style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", marginBottom: 12, flexWrap: "wrap", background: "var(--primary-soft)" }}>
+          <strong style={{ fontSize: 13 }}>{selectedIds.size}명 선택</strong>
+          <button className="btn sm" onClick={() => setBulkModal("invoice")}>🧾 청구서 일괄 발행</button>
+          <button className="btn sm ghost" onClick={() => setBulkModal("notify")}>🔔 학부모 알림 보내기</button>
+          <button className="btn sm ghost ml-auto" onClick={() => setSelectedIds(new Set())}>선택 해제</button>
+        </div>
+      )}
+
       {(!Array.isArray(members) || members.length === 0) ? (
         <div className="empty">조회된 학생이 없습니다.</div>
       ) : (
@@ -236,13 +270,13 @@ export default function Members() {
           <table>
             <thead>
               <tr>
-                <th style={{ width: 36 }}><input type="checkbox" /></th>
+                <th style={{ width: 36 }}><input type="checkbox" checked={allSelected} onChange={toggleSelectAll} aria-label="전체 선택" /></th>
                 <th>이름</th>
                 <th>성별</th>
                 <th>나이</th>
                 <th>수강 과목</th>
-                <th>입관일</th>
-                <th>퇴관일</th>
+                <th>등록일</th>
+                <th>퇴원일</th>
                 <th>부모님 전화</th>
                 <th>부모님 성함</th>
                 <th>주소</th>
@@ -266,7 +300,7 @@ export default function Members() {
                   onClick={() => setSelectedMember(m)}
                    style={{ cursor: 'pointer', ...rowStyle }}
                    >
-                    <td onClick={(e) => e.stopPropagation()}><input type="checkbox" /></td>
+                    <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.has(m.member_id)} onChange={() => toggleSelect(m.member_id)} aria-label={`${m.name} 선택`} /></td>
                     <td>
                       <div className="member-cell">
                         <div className="avatar" style={{ overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--surface-hover)" }}>
@@ -363,6 +397,15 @@ export default function Members() {
           onClose={() => setShowOcrModal(false)}
           onSaved={() => { setShowOcrModal(false); load(); }}
         />
+      )}
+
+      {bulkModal === "invoice" && (
+        <BulkInvoiceModal members={selectedMembers} onClose={() => setBulkModal(null)}
+          onDone={() => { setBulkModal(null); setSelectedIds(new Set()); load(); }} />
+      )}
+      {bulkModal === "notify" && (
+        <BulkNotifyModal members={selectedMembers} onClose={() => setBulkModal(null)}
+          onDone={() => { setBulkModal(null); setSelectedIds(new Set()); }} />
       )}
 
       {selectedMember && (
@@ -555,7 +598,7 @@ function OcrMemberModal({ onClose, onSaved }) {
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
               <div className="form-row">
-                <label>입관일</label>
+                <label>등록일</label>
                 <input type="date" className="input" value={formData.enrollment_date} onChange={(e) => updateOcrData("enrollment_date", e.target.value)} />
               </div>
               <div className="form-row">
@@ -636,14 +679,6 @@ function MemberModal({ onClose, onSaved, member }) {
     }
   };
 
-  const getPaymentStatus = () => {
-    if (form.status === "WITHDRAWN") return "WITHDRAWN";
-    const days = daysSince(form.payment_date);
-    if (days != null && days > 30) return "UNPAID";
-    return "PAID";
-  };
-  
-  const currentStatus = getPaymentStatus();
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -699,52 +734,18 @@ function MemberModal({ onClose, onSaved, member }) {
         {isEdit && (
           <div style={{ margin: "12px 0", padding: "12px", background: "var(--surface-2)", border: "1px solid var(--border)", borderRadius: "8px" }}>
             <label style={{ display: "block", marginBottom: "8px", fontWeight: "600", fontSize: "13px", textAlign: "center" }}>
-              상태 및 납부 관리
+              재원 상태
             </label>
-            
-            <div style={{ display: "flex", gap: "8px" }}>
-              <button 
-                type="button" 
-                className={`btn sm ${currentStatus === "PAID" ? "" : "ghost"}`} 
-                style={{ 
-                  flex: 1, 
-                  border: currentStatus === "PAID" ? "none" : "1px solid var(--border)",
-                  ...(currentStatus === "PAID" ? { backgroundColor: "var(--primary)", color: "#fff" } : {})
-                }} 
-                onClick={() => { update("payment_date", today()); update("status", "ACTIVE"); update("withdrawal_date", ""); }}
-              >
-                납부 완료
-              </button>
-              
-              <button 
-                type="button" 
-                className={`btn sm ${currentStatus === "UNPAID" ? "" : "ghost"}`} 
-                style={{ 
-                  flex: 1, 
-                  border: currentStatus === "UNPAID" ? "none" : "1px solid var(--border)",
-                  ...(currentStatus === "UNPAID" ? { backgroundColor: "var(--danger)", color: "#fff" } : {})
-                }} 
-                onClick={() => { 
-                  const d = new Date(); d.setDate(d.getDate() - 31); 
-                  update("payment_date", d.toISOString().slice(0, 10)); 
-                  update("status", "ACTIVE"); update("withdrawal_date", ""); 
-                }}
-              >
-                미납 처리
-              </button>
-              
-              <button 
-                type="button" 
-                className={`btn sm ${currentStatus === "WITHDRAWN" ? "" : "ghost"}`} 
-                style={{ 
-                  flex: 1, 
-                  border: currentStatus === "WITHDRAWN" ? "none" : "1px solid var(--border)",
-                  ...(currentStatus === "WITHDRAWN" ? { backgroundColor: "var(--text-2)", color: "#fff" } : {})
-                }} 
-                onClick={() => { update("status", "WITHDRAWN"); update("withdrawal_date", today()); }}
-              >
-                종료(퇴관)
-              </button>
+            <div className="segmented" style={{ display: "flex" }}>
+              <button type="button" style={{ flex: 1 }} className={form.status !== "WITHDRAWN" ? "active" : ""}
+                onClick={() => { update("status", "ACTIVE"); update("withdrawal_date", ""); }}>재원</button>
+              <button type="button" style={{ flex: 1 }} className={form.status === "WITHDRAWN" ? "active" : ""}
+                onClick={() => { update("status", "WITHDRAWN"); update("withdrawal_date", form.withdrawal_date || today()); }}>퇴원</button>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 8, textAlign: "center" }}>
+              {member?.unpaid_count > 0
+                ? `미납 청구서 ${member.unpaid_count}건 (${Number(member.unpaid_amount).toLocaleString()}원) — 납부 처리는 ‘수납·청구’ 화면에서 합니다.`
+                : "납부 상태는 청구서 기준으로 자동 계산됩니다 (‘수납·청구’ 화면)."}
             </div>
           </div>
         )}
@@ -753,18 +754,18 @@ function MemberModal({ onClose, onSaved, member }) {
           <div className="form-row">
             <label>상태</label>
             <select className="select" value={form.status} onChange={(e) => update("status", e.target.value)}>
-              <option value="ACTIVE">활동중</option><option value="WITHDRAWN">퇴관</option>
+              <option value="ACTIVE">활동중</option><option value="WITHDRAWN">퇴원</option>
             </select>
           </div>
           <div className="form-row">
-            <label>퇴관일</label>
+            <label>퇴원일</label>
             <input type="date" className="input" value={form.withdrawal_date} onChange={(e) => update("withdrawal_date", e.target.value)} disabled={form.status !== "WITHDRAWN"} />
           </div>
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
           <div className="form-row">
-            <label>입관일</label>
+            <label>등록일</label>
             <input type="date" className="input" value={form.enrollment_date} onChange={(e) => update("enrollment_date", e.target.value)} />
           </div>
           <div className="form-row">
@@ -801,6 +802,103 @@ function MemberModal({ onClose, onSaved, member }) {
           <button className="btn" onClick={submit} disabled={submitting || !form.name}>
             {submitting ? "저장 중..." : isEdit ? "수정 완료" : "등록"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------
+// v8.1 선택 학생 일괄 작업
+// ---------------------------------------------------------------------
+function BulkInvoiceModal({ members, onClose, onDone }) {
+  const month = new Date().getMonth() + 1;
+  const [form, setForm] = useState({ item_name: `${month}월 수강료`, amount: "", due_date: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const active = members.filter((m) => m.status === "ACTIVE");
+
+  const submit = async () => {
+    if (!form.item_name.trim()) return setErr("청구 항목을 입력하세요.");
+    setBusy(true); setErr(null);
+    try {
+      const result = await bulkCreateInvoices({
+        member_ids: active.map((m) => m.member_id), item_name: form.item_name.trim(),
+        amount: form.amount ? Number(form.amount) : null, due_date: form.due_date || null,
+      });
+      alert(`청구서 ${result.created}건 · ${result.total_amount.toLocaleString()}원 발행` +
+        (result.skipped_existing ? `\n같은 항목의 미납 청구서가 있어 건너뜀 ${result.skipped_existing}명` : "") +
+        (result.skipped_no_fee ? `\n수강료가 설정되지 않아 건너뜀 ${result.skipped_no_fee}명 (설정 → 결제 정보)` : "") +
+        "\n학부모 포털에 청구서 알림이 갔습니다.");
+      onDone();
+    } catch (e) {
+      setErr(errorText(e, "청구서를 발행하지 못했습니다."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 460 }}>
+        <h3>청구서 일괄 발행</h3>
+        <p className="meta" style={{ marginBottom: 12 }}>
+          재원생 {active.length}명에게 발행합니다{members.length !== active.length ? ` (퇴원생 ${members.length - active.length}명 제외)` : ""}.
+          금액을 비우면 설정의 반별 수강료(없으면 기본 수강료)로 계산합니다.
+        </p>
+        <div className="form-row"><label>청구 항목 *</label>
+          <input className="input" value={form.item_name} onChange={(e) => setForm({ ...form, item_name: e.target.value })} /></div>
+        <div className="form-row"><label>금액 (원, 비우면 자동)</label>
+          <input className="input" type="number" min="1" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} placeholder="자동 계산" /></div>
+        <div className="form-row"><label>납부 기한</label>
+          <input className="input" type="date" value={form.due_date} onChange={(e) => setForm({ ...form, due_date: e.target.value })} /></div>
+        {err && <div className="error-banner">{err}</div>}
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={onClose}>취소</button>
+          <button className="btn" onClick={submit} disabled={busy || active.length === 0}>{busy ? "발행 중…" : `${active.length}명 발행`}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BulkNotifyModal({ members, onClose, onDone }) {
+  const [form, setForm] = useState({ title: "안내", message: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const submit = async () => {
+    if (!form.message.trim()) return setErr("보낼 내용을 입력하세요.");
+    setBusy(true); setErr(null);
+    let sent = 0, noParent = 0;
+    try {
+      for (const m of members) {
+        const result = await notifyMemberParents(m.member_id, { title: form.title, message: form.message, kind: "NOTICE" });
+        if (result.sent) sent += result.sent; else noParent += 1;
+      }
+      alert(`학부모 ${sent}명에게 앱 알림을 보냈습니다.${noParent ? `\n학부모 계정이 연결되지 않은 학생 ${noParent}명은 보내지 못했습니다.` : ""}`);
+      onDone();
+    } catch (e) {
+      setErr(errorText(e, "알림을 보내지 못했습니다."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 460 }}>
+        <h3>학부모 알림 보내기</h3>
+        <p className="meta" style={{ marginBottom: 12 }}>선택한 {members.length}명의 학부모 포털에 알림을 보냅니다. (문자·카카오톡이 아닌 앱 내 알림)</p>
+        <div className="form-row"><label>제목</label>
+          <input className="input" maxLength={100} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></div>
+        <div className="form-row"><label>내용 *</label>
+          <textarea maxLength={1000} value={form.message} onChange={(e) => setForm({ ...form, message: e.target.value })} placeholder="예: 내일은 승급 심사로 수업 시간이 30분 앞당겨집니다." /></div>
+        {err && <div className="error-banner">{err}</div>}
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={onClose}>취소</button>
+          <button className="btn" onClick={submit} disabled={busy}>{busy ? "보내는 중…" : "보내기"}</button>
         </div>
       </div>
     </div>

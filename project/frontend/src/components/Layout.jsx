@@ -1,6 +1,7 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { createAdminAccount, exportAdminData, fetchAdminAccounts, fetchAppSettings, fetchClasses, fetchMe, importAdminSettings, saveAppSettings, signOut, updateAdminAccount } from "../api";
+import { createAdminAccount, errorText, exportAdminData, fetchAdminAccounts, fetchAdminNotifications, fetchAdminSummary, fetchAppSettings, fetchClasses, fetchMe, importAdminSettings, loadDemoData, markAdminNotificationsRead, saveAppSettings, signOut, updateAdminAccount } from "../api";
+import { NOTIFICATION_META, WEATHER_CITIES, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import { resizeImageFile } from "../utils/image";
 
 const SETTINGS_STYLES = `
@@ -23,12 +24,13 @@ const initialNavItems = [
   { id: "members",     to: "/members",     label: "학생 관리", icon: "👥" },
   { id: "classes",     to: "/classes",     label: "수업 관리", icon: "📒"},
   { id: "attendances", to: "/attendances", label: "출석 체크", icon: "✓" },
+  { id: "kiosk",       to: "/kiosk",       label: "출석 키오스크", icon: "📲" },
   { id: "community",   to: "/community",   label: "커뮤니티",  icon: "🤝" },
-  { id: "checkout",    to: "/admin-checkout",    label: "원격결제",  icon: "💳" },
+  { id: "checkout",    to: "/admin-checkout",    label: "수납·청구",  icon: "💳" },
   { id: "AIservice",   to: "/aiservice",   label: "AI비서",  icon: "🤖"},
   { id: "shop",        to: "/shop",        label: "쇼핑몰",   icon: "🛍️" },
 ];
-const STAFF_PATHS = ["/shop"]; // 직원 계정이 Layout 안에서 볼 수 있는 화면
+const STAFF_PATHS = ["/shop", "/kiosk"]; // 직원 계정이 볼 수 있는 화면 (키오스크는 Layout 밖 전체 화면)
 
 function readLocalJson(key, fallback) {
   try {
@@ -39,7 +41,12 @@ function readLocalJson(key, fallback) {
 }
 
 export default function Layout() {
-  const [notifications, setNotifications] = useState(() => readLocalJson("dashboard_notifications", []));
+  // v8.1: 알림함은 서버 알림(결제 완료·학부모 댓글·검토 대기·자녀 연결 등) + 오늘의 업무 정시 알림
+  const [notifications, setNotifications] = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [globalQuery, setGlobalQuery] = useState("");
+  const searchRef = useRef(null);
+  const lastUnreadRef = useRef(null);
   const [toasts, setToasts] = useState([]);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   
@@ -90,15 +97,10 @@ export default function Layout() {
 
   // [신규] 기관 정보 상태 (학원/도장명, 원장/관장명, 로고 등)
   const [academyInfo, setAcademyInfo] = useState(() => {
+    // 화면 깜빡임을 줄이기 위한 이전 값 캐시. 실제 값은 서버(설정·상단 요약)에서 받아 덮어씀
     return readLocalJson("app_academy_info", {
-      name: "한빛학원",
-      branch: "강남캠퍼스",
-      principal: "김선생님",
-      role: "관리자",
-      phone: "010-1234-5678",
-      address: "서울시 강남구 테헤란로 123",
-      logo: "",
-      facilityType: "학원"
+      name: "", branch: "", principal: "", role: "관리자", phone: "", address: "", logo: "",
+      facilityType: "학원", weatherCity: "용인", lateGraceMinutes: 10,
     });
   });
 
@@ -186,9 +188,6 @@ export default function Layout() {
     localStorage.setItem("app_payment_settings", JSON.stringify(paymentSettings));
   }, [paymentSettings]);
 
-  useEffect(() => {
-    localStorage.setItem("dashboard_notifications", JSON.stringify(notifications));
-  }, [notifications]);
 
   useEffect(() => {
     if (!authChecking && !authStatus) {
@@ -205,77 +204,120 @@ export default function Layout() {
 
   const visibleMenu = isOwner ? menuOrder : menuOrder.filter((item) => STAFF_PATHS.includes(item.to));
 
-  const unreadCount = useMemo(() => notifications.filter(n => !n.isRead).length, [notifications]);
+  const unreadCount = summary?.unread_notifications || 0;
+  const badges = summary?.badges || {};
+  const brand = summary?.brand || academyInfo;
 
-  // 글로벌 실시간 시간 트래킹 엔진 (Background Engine)
-  useEffect(() => {
-    const checkGlobalActivityTime = () => {
-      const now = new Date();
-      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-      const todayDateStr = now.toISOString().slice(0, 10);
+  const pushToast = useCallback((toast) => {
+    const id = `${toast.key || Date.now()}-${Math.random()}`;
+    setToasts((prev) => [...prev.slice(-3), { ...toast, id }]);
+    window.setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 15000);
+  }, []);
 
-      const savedTodos = localStorage.getItem("dashboard_todos");
-      const todos = savedTodos ? JSON.parse(savedTodos) : [];
-
-      const savedKeys = localStorage.getItem("dashboard_notified_keys");
-      let notifiedKeys = savedKeys ? JSON.parse(savedKeys) : [];
-
-      let hasUpdates = false;
-      let updatedNotifications = [...notifications];
-
-      todos.forEach(todo => {
-        const uniqueKey = `${todayDateStr}_${todo.id}_${todo.time}`;
-
-        if (todo.time === currentHHMM && !notifiedKeys.includes(uniqueKey)) {
-          const sharedNotificationId = Date.now() + Math.random();
-
-          const newNotif = {
-            id: sharedNotificationId,
-            text: todo.text,
-            time: todo.time,
-            isRead: false,
-            timestamp: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          };
-          updatedNotifications = [newNotif, ...updatedNotifications];
-          hasUpdates = true;
-
-          const newToast = { id: sharedNotificationId, text: todo.text, time: todo.time };
-          setToasts(prev => [...prev, newToast]);
-          notifiedKeys.push(uniqueKey);
-
-          setTimeout(() => {
-            setToasts(prev => prev.filter(t => t.id !== newToast.id));
-          }, 30000);
-        }
-      });
-
-      if (hasUpdates) {
-        setNotifications(updatedNotifications);
-        localStorage.setItem("dashboard_notified_keys", JSON.stringify(notifiedKeys));
+  // 상단 요약 20초마다 조회 (탭이 보일 때만) — 새 알림은 토스트로, 백그라운드면 브라우저 알림
+  const refreshSummary = useCallback(async () => {
+    try {
+      const next = await fetchAdminSummary();
+      setSummary(next);
+      if (lastUnreadRef.current != null && next.unread_notifications > lastUnreadRef.current) {
+        const latest = await fetchAdminNotifications({ unread_only: true, limit: next.unread_notifications - lastUnreadRef.current });
+        latest.items.slice(0, 3).forEach((n) => {
+          pushToast({ title: `${NOTIFICATION_META[n.kind]?.icon || "🔔"} ${n.title}`, text: n.body, key: `n${n.notification_id}` });
+          showBrowserNotification(n.title, n.body);
+        });
       }
+      lastUnreadRef.current = next.unread_notifications;
+    } catch { /* 일시적 오류는 다음 주기에 재시도 */ }
+  }, [pushToast]);
+
+  useEffect(() => {
+    if (authChecking || !authStatus) return undefined;
+    refreshSummary();
+    return startVisiblePolling(refreshSummary, 20000);
+  }, [authChecking, authStatus, refreshSummary]);
+
+  // 오늘의 업무 정시 알림 (서버에 저장된 업무 중 시간이 지정된 항목)
+  useEffect(() => {
+    const todos = summary?.todos || [];
+    if (!todos.length) return undefined;
+    const check = () => {
+      const now = new Date();
+      const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const day = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+      const notified = readLocalJson("dashboard_notified_keys", []);
+      const due = todos.filter((t) => t.due_time === hhmm && !notified.includes(`${day}_${t.todo_id}`));
+      if (!due.length) return;
+      due.forEach((t) => {
+        pushToast({ title: "📅 오늘의 업무", text: `[${t.due_time}] ${t.text}`, key: `t${t.todo_id}` });
+        showBrowserNotification("오늘의 업무", `[${t.due_time}] ${t.text}`);
+      });
+      try { localStorage.setItem("dashboard_notified_keys", JSON.stringify([...notified, ...due.map((t) => `${day}_${t.todo_id}`)].slice(-200))); } catch { /* 무시 */ }
     };
+    check();
+    const timer = window.setInterval(check, 15000);
+    return () => window.clearInterval(timer);
+  }, [summary?.todos, pushToast]);
 
-    const timerId = setInterval(checkGlobalActivityTime, 5000);
-    checkGlobalActivityTime();
+  // ⌘K / Ctrl+K → 상단 검색창
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); searchRef.current?.focus(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-    return () => clearInterval(timerId);
-  }, [notifications]);
-
-  // --------------------------------------------------------
-  // ⭐ 핸들러 함수들
-  // --------------------------------------------------------
-  const handleNotificationClick = (id) => {
-    setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
+  const openNotifications = async () => {
+    const next = !isDropdownOpen;
+    setIsDropdownOpen(next);
+    if (next) {
+      try {
+        if (typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => null);
+        setNotifications((await fetchAdminNotifications({ limit: 30 })).items);
+      } catch { /* 무시 */ }
+    }
   };
 
-  const handleNotificationDelete = (id, e) => {
-    e.stopPropagation();
-    setNotifications(prev => prev.filter(n => n.id !== id));
+  const handleNotificationClick = async (n) => {
+    if (!n.is_read) {
+      setNotifications((prev) => prev.map((x) => (x.notification_id === n.notification_id ? { ...x, is_read: true } : x)));
+      await markAdminNotificationsRead({ ids: [n.notification_id] }).catch(() => null);
+      refreshSummary();
+    }
+    const target = NOTIFICATION_META[n.kind]?.admin;
+    setIsDropdownOpen(false);
+    if (target && isOwner) navigate(target);
   };
 
-  const handleRemoveToast = (id) => {
-    setToasts(prev => prev.filter(t => t.id !== id));
-    setNotifications(prev => prev.filter(n => n.id !== id));
+  const handleReadAll = async () => {
+    await markAdminNotificationsRead({ all: true }).catch(() => null);
+    setNotifications((prev) => prev.map((x) => ({ ...x, is_read: true })));
+    refreshSummary();
+  };
+
+  const handleRemoveToast = (id) => setToasts((prev) => prev.filter((t) => t.id !== id));
+
+  const handleGlobalSearch = (e) => {
+    e.preventDefault();
+    const q = globalQuery.trim();
+    if (!q || !isOwner) return;
+    navigate(`/members?q=${encodeURIComponent(q)}`);
+  };
+
+  const handleDemoData = async () => {
+    if (!window.confirm("시연용 가상 데이터(학생 12명·수업·출결·청구서·공지·커뮤니티)를 넣을까요?\n기존 데이터는 지우지 않습니다.")) return;
+    try {
+      const result = await loadDemoData(false).catch(async (error) => {
+        if (error?.response?.status === 409 && window.confirm(`${errorText(error)}\n그래도 추가로 넣을까요?`)) return loadDemoData(true);
+        throw error;
+      });
+      if (!result) return;
+      // 열려 있는 화면·설정값이 새 데이터를 반영하도록 안내 후 새로고침
+      window.alert(`데모 데이터를 넣었습니다.\n\n· 키오스크: 보호자 번호 뒤 4자리 ${result.kiosk_digits}\n· 학부모 체험: 자녀 ${result.parent_demo.child_name} / ${result.parent_demo.phone}`);
+      window.location.assign("/dashboard");
+    } catch (error) {
+      setSettingsMessage(errorText(error, "데모 데이터를 넣지 못했습니다."));
+    }
   };
 
   const handleLogout = async () => {
@@ -340,7 +382,6 @@ export default function Layout() {
       setTheme("light");
       setFontSize("normal");
       setMenuOrder(initialNavItems);
-      setNotifications([]);
       setSettingsMessage("화면 환경 설정만 초기화했습니다. 업무 데이터는 보존했습니다.");
     }
   };
@@ -443,16 +484,16 @@ export default function Layout() {
       <aside className="sidebar">
         {/* ⭐ 설정된 학원명/로고를 동적으로 렌더링 */}
         <div className="sidebar-brand">
-          <div className="sidebar-logo" style={{ overflow: 'hidden', padding: academyInfo.logo ? 0 : undefined, background: academyInfo.logo ? "transparent" : "var(--primary)" }}>
-            {academyInfo.logo ? (
-              <img src={academyInfo.logo} alt="로고" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          <div className="sidebar-logo" style={{ overflow: 'hidden', padding: brand.logo ? 0 : undefined, background: brand.logo ? "transparent" : "var(--primary)" }}>
+            {brand.logo ? (
+              <img src={brand.logo} alt="로고" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
             ) : (
-              academyInfo.name ? academyInfo.name.charAt(0) : "학"
+              brand.name ? brand.name.charAt(0) : "시"
             )}
           </div>
           <div>
-            <div className="sidebar-brand-name">{academyInfo.name || "학원명 미설정"}</div>
-            <div className="sidebar-brand-sub">{academyInfo.branch || "지점명"}</div>
+            <div className="sidebar-brand-name">{brand.name || "기관명을 설정하세요"}</div>
+            <div className="sidebar-brand-sub">{brand.branch || (isOwner ? "⚙ 설정 → 기관 정보" : "")}</div>
           </div>
         </div>
 
@@ -474,11 +515,15 @@ export default function Layout() {
             >
               <span style={{ width: 18, textAlign: "center" }}>{item.icon}</span>
               <span>{item.label}</span>
-              {item.id === "community" && (
-                <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 9999, background: "var(--primary)", color: "#fff" }}>N</span>
+              {item.id === "community" && (badges.moderation_pending > 0 || badges.community_new > 0) && (
+                <span title={badges.moderation_pending ? `검토 대기 댓글 ${badges.moderation_pending}건` : `24시간 새 댓글 ${badges.community_new}건`}
+                  style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 9999,
+                    background: badges.moderation_pending ? "var(--danger)" : "var(--primary)", color: "#fff" }}>
+                  {badges.moderation_pending ? `검토 ${badges.moderation_pending}` : `N ${badges.community_new}`}
+                </span>
               )}
-              {item.id === "checkout" && (
-                <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 9999, background: "var(--danger-soft)", color: "var(--danger-text)" }}>미납</span>
+              {item.id === "checkout" && badges.unpaid_invoices > 0 && (
+                <span title={`미납 청구서 ${badges.unpaid_invoices}건`} style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 9999, background: "var(--danger-soft)", color: "var(--danger-text)" }}>미납 {badges.unpaid_invoices}</span>
               )}
             </NavLink>
           ))}
@@ -487,11 +532,11 @@ export default function Layout() {
         {/* ⭐ 설정된 원장님 이름/직책을 동적으로 렌더링 */}
         <div className="sidebar-foot">
           <div className="avatar">
-            {academyInfo.principal ? academyInfo.principal.charAt(0) : "원"}
+            {(brand.principal || account.username || "관").charAt(0)}
           </div>
           <div>
-            <div className="sidebar-foot-name">{academyInfo.principal || "이름 미설정"}</div>
-            <div className="sidebar-foot-role">{academyInfo.role || "관리자"} · {authStatus ? account.username : "로그아웃 상태"}</div>
+            <div className="sidebar-foot-name">{isOwner ? (brand.principal || account.username) : account.username}</div>
+            <div className="sidebar-foot-role">{isOwner ? (brand.role || "원장") : "직원"} · {account.email}</div>
           </div>
           {isOwner ? (
             <div
@@ -510,14 +555,16 @@ export default function Layout() {
 
       <main className="main">
         <div className="topbar">
-          <div className="topbar-search">
-            <input placeholder="학생 이름 또는 전화번호 검색" />
+          <form className="topbar-search" onSubmit={handleGlobalSearch} role="search">
+            <input ref={searchRef} value={globalQuery} onChange={(e) => setGlobalQuery(e.target.value)}
+              placeholder={isOwner ? "학생 이름·보호자 이름·전화번호 검색 (Enter)" : "검색은 원장 계정에서 사용할 수 있습니다"}
+              disabled={!isOwner} aria-label="학생 검색" />
             <span className="kbd">⌘K</span>
-          </div>
+          </form>
           
           <button type="button" className="btn ghost sm" style={{ marginLeft: "auto", marginRight: 8 }} onClick={() => navigate("/")}>역할 변경</button>
           <div className="topbar-bell-wrapper">
-            <button className="topbar-bell" onClick={() => setIsDropdownOpen(!isDropdownOpen)}>
+            <button className="topbar-bell" onClick={openNotifications} aria-label={`알림 ${unreadCount}건`}>
               🔔
               {unreadCount > 0 && (
                 <span className="topbar-bell-badge">{unreadCount}</span>
@@ -526,30 +573,27 @@ export default function Layout() {
 
             {isDropdownOpen && (
               <div className="notification-dropdown">
-                <div className="notification-header">실시간 업무 알림 센터</div>
+                <div className="notification-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span>알림 {unreadCount > 0 ? `(${unreadCount})` : ""}</span>
+                  {unreadCount > 0 && <button className="notification-del-btn" onClick={handleReadAll}>모두 읽음</button>}
+                </div>
                 {notifications.length === 0 ? (
-                  <div className="notification-empty">도착한 정시 알림 내역이 없습니다.</div>
+                  <div className="notification-empty">새 알림이 없습니다. 결제 완료·학부모 댓글·검토 대기 등이 여기에 표시됩니다.</div>
                 ) : (
                   notifications.map((n) => (
-                    <div 
-                      key={n.id} 
-                      className={`notification-item ${n.isRead ? '' : 'unread'}`}
-                      onClick={() => handleNotificationClick(n.id)}
+                    <div
+                      key={n.notification_id}
+                      className={`notification-item ${n.is_read ? '' : 'unread'}`}
+                      onClick={() => handleNotificationClick(n)}
+                      style={{ cursor: "pointer" }}
                     >
                       <div className="notification-item-body">
                         <div className="notification-item-text">
-                          <span className="notification-notif-time">[{n.time}]</span> {n.text}
+                          <span style={{ marginRight: 4 }}>{NOTIFICATION_META[n.kind]?.icon || "🔔"}</span><b>{n.title}</b>
+                          {n.body && <div style={{ fontSize: 12, color: "var(--text-2)", marginTop: 2 }}>{n.body}</div>}
                         </div>
-                        <div className="notification-item-meta">
-                          {n.timestamp} · {n.isRead ? "확인됨" : "새 알림"}
-                        </div>
+                        <div className="notification-item-meta">{relativeTime(n.created_at)} · {n.is_read ? "확인됨" : "새 알림"}</div>
                       </div>
-                      <button 
-                        className="notification-del-btn"
-                        onClick={(e) => handleNotificationDelete(n.id, e)}
-                      >
-                        삭제
-                      </button>
                     </div>
                   ))
                 )}
@@ -567,10 +611,8 @@ export default function Layout() {
         {toasts.map(t => (
           <div key={t.id} className="toast-item">
             <div className="toast-content">
-              <div className="toast-title">📅 오늘의 할 일</div>
-              <div className="toast-text">
-                <span className="toast-time">[{t.time}]</span> {t.text}
-              </div>
+              <div className="toast-title">{t.title}</div>
+              <div className="toast-text">{t.text}</div>
             </div>
             <button className="toast-close-btn" onClick={() => handleRemoveToast(t.id)}>✕</button>
           </div>
@@ -704,7 +746,7 @@ export default function Layout() {
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
                     <div className="form-row">
                       <label>도장/학원 이름</label>
-                      <input type="text" className="input" value={academyInfo.name} onChange={(e) => setAcademyInfo({...academyInfo, name: e.target.value})} placeholder="예: 한빛학원" />
+                      <input type="text" className="input" value={academyInfo.name} onChange={(e) => setAcademyInfo({...academyInfo, name: e.target.value})} placeholder="예: 한빛 태권도장" />
                     </div>
                     <div className="form-row">
                       <label>지점명 (캠퍼스)</label>
@@ -712,7 +754,7 @@ export default function Layout() {
                     </div>
                     <div className="form-row">
                       <label>관장/원장 이름</label>
-                      <input type="text" className="input" value={academyInfo.principal} onChange={(e) => setAcademyInfo({...academyInfo, principal: e.target.value})} placeholder="예: 김선생님" />
+                      <input type="text" className="input" value={academyInfo.principal} onChange={(e) => setAcademyInfo({...academyInfo, principal: e.target.value})} placeholder="예: 김관장" />
                     </div>
                     <div className="form-row">
                       <label>관리자 직책</label>
@@ -720,8 +762,22 @@ export default function Layout() {
                     </div>
                   </div>
 
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                    <div className="form-row">
+                      <label>대시보드 날씨 지역</label>
+                      <select className="select" value={academyInfo.weatherCity || "용인"} onChange={(e) => setAcademyInfo({ ...academyInfo, weatherCity: e.target.value })}>
+                        {Object.keys(WEATHER_CITIES).map((city) => <option key={city} value={city}>{city}</option>)}
+                      </select>
+                    </div>
+                    <div className="form-row">
+                      <label>키오스크 지각 기준 (수업 시작 후 분)</label>
+                      <input type="number" min="0" max="60" className="input" value={academyInfo.lateGraceMinutes ?? 10}
+                        onChange={(e) => setAcademyInfo({ ...academyInfo, lateGraceMinutes: Number(e.target.value) })} />
+                    </div>
+                  </div>
+
                   <div className="form-row">
-                    <label>대표 연락처</label>
+                    <label>대표 연락처 (학부모 포털에 표시)</label>
                     <input type="text" className="input" value={academyInfo.phone} onChange={(e) => setAcademyInfo({...academyInfo, phone: e.target.value})} placeholder="예: 02-123-4567" />
                   </div>
                   <div className="form-row">
@@ -866,6 +922,14 @@ export default function Layout() {
                       <button className="btn ghost sm" type="button" onClick={handleExportData}>데이터 내보내기</button>
                       <label className="btn ghost sm" style={{ cursor: "pointer" }}>설정 파일 복원<input type="file" accept="application/json,.json" onChange={handleImportSettings} style={{ display: "none" }} /></label>
                     </div>
+                  </section>
+                  <section style={{ padding: 16, border: "1px solid var(--border)", background: "var(--primary-soft)" }}>
+                    <h4 style={{ margin: "0 0 5px" }}>시연용 데모 데이터</h4>
+                    <p style={{ margin: "0 0 12px", color: "var(--text-2)", fontSize: 12, lineHeight: 1.6 }}>
+                      발표·전시회용 가상 데이터(학생 12명, 수업 3개, 35일 출결, 6개월 결제, 청구서, 공지, 과제, 모니터링 예시 댓글)를 넣습니다.
+                      기존 데이터는 지우지 않으며, 오늘 출결은 비워 두어 키오스크로 바로 체험할 수 있습니다.
+                    </p>
+                    <button className="btn sm" type="button" onClick={handleDemoData}>데모 데이터 넣기</button>
                   </section>
                   <section style={{ padding: 16, border: "1px solid var(--border)" }}>
                     <h4 style={{ margin: "0 0 5px" }}>화면 환경 초기화</h4>

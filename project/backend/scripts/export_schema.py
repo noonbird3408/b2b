@@ -44,6 +44,12 @@ def render() -> str:
         for index in sorted(table.indexes, key=lambda i: i.name or ""):
             lines.append(str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect)).strip() + ";")
         lines.append("")
+    lines.append("-- 이전 버전으로 이미 테이블을 만든 경우를 위한 컬럼 보완 (있으면 건너뜀)")
+    for table, column, ddl, index in main.COLUMN_PATCHES:
+        lines.append(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl};")
+        if index:
+            lines.append(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column});")
+    lines.append("")
     lines.append(FOOTER.strip())
     lines += [f"ALTER TABLE {t.name} ENABLE ROW LEVEL SECURITY;" for t in tables]
     lines += ["", f"SELECT 'setup 완료 — 테이블 {len(tables)}개 준비됨' AS result;"]
