@@ -1,0 +1,14 @@
+# Vercel 은 저장소 루트의 requirements.txt 로 Python 함수(api/index.py)를 빌드합니다.
+# backend/requirements.txt 와 같은 패키지 목록을 유지하세요 (setup.py 가 불일치를 경고합니다).
+fastapi==0.136.3
+starlette==1.2.1
+uvicorn==0.48.0
+pydantic==2.13.4
+python-multipart==0.0.31
+python-dotenv==1.0.1
+SQLAlchemy==2.0.50
+psycopg[binary]>=3.2
+requests>=2.31.0
+google-genai>=1.0.0
+tzdata>=2024.1
+apscheduler>=3.10.0

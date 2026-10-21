@@ -1,0 +1,68 @@
+# =====================================================================
+# 시설 통합 관리 시스템 - .gitignore
+# 저장소 루트(project/)에 둡니다. 백엔드(Python) + 프론트엔드(Node) 공용.
+# =====================================================================
+
+# ----- 비밀/환경설정 (절대 커밋 금지) -----
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+
+# ----- Python / FastAPI 백엔드 -----
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 과제 첨부 업로드 (런타임 생성물)
+backend/uploads/
+uploads/
+
+# ----- Node / React / Vite 프론트엔드 -----
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
+*.tsbuildinfo
+
+# 패키지 매니저 디버그 로그
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ----- 에디터 / IDE -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ----- OS 생성 파일 -----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----- 로컬 DB / 정리 대기 / 배포 -----
+# (.env.vercel 은 위의 .env.* 규칙으로 제외됩니다 — 비밀 값이 들어 있으니 커밋 금지)
+*.db
+*.sqlite3
+_to_delete/
+.vercel/
+
+# ----- 로그 / 임시 -----
+*.log
+*.tmp

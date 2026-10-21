@@ -1,0 +1,25 @@
+# ===== 시설 통합 관리 시스템 - 백엔드 의존성 =====
+# ⚠️ 저장소 루트의 requirements.txt(Vercel 이 읽는 파일)와 내용을 같게 유지하세요.
+# 웹 프레임워크
+fastapi==0.136.3
+starlette==1.2.1
+uvicorn==0.48.0
+pydantic==2.13.4
+python-multipart==0.0.31
+python-dotenv==1.0.1
+
+# DB: Supabase(PostgreSQL) — 테스트·로컬은 파이썬 내장 SQLite
+SQLAlchemy==2.0.50
+psycopg[binary]>=3.2
+
+# 외부 API (카카오페이 / Google 토큰 검증 / 쇼핑몰 피드)
+requests>=2.31.0
+
+# AI (Gemini 서버 프록시)
+google-genai>=1.0.0
+
+# 시간대 데이터(Asia/Seoul) — 서버(Vercel)에 시간대 DB 가 없어도 한국 시간 계산
+tzdata>=2024.1
+
+# 로컬 상시 실행용 결제 대기 자동 정리 (Vercel 에서는 Cron 사용)
+apscheduler>=3.10.0
