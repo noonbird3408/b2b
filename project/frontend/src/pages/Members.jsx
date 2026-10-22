@@ -1,115 +1,136 @@
-import React, { useEffect, useState, useMemo } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import {
-  fetchMembers, createMember, updateMember, deleteMember, fetchClasses, fetchEnrollmentMap, extractStudentInfoFromImage,
-  fetchDashboardInsights, bulkCreateInvoices, notifyMemberParents, errorText, localToday,
+  fetchMembers, createMember, updateMember, deleteMember, fetchClasses, extractStudentInfoFromImage,
+  bulkCreateInvoices, notifyMemberParents, errorText, localToday, fetchApplications, approveApplication, rejectApplication,
 } from "../api";
 import { resizeImageFile } from "../utils/image";
+import { STATUS_LABEL, STATUS_TONE, useDataRefresh, won } from "../utils/sync";
 import MemberDetailDashboard from "./MemberDetailDashboard";
 
 const errorMessage = (error, fallback) => errorText(error, fallback);
-
-// [FIX] UTC 기준 날짜(오전 9시 전 '어제')가 아닌 현지 날짜
 const today = () => localToday();
+
+const STYLES = `
+.mem-table{min-width:620px;}
+.mem-table td{vertical-align:middle;}
+.mem-table .member-cell .name,.mem-table .member-cell .sub{white-space:nowrap;}
+.mem-classes{display:flex;flex-direction:column;gap:4px;min-width:180px;}
+.mem-class{display:flex;align-items:center;gap:6px;font-size:12px;border:0;background:none;padding:0;text-align:left;color:var(--text);}
+.mem-class .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.mem-class .nm{font-weight:600;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mem-class .rate{color:var(--text-3);font-size:11px;}
+.mem-class .badge{font-size:10px;padding:1px 6px;}
+.col-wide{display:none;}
+@media(min-width:1500px){.col-wide{display:table-cell;}}
+.app-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;display:grid;gap:10px;}
+.app-card .head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+.app-card .head h4{margin:0;font-size:16px;}
+.app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;}
+.app-kv{display:grid;grid-template-columns:72px 1fr;gap:4px 10px;font-size:13px;}
+.app-kv span:nth-child(odd){color:var(--text-3);}
+.member-row-menu{position:absolute;right:0;z-index:10;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);padding:4px;min-width:90px;display:flex;flex-direction:column;}
+.member-row-menu button{background:none;border:0;padding:7px 12px;text-align:left;font-size:13px;border-radius:6px;color:var(--text);}
+.member-row-menu button:hover{background:var(--surface-hover);}
+@media(max-width:700px){.mem-hide-sm{display:none;}.app-grid{grid-template-columns:1fr;}}
+`;
 
 const ageToGrade = (age) => {
   if (age == null) return "";
-  if (age >= 7  && age <= 12) return `초${age - 6}`;
+  if (age >= 7 && age <= 12) return `초${age - 6}`;
   if (age >= 13 && age <= 15) return `중${age - 12}`;
   if (age >= 16 && age <= 18) return `고${age - 15}`;
   return "";
 };
 
-const formatPaymentDay = (dateStr) => {
-  if (!dateStr) return "-";
-  const d = new Date(dateStr);
-  return `매월 ${d.getDate()}일`;
-};
+const formatPaymentDay = (dateStr) => (dateStr ? `매월 ${new Date(dateStr).getDate()}일` : "-");
 
-
-// v8.1: 미납 = 서버의 '미납' 청구서 기준 (기존: 마지막 납부일이 30일 지났는지로 추정)
 const paymentBadge = (m) => {
   if (m.status === "WITHDRAWN") return { cls: "gray", label: "퇴원" };
-  if (m.unpaid_count > 0) return { cls: "danger", label: `미납 ${m.unpaid_count}건 · ${Number(m.unpaid_amount || 0).toLocaleString()}원` };
-  return { cls: "success", label: "미납 없음" };
+  if (m.unpaid_count > 0) return { cls: "danger", label: `미납 ${won(m.unpaid_amount)}` };
+  return { cls: "success", label: "완납" };
 };
 
 export default function Members() {
+  const navigate = useNavigate();
+  const { isOwner } = useOutletContext() || { isOwner: true };
   const [members, setMembers] = useState([]);
-  const [classes, setClasses] = useState([]); 
-  const [memberClasses, setMemberClasses] = useState({}); 
-
-  const [statusFilter, setStatusFilter] = useState(""); 
-  const [classFilter, setClassFilter] = useState(""); 
-  const [gradeFilter, setGradeFilter] = useState(""); 
-  // 상단 통합 검색(⌘K)에서 /members?q=... 로 들어오면 그 검색어로 조회
+  const [classes, setClasses] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [statusFilter, setStatusFilter] = useState("ACTIVE");
+  const [classFilter, setClassFilter] = useState("");
+  const [gradeFilter, setGradeFilter] = useState("");
   const [searchParams, setSearchParams] = useSearchParams();
   const urlQ = searchParams.get("q") || "";
+  const urlMemberId = searchParams.get("member_id") || searchParams.get("member");
+  const tab = searchParams.get("tab") === "applications" ? "applications" : "list";
   const [q, setQ] = useState(urlQ);
-  const [insights, setInsights] = useState(null);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
-  const [bulkModal, setBulkModal] = useState(null);   // "invoice" | "notify" | null
+  const [bulkModal, setBulkModal] = useState(null);
   const [showModal, setShowModal] = useState(false);
   const [showOcrModal, setShowOcrModal] = useState(false);
-  
-  const [editingMember, setEditingMember] = useState(null); 
-  const [activeMenuId, setActiveMenuId] = useState(null);   
+  const [editingMember, setEditingMember] = useState(null);
+  const [activeMenuId, setActiveMenuId] = useState(null);
   const [error, setError] = useState(null);
-  const [selectedMember, setSelectedMember] = useState(null);
+  const [selectedId, setSelectedId] = useState(null);
+  const [applications, setApplications] = useState([]);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
-      let classData = [];
-      try {
-        const rawClassData = await fetchClasses();
-        classData = Array.isArray(rawClassData) ? rawClassData : [];
-      } catch (err) {
-        classData = [];
-      }
-      setClasses(classData);
-
-      const rawMemData = await fetchMembers({
-        status: statusFilter || undefined,
-        class_id: classFilter || undefined,
-        grade: gradeFilter || undefined,
-        q: urlQ || undefined
-      });
-      
-      let validMembers = Array.isArray(rawMemData) ? rawMemData : [];
-      
-      if (gradeFilter) {
-        validMembers = validMembers.filter(m => {
-          const grade = ageToGrade(m.age); 
-          if (gradeFilter === "초등") return grade.startsWith("초");
-          if (gradeFilter === "중등") return grade.startsWith("중");
-          if (gradeFilter === "고등") return grade.startsWith("고");
-          return true;
-        });
-      }
-      setMembers(validMembers);
-
-      // [PERF] 학생 수만큼 /api/members/{id}/classes 를 호출하던 N+1 → 1회 호출
-      let classesMap = {};
-      try {
-        classesMap = await fetchEnrollmentMap();
-      } catch (e) {
-        classesMap = {};
-      }
-      setMemberClasses(classesMap);
-      setError(null); 
+      const [memberRows, classRows] = await Promise.all([
+        fetchMembers({ status: statusFilter || undefined, class_id: classFilter || undefined, q: urlQ || undefined }),
+        fetchClasses().catch(() => []),
+      ]);
+      let rows = Array.isArray(memberRows) ? memberRows : [];
+      if (gradeFilter) rows = rows.filter((m) => ageToGrade(m.age).startsWith(gradeFilter));
+      setMembers(rows);
+      setClasses(Array.isArray(classRows) ? classRows : []);
+      setError(null);
     } catch (e) {
-      console.error(e); 
-      setError(e.message || "데이터를 불러오는 중 오류가 발생했습니다.");
+      setError(errorMessage(e, "학생 목록을 불러오지 못했습니다."));
+    } finally {
+      setLoaded(true);
+    }
+  }, [statusFilter, classFilter, gradeFilter, urlQ]);
+
+  const loadApplications = useCallback(() => {
+    if (!isOwner) return;
+    fetchApplications("").then(setApplications).catch(() => setApplications([]));
+  }, [isOwner]);
+
+  useEffect(() => { setQ(urlQ); }, [urlQ]);
+  useEffect(() => { load(); setSelectedIds(new Set()); }, [load]);
+  useEffect(loadApplications, [loadApplications]);
+  useDataRefresh(() => { load(); loadApplications(); });
+
+  // 알림·출석 화면에서 학생을 지정해 들어오면 상세 패널을 바로 엶 (퇴원생도 찾을 수 있도록 상태 필터 해제)
+  useEffect(() => {
+    if (!urlMemberId) return;
+    if (loaded && !members.some((m) => String(m.member_id) === urlMemberId) && statusFilter) setStatusFilter("");
+    else if (members.some((m) => String(m.member_id) === urlMemberId)) setSelectedId(Number(urlMemberId));
+  }, [members, urlMemberId, loaded, statusFilter]);
+
+  const selectedMember = members.find((m) => m.member_id === selectedId) || null;
+  const pendingApps = applications.filter((a) => a.status === "PENDING");
+
+  const setTab = (next) => {
+    const params = new URLSearchParams(searchParams);
+    if (next === "applications") params.set("tab", "applications"); else params.delete("tab");
+    setSearchParams(params);
+  };
+  const closeDetail = () => {
+    setSelectedId(null);
+    if (urlMemberId) {
+      const params = new URLSearchParams(searchParams);
+      params.delete("member_id"); params.delete("member");
+      setSearchParams(params, { replace: true });
     }
   };
-  
-  useEffect(() => { setQ(urlQ); }, [urlQ]);
-  useEffect(() => { load(); setSelectedIds(new Set()); }, [statusFilter, classFilter, gradeFilter, urlQ]);
-  useEffect(() => { fetchDashboardInsights().then(setInsights).catch(() => setInsights(null)); }, []);
-
   const applySearch = () => {
     const next = q.trim();
-    if (next) setSearchParams({ q: next }); else setSearchParams({});
+    const params = new URLSearchParams(searchParams);
+    if (next) params.set("q", next); else params.delete("q");
+    setSearchParams(params);
   };
 
   const toggleSelect = (id) => setSelectedIds((prev) => {
@@ -122,283 +143,215 @@ export default function Members() {
   const selectedMembers = members.filter((m) => selectedIds.has(m.member_id));
 
   const onDelete = async (id) => {
-    if (!window.confirm("정말 삭제하시겠습니까? 출결·수강 기록과 미납 청구서가 함께 삭제됩니다.\n(결제 기록이 있는 학생은 삭제 대신 '퇴원'으로 바꿔 주세요.)")) return;
+    if (!window.confirm("이 학생을 삭제할까요? 출결·수강 기록과 미납 청구서가 함께 삭제됩니다.\n(결제 기록이 있으면 삭제 대신 '퇴원'으로 바꿔 주세요.)")) return false;
     try {
       await deleteMember(id);
-    } catch (error) {
-      alert(errorMessage(error, "학생을 삭제하지 못했습니다."));
+      load();
+      return true;
+    } catch (e) {
+      alert(errorMessage(e, "학생을 삭제하지 못했습니다."));
+      return false;
     }
-    load();
   };
 
   const handleDownloadCSV = () => {
-    if (!Array.isArray(members) || members.length === 0) {
-      alert("다운로드할 학생 데이터가 없습니다.");
-      return;
-    }
-    const headers = ["이름", "성별", "나이", "학년", "수강 과목", "등록일", "퇴원일", "부모님 연락처", "부모님 성함", "주소", "회비 납부일", "상태"];
-    
-    const rows = members.map(m => {
-      const enrolledClasses = memberClasses[m.member_id]?.join(", ") || "미수강";
-      
-      return [
-        m.name, m.gender === "M" ? "남" : "여", m.age,
-        ageToGrade(m.age) || "-", enrolledClasses, m.enrollment_date, m.withdrawal_date || "-",
-        m.mother_phone || m.father_phone || "-", m.mother_name || m.father_name || "-",
-        m.address || "-", formatPaymentDay(m.payment_date),
-        m.status === "ACTIVE" ? "재원" : "퇴원"
-      ];
-    });
-
-    const csvContent = "\uFEFF" + [headers.join(","), ...rows.map(e => e.map(val => `"${String(val).replace(/"/g, '""')}"`).join(","))].join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
+    if (!members.length) return alert("다운로드할 학생이 없습니다.");
+    const headers = ["이름", "성별", "나이", "학년", "수강 수업", "등록일", "퇴원일", "보호자 연락처", "보호자 이름", "주소", "결제일", "상태"];
+    const rows = members.map((m) => [
+      m.name, m.gender === "M" ? "남" : "여", m.age, ageToGrade(m.age) || "-",
+      (m.classes || []).map((c) => c.name).join(", ") || "미수강", m.enrollment_date, m.withdrawal_date || "-",
+      m.mother_phone || m.father_phone || "-", m.mother_name || m.father_name || "-", m.address || "-",
+      formatPaymentDay(m.payment_date), m.status === "ACTIVE" ? "재원" : "퇴원",
+    ]);
+    const csv = "﻿" + [headers.join(","), ...rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","))].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8;" }));
     const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", `학생명단_${today()}.csv`);
-    document.body.appendChild(link);
+    link.href = url;
+    link.download = `학생명단_${today()}.csv`;
     link.click();
-    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
-  // 통계는 서버 집계(대시보드 인사이트)와 같은 정의를 사용 — 기존 '활동중 × 0.78' 같은 추정치 제거
   const stats = useMemo(() => {
-    const safeMembers = Array.isArray(members) ? members : [];
-    const active = safeMembers.filter(m => m.status === "ACTIVE").length;
-    const unpaidCnt = safeMembers.filter(m => m.status === "ACTIVE" && m.unpaid_count > 0).length;
-    const todayAtt = insights?.attendance?.today;
+    const active = members.filter((m) => m.status === "ACTIVE");
+    const todayRows = active.flatMap((m) => (m.classes || []).filter((c) => c.scheduled_today));
     return {
-      total: safeMembers.length, active, unpaidCnt,
-      todayAttended: todayAtt ? todayAtt.present + todayAtt.late : null,
-      todayExpected: todayAtt?.expected ?? null,
-      paymentRate: insights?.billing?.collection_rate ?? null,
+      total: members.length,
+      unpaid: active.filter((m) => m.unpaid_count > 0).length,
+      todayExpected: todayRows.length,
+      todayDone: todayRows.filter((c) => c.status === "PRESENT" || c.status === "LATE").length,
+      linked: members.filter((m) => m.parent_linked).length,
     };
-  }, [members, insights]);
-
-  const getRateColor = (rate) => {
-    if (rate == null) return "";
-    if (rate >= 80) return "success";  
-    if (rate >= 50) return "warning";  
-    return "danger";                   
-  };
+  }, [members]);
 
   return (
     <>
+      <style>{STYLES}</style>
       <h2 className="page-title">학생 관리</h2>
-      <p className="page-subtitle">조회 {stats.total}명 · 재원 {stats.active}명{urlQ ? ` · “${urlQ}” 검색 결과` : ""}</p>
+      <p className="page-subtitle">조회 {stats.total}명{urlQ ? ` · “${urlQ}” 검색 결과` : ""}</p>
 
-      {error && <div className="error-banner">{error}</div>}
-
-      <div className="stat-grid">
-        <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label">전체 학생</span></div>
-          <div className="stat-value num">{stats.total}<span className="unit">명</span></div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.attendance_rate_today}>오늘 출석 ⓘ</span></div>
-          <div className="stat-value num primary">{stats.todayAttended ?? "–"}<span className="unit">명</span></div>
-          {stats.todayExpected ? <div className="stat-sub">오늘 수업 대상 {stats.todayExpected}명</div> : null}
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.unpaid}>미납 학생 ⓘ</span></div>
-          <div className="stat-value num danger">{stats.unpaidCnt}<span className="unit">명</span></div>
-          <div className="stat-sub">'미납' 청구서가 있는 재원생 (현재 조회 기준)</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-card-head"><span className="stat-label" title={insights?.definitions?.collection_rate}>이달 수납률 ⓘ</span></div>
-          <div className={`stat-value num ${getRateColor(stats.paymentRate)}`}>
-            {stats.paymentRate ?? "–"}<span className="unit">%</span>
-          </div>
-          {stats.paymentRate == null && <div className="stat-sub">이번 달 발행된 청구서가 없습니다</div>}
-        </div>
+      <div className="tabs">
+        <button className={tab === "list" ? "active" : ""} onClick={() => setTab("list")}>학생 목록</button>
+        {isOwner && (
+          <button className={tab === "applications" ? "active" : ""} onClick={() => setTab("applications")}>
+            가입 신청{pendingApps.length ? <span className="count">{pendingApps.length}</span> : null}
+          </button>
+        )}
       </div>
 
-      <div className="toolbar">
-        <div className="search-box">
-          <input
-            className="input"
-            placeholder="이름·보호자 이름·전화번호(3자리 이상) 검색 후 Enter"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && applySearch()}
-          />
-        </div>
-        
-        <div style={{ display: "flex", flexDirection: "row", gap: "8px" }}>
-          <select className="select" value={classFilter} onChange={(e) => setClassFilter(e.target.value)}>
-            <option value="">반 전체 ▼</option>
-            {Array.isArray(classes) && classes.map((c) => (
-              <option key={c.class_id} value={c.class_id}>{c.name}</option>
-            ))}
-          </select>
-          
-          <select className="select" value={gradeFilter} onChange={(e) => setGradeFilter(e.target.value)}>
-            <option value="">학년 ▼</option>
-            <option value="초등">초등</option>
-            <option value="중등">중등</option>
-            <option value="고등">고등</option>
-          </select>
-          
-          <select className="select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-            <option value="">재원 상태 ▼</option>
-            <option value="ACTIVE">재원</option>
-            <option value="WITHDRAWN">퇴원</option>
-          </select>
-        </div>
-        
-        <div style={{ flex: 1 }} />
-        <button className="btn ghost" onClick={handleDownloadCSV}>⬇ 엑셀</button>
-        <button className="btn" style={{ border: "1px solid var(--border)" }} onClick={() => setShowOcrModal(true)}>
-          📸 사진으로 학생 추가
-        </button>
-        <button className="btn" onClick={() => { setEditingMember(null); setShowModal(true); }}>+ 학생 추가</button>
-      </div>
+      {error && <div className="fl-banner danger">{error}</div>}
 
-      {selectedIds.size > 0 && (
-        <div className="card" style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", marginBottom: 12, flexWrap: "wrap", background: "var(--primary-soft)" }}>
-          <strong style={{ fontSize: 13 }}>{selectedIds.size}명 선택</strong>
-          <button className="btn sm" onClick={() => setBulkModal("invoice")}>🧾 청구서 일괄 발행</button>
-          <button className="btn sm ghost" onClick={() => setBulkModal("notify")}>🔔 학부모 알림 보내기</button>
-          <button className="btn sm ghost ml-auto" onClick={() => setSelectedIds(new Set())}>선택 해제</button>
-        </div>
-      )}
-
-      {(!Array.isArray(members) || members.length === 0) ? (
-        <div className="empty">조회된 학생이 없습니다.</div>
+      {tab === "applications" ? (
+        <ApplicationsPanel applications={applications} classes={classes}
+          onChanged={() => { loadApplications(); load(); }} />
       ) : (
-        <div style={{ overflowX: "auto", overflowY: "visible", paddingBottom: "200px" }}>
-          <table>
-            <thead>
-              <tr>
-                <th style={{ width: 36 }}><input type="checkbox" checked={allSelected} onChange={toggleSelectAll} aria-label="전체 선택" /></th>
-                <th>이름</th>
-                <th>성별</th>
-                <th>나이</th>
-                <th>수강 과목</th>
-                <th>등록일</th>
-                <th>퇴원일</th>
-                <th>부모님 전화</th>
-                <th>부모님 성함</th>
-                <th>주소</th>
-                <th>회비 납부일</th>
-                <th>납부 상태</th>
-                <th style={{ width: 45 }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {members.map((m, index) => {
-                const pb = paymentBadge(m);
-                const isWithdrawn = m.status === "WITHDRAWN";
-                const isNearBottom = index >= members.length - 2;
-                
-                const rowStyle = isWithdrawn 
-                  ? { backgroundColor: "var(--surface-hover)", color: "var(--text-3)" }
-                  : {};
+        <>
+          <div className="stat-grid">
+            <div className="stat-card">
+              <div className="stat-card-head"><span className="stat-label">조회 학생</span></div>
+              <div className="stat-value num">{stats.total}<span className="unit">명</span></div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-card-head"><span className="stat-label">오늘 수업 출석</span></div>
+              <div className="stat-value num primary">{stats.todayDone}<span className="unit">/ {stats.todayExpected}</span></div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-card-head"><span className="stat-label">미납 학생</span></div>
+              <div className="stat-value num danger">{stats.unpaid}<span className="unit">명</span></div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-card-head"><span className="stat-label">학부모 연결</span></div>
+              <div className="stat-value num">{stats.linked}<span className="unit">명</span></div>
+            </div>
+          </div>
 
-                return (
-                  <tr key={m.member_id}
-                  onClick={() => setSelectedMember(m)}
-                   style={{ cursor: 'pointer', ...rowStyle }}
-                   >
-                    <td onClick={(e) => e.stopPropagation()}><input type="checkbox" checked={selectedIds.has(m.member_id)} onChange={() => toggleSelect(m.member_id)} aria-label={`${m.name} 선택`} /></td>
-                    <td>
-                      <div className="member-cell">
-                        <div className="avatar" style={{ overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--surface-hover)" }}>
-                          {m.photo_url ? (
-                            <img 
-                              src={m.photo_url} 
-                              alt={m.name} 
-                              style={{ width: "100%", height: "100%", objectFit: "cover" }} 
-                            />
-                          ) : (
-                            m.name?.[0]
-                          )}
-                        </div>
-                        <div>
-                          <div className="name">{m.name}</div>
-                          <div className="sub">{ageToGrade(m.age) ? `${ageToGrade(m.age)}` : "—"}</div>
-                        </div>
-                      </div>
-                    </td>
-                    <td>{m.gender === "M" ? "남" : "여"}</td>
-                    <td className="num">{m.age}{ageToGrade(m.age) && <span style={{ color: "var(--text-3)" }}> ({ageToGrade(m.age)})</span>}</td>
-                    
-                    <td>
-                      {memberClasses[m.member_id]?.length > 0 ? (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
-                          {memberClasses[m.member_id].map((cName, idx) => (
-                            <span key={idx} className="badge gray" style={{ fontSize: "11px", fontWeight: "500" }}>{cName}</span>
-                          ))}
-                        </div>
-                      ) : (
-                        <span style={{ color: "var(--text-3)", fontSize: "12px" }}>미수강</span>
-                      )}
-                    </td>
+          <div className="toolbar">
+            <div className="search-box" style={{ flex: "1 1 220px" }}>
+              <input className="input" style={{ width: "100%" }} placeholder="이름·보호자·전화번호 검색" value={q}
+                onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applySearch()} />
+            </div>
+            <select className="select" value={classFilter} onChange={(e) => setClassFilter(e.target.value)} aria-label="수업">
+              <option value="">전체 수업</option>
+              {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name}</option>)}
+            </select>
+            <select className="select" value={gradeFilter} onChange={(e) => setGradeFilter(e.target.value)} aria-label="학년">
+              <option value="">전체 학년</option><option value="초">초등</option><option value="중">중등</option><option value="고">고등</option>
+            </select>
+            <select className="select" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label="상태">
+              <option value="ACTIVE">재원</option><option value="WITHDRAWN">퇴원</option><option value="">전체</option>
+            </select>
+            {isOwner && (
+              <div style={{ display: "flex", gap: 8, marginLeft: "auto", flexWrap: "wrap" }}>
+                <button className="btn ghost" onClick={handleDownloadCSV}>⬇ 엑셀</button>
+                <button className="btn ghost" onClick={() => setShowOcrModal(true)}>📸 사진으로 추가</button>
+                <button className="btn" onClick={() => { setEditingMember(null); setShowModal(true); }}>+ 학생 추가</button>
+              </div>
+            )}
+          </div>
 
-                    <td className="num">{m.enrollment_date}</td>
-                    <td className="num">{m.withdrawal_date || "-"}</td>
-                    <td className="num">{m.mother_phone || m.father_phone || "-"}</td>
-                    <td>{m.mother_name || m.father_name || "-"}</td>
-                    <td style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.address || "-"}</td>
-                    <td className="num">{formatPaymentDay(m.payment_date)}</td>
-                    <td><span className={`badge ${pb.cls}`}>{pb.label}</span></td>
-                    
-                    <td style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
-                      <button className="btn ghost sm" onClick={() => setActiveMenuId(activeMenuId === m.member_id ? null : m.member_id)}>⋯</button>
-                      {activeMenuId === m.member_id && (
-                        <>
-                          <div style={{ position: "fixed", inset: 0, zIndex: 9 }} onClick={() => setActiveMenuId(null)} />
-                          <div style={{
-                            position: "absolute", 
-                            right: 0, 
-                            zIndex: 10,
-                            top: isNearBottom ? "auto" : "100%",
-                            bottom: isNearBottom ? "100%" : "auto",
-                            background: "var(--surface)",
-                            border: "1px solid var(--border)",
-                            borderRadius: "6px",
-                            boxShadow: "0 4px 12px rgba(0,0,0,0.15)", 
-                            padding: "4px", 
-                            minWidth: "80px",
-                            display: "flex", 
-                            flexDirection: "column", 
-                            gap: "2px"
-                          }}>
-                            <button style={{
-                              background: "none", border: "none", padding: "6px 12px", textAlign: "left",
-                              cursor: "pointer", fontSize: "13px", borderRadius: "4px", color: "var(--text)"
-                            }} onClick={() => { setEditingMember(m); setShowModal(true); setActiveMenuId(null); }}>수정</button>
-                            <button style={{
-                              background: "none", border: "none", padding: "6px 12px", textAlign: "left",
-                              cursor: "pointer", fontSize: "13px", color: "var(--danger)", borderRadius: "4px"
-                            }} onClick={() => { onDelete(m.member_id); setActiveMenuId(null); }}>삭제</button>
-                          </div>
-                        </>
-                      )}
-                    </td>
+          {selectedIds.size > 0 && isOwner && (
+            <div className="card" style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", marginBottom: 12, flexWrap: "wrap", background: "var(--primary-soft)" }}>
+              <strong style={{ fontSize: 13 }}>{selectedIds.size}명 선택</strong>
+              <button className="btn sm" onClick={() => setBulkModal("invoice")}>🧾 청구서 발행</button>
+              <button className="btn sm ghost" onClick={() => setBulkModal("notify")}>🔔 학부모 알림</button>
+              <button className="btn sm ghost ml-auto" onClick={() => setSelectedIds(new Set())}>선택 해제</button>
+            </div>
+          )}
+
+          {!loaded ? <div className="fl-skeleton" style={{ height: 240 }} /> : members.length === 0 ? (
+            <div className="empty">조회된 학생이 없습니다.</div>
+          ) : (
+            <div className="table-scroll" style={{ paddingBottom: 120 }}>
+              <table className="mem-table">
+                <thead>
+                  <tr>
+                    {isOwner && <th style={{ width: 36 }}><input type="checkbox" checked={allSelected} onChange={toggleSelectAll} aria-label="전체 선택" /></th>}
+                    <th>이름</th>
+                    <th>수강 수업 · 오늘 출결 · 30일 출석률</th>
+                    <th>납부</th>
+                    <th className="mem-hide-sm">등록일</th>
+                    <th className="col-wide">퇴원일</th>
+                    <th className="col-wide">보호자</th>
+                    <th className="col-wide">연락처</th>
+                    <th className="col-wide">주소</th>
+                    {isOwner && <th style={{ width: 44 }} />}
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                </thead>
+                <tbody>
+                  {members.map((m, index) => {
+                    const pb = paymentBadge(m);
+                    const nearBottom = index >= members.length - 2 && members.length > 3;
+                    return (
+                      <tr key={m.member_id} className="row-click" onClick={() => setSelectedId(m.member_id)}
+                        style={m.status === "WITHDRAWN" ? { color: "var(--text-3)" } : undefined}>
+                        {isOwner && (
+                          <td onClick={(e) => e.stopPropagation()}>
+                            <input type="checkbox" checked={selectedIds.has(m.member_id)} onChange={() => toggleSelect(m.member_id)} aria-label={`${m.name} 선택`} />
+                          </td>
+                        )}
+                        <td>
+                          <div className="member-cell">
+                            <div className="avatar" style={{ overflow: "hidden" }}>
+                              {m.photo_url ? <img src={m.photo_url} alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : m.name?.[0]}
+                            </div>
+                            <div>
+                              <div className="name">{m.name}{m.parent_linked && <span title="학부모 연결" style={{ marginLeft: 4 }}>🔗</span>}</div>
+                              <div className="sub">{m.gender === "M" ? "남" : "여"} · {m.age}세{ageToGrade(m.age) ? ` (${ageToGrade(m.age)})` : ""}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td onClick={(e) => e.stopPropagation()}>
+                          {(m.classes || []).length ? (
+                            <div className="mem-classes">
+                              {m.classes.map((c) => (
+                                <button key={c.class_id} type="button" className="mem-class" title={`${c.name} 수업으로 이동`}
+                                  onClick={() => navigate(`/classes?class_id=${c.class_id}`)}>
+                                  <span className="dot" style={{ background: c.color }} />
+                                  <span className="nm">{c.name}</span>
+                                  {c.scheduled_today ? (
+                                    <span className={`badge ${c.status ? STATUS_TONE[c.status] : "gray"} no-dot`}>{c.status ? STATUS_LABEL[c.status] : "미체크"}</span>
+                                  ) : null}
+                                  <span className="rate">{c.rate_30d == null ? "기록 없음" : `${Math.round(c.rate_30d)}%`}</span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : <span className="muted">미수강</span>}
+                        </td>
+                        <td><span className={`badge ${pb.cls}`}>{pb.label}</span></td>
+                        <td className="num mem-hide-sm">{m.enrollment_date}</td>
+                        <td className="col-wide num">{m.withdrawal_date || "-"}</td>
+                        <td className="col-wide">{m.mother_name || m.father_name || "-"}</td>
+                        <td className="col-wide num">{m.mother_phone || m.father_phone || "-"}</td>
+                        <td className="col-wide" style={{ maxWidth: 220, whiteSpace: "normal" }}>{m.address || "-"}</td>
+                        {isOwner && (
+                          <td style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
+                            <button className="btn ghost sm" aria-label="더보기" onClick={() => setActiveMenuId(activeMenuId === m.member_id ? null : m.member_id)}>⋯</button>
+                            {activeMenuId === m.member_id && (
+                              <>
+                                <div style={{ position: "fixed", inset: 0, zIndex: 9 }} onClick={() => setActiveMenuId(null)} />
+                                <div className="member-row-menu" style={{ top: nearBottom ? "auto" : "100%", bottom: nearBottom ? "100%" : "auto" }}>
+                                  <button onClick={() => { setEditingMember(m); setShowModal(true); setActiveMenuId(null); }}>수정</button>
+                                  <button style={{ color: "var(--danger)" }} onClick={() => { setActiveMenuId(null); onDelete(m.member_id); }}>삭제</button>
+                                </div>
+                              </>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
 
       {showModal && (
-        <MemberModal 
-          member={editingMember} 
-          onClose={() => { setShowModal(false); setEditingMember(null); }}
-          onSaved={() => { setShowModal(false); setEditingMember(null); load(); }}
-        />
+        <MemberModal member={editingMember} onClose={() => { setShowModal(false); setEditingMember(null); }}
+          onSaved={() => { setShowModal(false); setEditingMember(null); load(); }} />
       )}
-
-      {showOcrModal && (
-        <OcrMemberModal
-          onClose={() => setShowOcrModal(false)}
-          onSaved={() => { setShowOcrModal(false); load(); }}
-        />
-      )}
-
+      {showOcrModal && <OcrMemberModal onClose={() => setShowOcrModal(false)} onSaved={() => { setShowOcrModal(false); load(); }} />}
       {bulkModal === "invoice" && (
         <BulkInvoiceModal members={selectedMembers} onClose={() => setBulkModal(null)}
           onDone={() => { setBulkModal(null); setSelectedIds(new Set()); load(); }} />
@@ -407,16 +360,137 @@ export default function Members() {
         <BulkNotifyModal members={selectedMembers} onClose={() => setBulkModal(null)}
           onDone={() => { setBulkModal(null); setSelectedIds(new Set()); }} />
       )}
-
       {selectedMember && (
-        <MemberDetailDashboard 
-          member={selectedMember} 
-          enrolledClasses={memberClasses[selectedMember.member_id]?.join(", ")}
-          onClose={() => setSelectedMember(null)}
-          onUpdate={load}
-        />
+        <MemberDetailDashboard member={selectedMember} readOnly={!isOwner} onClose={closeDetail} onUpdate={load}
+          onEdit={() => { setEditingMember(selectedMember); setShowModal(true); }}
+          onDelete={async () => { if (await onDelete(selectedMember.member_id)) closeDetail(); }} />
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------
+// 가입 신청 심사 — 승인하면 서버가 학생(members)·수강·학부모 연결을 만듭니다
+// ---------------------------------------------------------------------
+const APP_STATUS = { PENDING: ["warning", "심사 대기"], APPROVED: ["success", "승인"], REJECTED: ["danger", "반려"], CANCELED: ["gray", "취소"] };
+
+function ApplicationsPanel({ applications, classes, onChanged }) {
+  const [filter, setFilter] = useState("PENDING");
+  const [approving, setApproving] = useState(null);
+  const rows = applications.filter((a) => (filter ? a.status === filter : true));
+
+  const reject = async (a) => {
+    const reason = window.prompt(`${a.child.name} 학생의 가입 신청을 반려합니다. 사유(학부모에게 전달):`, "");
+    if (reason === null) return;
+    try {
+      await rejectApplication(a.application_id, reason);
+      onChanged();
+    } catch (e) {
+      alert(errorText(e, "반려하지 못했습니다."));
+    }
+  };
+
+  return (
+    <>
+      <div className="toolbar">
+        <div className="segmented">
+          {[["PENDING", "심사 대기"], ["APPROVED", "승인"], ["REJECTED", "반려"], ["", "전체"]].map(([v, l]) => (
+            <button key={v || "all"} className={filter === v ? "active" : ""} onClick={() => setFilter(v)}>{l}</button>
+          ))}
+        </div>
+      </div>
+      {rows.length === 0 ? <div className="empty">{filter === "PENDING" ? "심사할 가입 신청이 없습니다." : "신청 내역이 없습니다."}</div> : (
+        <div className="app-grid">
+          {rows.map((a) => {
+            const [tone, label] = APP_STATUS[a.status] || ["gray", a.status];
+            return (
+              <div className="app-card" key={a.application_id}>
+                <div className="head">
+                  <h4>{a.child.name}</h4>
+                  <span className="muted">{a.child.gender === "M" ? "남" : "여"} · {a.child.age}세{a.child.school ? ` · ${a.child.school}` : ""}</span>
+                  <span className={`badge ${tone} no-dot`} style={{ marginLeft: "auto" }}>{label}</span>
+                </div>
+                <div className="app-kv">
+                  <span>보호자</span><span>{a.child.parent_name || "-"} ({a.child.relation}) {a.child.parent_phone}</span>
+                  <span>신청 수업</span>
+                  <span style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {a.classes.length ? a.classes.map((c) => <span key={c.class_id} className="badge gray no-dot">{c.name}</span>) : "선택 안 함"}
+                  </span>
+                  <span>예상 비용</span><span><b>{won(a.estimated_fee)}</b> / 월</span>
+                  {a.child.address && <><span>주소</span><span>{a.child.address}</span></>}
+                  {a.child.note && <><span>특이사항</span><span>{a.child.note}</span></>}
+                  {a.message && <><span>메시지</span><span>{a.message}</span></>}
+                  {a.reject_reason && <><span>반려 사유</span><span>{a.reject_reason}</span></>}
+                  <span>신청일</span><span>{(a.created_at || "").slice(0, 16).replace("T", " ")}</span>
+                </div>
+                {a.status === "PENDING" && (
+                  <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                    <button className="btn danger sm" onClick={() => reject(a)}>반려</button>
+                    <button className="btn sm" onClick={() => setApproving(a)}>승인하고 등록</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {approving && (
+        <ApproveModal application={approving} classes={classes} onClose={() => setApproving(null)}
+          onDone={() => { setApproving(null); onChanged(); }} />
+      )}
+    </>
+  );
+}
+
+function ApproveModal({ application, classes, onClose, onDone }) {
+  const [classIds, setClassIds] = useState(() => new Set(application.class_ids));
+  const [enrollmentDate, setEnrollmentDate] = useState(today());
+  const [createInvoice, setCreateInvoice] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const toggle = (id) => setClassIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  const estimate = classes.filter((c) => classIds.has(c.class_id)).reduce((sum, c) => sum + (c.fee || 0), 0);
+
+  const submit = async () => {
+    setBusy(true); setErr("");
+    try {
+      await approveApplication(application.application_id, { class_ids: [...classIds], enrollment_date: enrollmentDate, create_invoice: createInvoice });
+      onDone();
+    } catch (e) {
+      setErr(errorText(e, "승인하지 못했습니다."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>{application.child.name} 학생 등록</h3>
+        {err && <div className="fl-banner danger">{err}</div>}
+        <div className="form-row">
+          <label>수강 수업</label>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {classes.map((c) => (
+              <button key={c.class_id} type="button" className={`chip${classIds.has(c.class_id) ? " active" : ""}`} onClick={() => toggle(c.class_id)}>
+                <span className="dot" style={{ background: classIds.has(c.class_id) ? "#fff" : c.color }} />{c.name} · {won(c.fee)}
+              </button>
+            ))}
+            {!classes.length && <span className="muted">등록된 수업이 없습니다.</span>}
+          </div>
+        </div>
+        <div className="form-row"><label>등록일</label>
+          <input type="date" className="input" value={enrollmentDate} onChange={(e) => setEnrollmentDate(e.target.value)} /></div>
+        <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, marginBottom: 12 }}>
+          <input type="checkbox" checked={createInvoice} onChange={(e) => setCreateInvoice(e.target.checked)} />
+          첫 달 수강료 청구서 발행 ({won(estimate)}) — 학부모 포털에서 바로 결제
+        </label>
+        <div className="modal-actions">
+          <button className="btn ghost" onClick={onClose}>취소</button>
+          <button className="btn" onClick={submit} disabled={busy}>{busy ? "등록 중…" : "승인"}</button>
+        </div>
+      </div>
+    </div>
   );
 }
 

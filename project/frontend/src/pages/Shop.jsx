@@ -170,7 +170,7 @@ export default function Shop() {
         <div>
           <h1 className="page-title">쇼핑몰 · {info.name}</h1>
           <p className="page-subtitle" style={{ margin: 0 }}>
-            우리 시설 일정과 규모에 맞춰 단체복·키링·매달을 추천합니다. 주문과 결제는 <a href={info.base_url} target="_blank" rel="noopener noreferrer">{info.base_url.replace(/^https?:\/\//, "")}</a>에서 진행됩니다.
+            주문·결제는 <a href={info.base_url} target="_blank" rel="noopener noreferrer">{info.base_url.replace(/^https?:\/\//, "")}</a>
           </p>
         </div>
         <div className="actions">
@@ -184,14 +184,12 @@ export default function Shop() {
       {error && <div className="error-banner" onClick={() => setError("")}>{error}</div>}
 
       <h2 className="shop-section-title">우리 시설 맞춤 추천</h2>
-      <p className="shop-section-sub">추천 근거는 각 상품 카드에 표시됩니다. (규칙 기반 v1 — 클릭 데이터가 쌓이면 가중치가 반영됩니다)</p>
       {ctx && (
         <div className="shop-context" aria-label="추천에 사용한 시설 정보">
           <span className="shop-chip">시설 유형: {ctx.facility_type}</span>
           <span className="shop-chip">활성 회원 {ctx.active_members}명</span>
           <span className="shop-chip">최대 반 인원 {ctx.largest_class}명</span>
           {ctx.events.map((e) => <span className="shop-chip event" key={e.label}>{e.label} · {e.source}</span>)}
-          {!ctx.events.length && <span className="shop-chip">최근 공지·수업에서 감지된 행사 없음</span>}
         </div>
       )}
       <div className="shop-grid">

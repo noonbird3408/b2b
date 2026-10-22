@@ -20,12 +20,13 @@ STUDENTS = [
 ]
 CLASSES = [
     ("유초등 기초반", "김사범", [("MON", "15:00", "16:00"), ("WED", "15:00", "16:00"), ("FRI", "15:00", "16:00")],
-     "기본 동작과 체력 훈련"),
+     "기본 동작과 체력 훈련", "#2563EB", 150000),
     ("초등 품새반", "박사범", [("TUE", "16:00", "17:00"), ("THU", "16:00", "17:00"), ("SAT", "10:00", "11:30")],
-     "승급 심사 대비 품새 집중"),
+     "승급 심사 대비 품새 집중", "#16A34A", 170000),
     ("중등 겨루기반", "이관장", [(d, "17:30", "19:00") for d in ("MON", "TUE", "WED", "THU", "FRI")],
-     "겨루기 대회 대비반"),
+     "겨루기 대회 대비반", "#DC2626", 190000),
 ]
+WEEKDAY_CODES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 DEMO_PARENT_EMAIL = "demo.parent@example.invalid"   # 시연용 가상 학부모(로그인 불가) — 댓글·좋아요 예시용
 
 
@@ -42,7 +43,8 @@ def seed(db, m, account=None, force: bool = False) -> dict:
     payment = m._read_settings(db, "payment_settings", m.DEFAULT_PAYMENT_SETTINGS)
     if academy.get("name") in (None, "", "우리 시설", "한빛학원"):
         academy = {**m.DEFAULT_ACADEMY_SETTINGS, **academy, "name": "한빛 태권도장", "branch": "용인 본관",
-                   "principal": "김관장", "facilityType": "도장", "phone": "031-000-0000"}
+                   "principal": "김관장", "facilityType": "도장", "phone": "031-000-0000", "region": "경기 용인시",
+                   "description": "유초등·중등 태권도 · 품새/겨루기반 운영"}
     payment = {**m.DEFAULT_PAYMENT_SETTINGS, **payment, "baseTuitionFee": 180000}
 
     members = []
@@ -56,39 +58,45 @@ def seed(db, m, account=None, force: bool = False) -> dict:
         db.add(member)
         members.append(member)
     classes = []
-    for idx, (name, teacher, schedule, desc) in enumerate(CLASSES):
+    for idx, (name, teacher, schedule, desc, color, fee) in enumerate(CLASSES):
         cls = m.Class(name=name, teacher=teacher, start_date=today - timedelta(days=90),
                       end_date=today + timedelta(days=180), description=desc, color_index=idx,
+                      color=color, monthly_fee=fee,
                       days_of_week=",".join(d for d, _, _ in schedule),
                       start_time=time.fromisoformat(schedule[0][1]), end_time=time.fromisoformat(schedule[0][2]),
                       schedule_detail=json.dumps([{"day": d, "start": s, "end": e} for d, s, e in schedule]))
         db.add(cls)
         classes.append(cls)
     db.flush()
-    payment["classFees"] = [{"classId": classes[0].class_id, "fee": 150000},
-                            {"classId": classes[1].class_id, "fee": 170000},
-                            {"classId": classes[2].class_id, "fee": 190000}]
     m._write_settings(db, academy, payment)
 
+    member_classes = {}
     for i, member in enumerate(members):
-        db.add(m.Enrollment(member_id=member.member_id, class_id=classes[i % 3].class_id))
-        if i % 4 == 0:
-            db.add(m.Enrollment(member_id=member.member_id, class_id=classes[(i + 1) % 3].class_id))
+        picks = [classes[i % 3]] + ([classes[(i + 1) % 3]] if i % 4 == 0 else [])
+        member_classes[member.member_id] = picks
+        for cls in picks:
+            db.add(m.Enrollment(member_id=member.member_id, class_id=cls.class_id))
 
-    # 최근 35일 출결 (오늘은 비움 → 키오스크 체험). 3번 학생은 출석률 낮음, 6번 학생은 최근 연속 결석
+    # 최근 35일 수업별 출결 (오늘은 비움 → 키오스크 체험). 3번 학생은 출석률 낮음, 6번 학생은 최근 연속 결석
     for d in range(1, 36):
         day = today - timedelta(days=d)
-        if day.weekday() == 6:
-            continue
+        code = WEEKDAY_CODES[day.weekday()]
         for i, member in enumerate(members[:11]):
-            weights = [55, 10, 35] if i == 3 else [84, 9, 7]
-            status = random.choices(["PRESENT", "LATE", "ABSENT"], weights)[0]
-            if i == 6 and d <= 4:
-                status = "ABSENT"
-            check_in = None if status == "ABSENT" else time(15 if i % 3 == 0 else 16, random.randint(0, 25))
-            check_out = None if status == "ABSENT" else time(check_in.hour + 1, random.randint(5, 40))
-            db.add(m.Attendance(member_id=member.member_id, attendance_date=day, status=status,
-                                check_in_time=check_in, check_out_time=check_out))
+            for cls, schedule in ((c, CLASSES[classes.index(c)][2]) for c in member_classes[member.member_id]):
+                slot = next((sl for sl in schedule if sl[0] == code), None)
+                if not slot:
+                    continue
+                weights = [55, 10, 35] if i == 3 else [84, 9, 7]
+                status = random.choices(["PRESENT", "LATE", "ABSENT"], weights)[0]
+                if i == 6 and d <= 4:
+                    status = "ABSENT"
+                start = time.fromisoformat(slot[1])
+                check_in = None if status == "ABSENT" else (
+                    datetime.combine(day, start) + timedelta(minutes=random.randint(-10, -1) if status == "PRESENT"
+                                                             else random.randint(6, 20))).time()
+                check_out = None if status == "ABSENT" else time.fromisoformat(slot[2])
+                db.add(m.Attendance(member_id=member.member_id, attendance_date=day, status=status, class_id=cls.class_id,
+                                    check_in_time=check_in, check_out_time=check_out))
 
     # 최근 6개월 수강료 결제 이력 (매출 추이 차트) + 이번 달 청구서
     for month_offset in range(5, 0, -1):
@@ -136,11 +144,19 @@ def seed(db, m, account=None, force: bool = False) -> dict:
         db.flush()
     if not db.query(m.ParentLink).filter(m.ParentLink.user_id == parent.user_id).first():
         db.add(m.ParentLink(user_id=parent.user_id, member_id=members[1].member_id))
-    post1 = m.CommunityPost(content="오늘 품새 수업 열심히 참여한 친구들 멋졌어요! 👏 다음 주 승급 심사도 화이팅!", like_count=0,
-                            author=academy.get("principal") or "관리자", created_at=now - timedelta(hours=5))
-    post2 = m.CommunityPost(content="이번 주 토요일 안전점검이 있습니다. 오전 수업은 정상 진행합니다.", like_count=0,
-                            author=academy.get("principal") or "관리자", created_at=now - timedelta(days=1))
-    db.add_all([post1, post2])
+    if not db.query(m.FacilityMember).filter(m.FacilityMember.user_id == parent.user_id).first():
+        db.add(m.FacilityMember(user_id=parent.user_id, nickname="서연맘", status="ACTIVE", joined_at=now - timedelta(days=20)))
+    principal = academy.get("principal") or "관리자"
+    post1 = m.CommunityPost(title="오늘 품새 수업 현장", content="오늘 품새 수업 열심히 참여한 친구들 멋졌어요! 👏 다음 주 승급 심사도 화이팅!",
+                            category="PHOTO", author_role="admin", like_count=0, view_count=24, status="VISIBLE",
+                            author=principal, created_at=now - timedelta(hours=5))
+    post2 = m.CommunityPost(title="토요일 안전점검 안내", content="이번 주 토요일 안전점검이 있습니다. 오전 수업은 정상 진행합니다.",
+                            category="INFO", author_role="admin", like_count=0, view_count=31, status="VISIBLE",
+                            author=principal, created_at=now - timedelta(days=1))
+    post3 = m.CommunityPost(title="도복 세탁 팁 공유해요", content="찬물에 뒤집어서 빨면 누렇게 변하는 게 덜하더라고요. 다른 분들은 어떻게 하세요?",
+                            category="FREE", author_role="parent", user_id=parent.user_id, like_count=0, view_count=12,
+                            status="VISIBLE", author="서연맘", created_at=now - timedelta(days=2))
+    db.add_all([post1, post2, post3])
     db.flush()
     db.add(m.CommunityLike(post_id=post1.post_id, user_id=parent.user_id))
     post1.like_count = 1
@@ -153,7 +169,8 @@ def seed(db, m, account=None, force: bool = False) -> dict:
         ("고수익 부업 오픈채팅 들어오세요 bit.ly/abcd", None),                         # 검토 대기
     ]
     for offset, (content, decision) in enumerate(samples):
-        comment = m.CommunityComment(post_id=post1.post_id, author="시** 학부모", content=content, user_id=parent.user_id,
+        comment = m.CommunityComment(post_id=post1.post_id, author="서연맘", content=content, user_id=parent.user_id,
+                                     author_role="parent",
                                      created_at=now - timedelta(hours=4, minutes=-offset * 7))
         db.add(comment)
         db.flush()

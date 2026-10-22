@@ -162,7 +162,7 @@
 @media (max-width: 900px) {
   .app-shell-responsive { grid-template-columns: minmax(0, 1fr); }
   .app-shell-responsive .sidebar { position: sticky; z-index: 10; top: 0; height: auto; min-width: 0; padding: 7px 10px; overflow: hidden; border-right: 0; border-bottom: 1px solid var(--border); }
-  .app-shell-responsive .sidebar-brand, .app-shell-responsive .sidebar-section-label, .app-shell-responsive .sidebar-foot { display: none; }
+  .app-shell-responsive .sidebar-section-label, .app-shell-responsive .sidebar-foot { display: none; }
   .app-shell-responsive .sidebar nav { display: flex; gap: 4px; min-width: 0; overflow-x: auto; }
   .app-shell-responsive .sidebar nav .nav-link { flex: 0 0 auto; margin: 0; padding: 7px 9px; font-size: 11px; }
   .app-shell-responsive .main { min-width: 0; }

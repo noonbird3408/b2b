@@ -123,6 +123,8 @@ button { font-family: inherit; cursor: pointer; }
   padding: 6px 8px 22px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 16px;
+  color: var(--text);
+  text-decoration: none;
 }
 .sidebar-logo {
   width: 36px; height: 36px;
@@ -132,6 +134,7 @@ button { font-family: inherit; cursor: pointer; }
   font-weight: 700;
   font-size: 16px;
   display: flex; align-items: center; justify-content: center;
+  text-transform: lowercase;
 }
 .sidebar-brand-name { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; }
 .sidebar-brand-sub  { font-size: 11px; color: var(--text-3); margin-top: 1px; }
@@ -305,6 +308,8 @@ button { font-family: inherit; cursor: pointer; }
   transition: border-color .12s;
   min-height: 36px;
 }
+.input, textarea { color: var(--text); }
+textarea { background: var(--surface); }
 .input:focus, .select:focus {
   outline: none; border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
@@ -649,7 +654,7 @@ tbody tr:hover { background: var(--surface-2); }
   font-size: 12px;
 }
 .calendar-cell {
-  min-height: 110px;
+  min-height: 140px;
   padding: 8px 4px;
   display: flex;
   flex-direction: column;
@@ -657,8 +662,8 @@ tbody tr:hover { background: var(--surface-2); }
   border: 1px solid var(--border);
 }
 .calendar-day-num {
-  font-weight: 600;
-  font-size: 13px;
+  font-weight: 700;
+  font-size: 22px;
   padding-left: 4px;
 }
 .calendar-events {
@@ -1268,6 +1273,46 @@ body {
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.4); display: flex; justify-content: center; align-items: center; z-index: 1000; }
 .modal-content { background: var(--surface); padding: 24px; border-radius: 12px; width: 500px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
 
+@media (max-width: 900px) {
+  .app-shell.app-shell-responsive { display: flex; flex-direction: column; min-height: 100dvh; }
+  .app-shell-responsive .sidebar { position: static; width: 100%; height: auto; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .app-shell-responsive .sidebar-brand { padding: 4px 6px 8px; margin: 0 0 6px; }
+  .app-shell-responsive .sidebar-section-label,
+  .app-shell-responsive .sidebar-foot { display: none; }
+  .app-shell-responsive .sidebar nav { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: thin; }
+  .app-shell-responsive .sidebar nav .nav-link { flex: 0 0 auto; margin: 0; padding: 8px 10px; }
+  .app-shell-responsive .topbar { padding: 10px 16px; }
+  .app-shell-responsive .topbar-search { width: min(360px, 55vw); }
+  .app-shell-responsive .page { max-width: none; padding: 20px 18px 32px; flex: 1; }
+  .app-shell-responsive .row.cols-2,
+  .app-shell-responsive .row.cols-2-eq { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 600px) {
+  .app-shell-responsive .topbar { padding: 8px 12px; gap: 8px; }
+  .app-shell-responsive .topbar-search { width: min(250px, 55vw); }
+  .app-shell-responsive .topbar-search .kbd { display: none; }
+  .app-shell-responsive .page { padding: 16px 12px 24px; }
+  .app-shell-responsive .card { padding: 15px; }
+  .app-shell-responsive .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .app-shell-responsive .stat-card { padding: 12px; min-width: 0; }
+  .app-shell-responsive .stat-value { font-size: 21px; }
+  .app-shell-responsive .toolbar > * { max-width: 100%; }
+  .app-shell-responsive .input { min-width: 0; }
+  .app-shell-responsive .modal-backdrop { padding: 8px; }
+  .app-shell-responsive .modal-large { width: 100%; height: calc(100dvh - 16px); }
+  .app-shell-responsive .modal-large-body { flex-direction: column; }
+  .app-shell-responsive .modal-sidebar { width: 100%; flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .app-shell-responsive .modal-tab-btn { flex: 0 0 auto; padding: 8px 10px; font-size: 12px; }
+  .app-shell-responsive .modal-large-content { padding: 14px; }
+  .app-shell-responsive .calendar-cell { min-height: 100px; padding: 5px 2px; }
+  .app-shell-responsive .calendar-event-item { font-size: 9px; padding: 3px 2px; }
+  .app-shell-responsive .calendar-controls { gap: 4px; }
+  .app-shell-responsive .calendar-select.year { min-width: 68px; }
+  .app-shell-responsive .calendar-select.month { min-width: 58px; }
+  .app-shell-responsive .dashboard-panel { width: 100vw !important; padding: 16px !important; }
+}
+
 /* index.css */
 .table-container {
   overflow-x: auto;
@@ -1371,3 +1416,75 @@ body {
 /* page-title / page-subtitle (없을 경우 보완) */
 .page-title   { font-size: 20px; font-weight: 700; color: var(--text); margin: 0 0 4px; }
 .page-subtitle { font-size: 13px; color: var(--text-3); margin: 0 0 20px; }
+/* =================================================================
+   v9 공통 — facilink 브랜드 · 배너 · 스켈레톤 · 모바일 보정
+   ================================================================= */
+:root, .theme-light { --shadow-lg: 0 12px 32px -8px rgba(15,23,42,0.18); --radius-xl: 16px; }
+.theme-dark { --shadow-lg: 0 12px 32px -8px rgba(0,0,0,0.7); }
+.auth-loading { min-height: 100vh; display: grid; place-items: center; color: var(--text-3); font-size: 13px; background: var(--bg); }
+
+.fl-brand { display: inline-flex; align-items: center; gap: 9px; color: var(--text); text-decoration: none; min-width: 0; }
+.fl-brand-logo { width: 34px; height: 34px; border-radius: 9px; background: linear-gradient(135deg, #3B82F6, #6366F1); color: #fff;
+  font-weight: 800; font-size: 18px; display: grid; place-items: center; flex-shrink: 0; letter-spacing: -.05em; }
+.fl-brand-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.15; }
+.fl-brand-text strong { font-size: 17px; font-weight: 800; letter-spacing: -.03em; }
+.fl-brand-text small { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.fl-brand.compact .fl-brand-logo { width: 30px; height: 30px; font-size: 16px; }
+
+.fl-banner { border-radius: 8px; padding: 10px 14px; font-size: 13px; font-weight: 500; margin-bottom: 14px; border: 1px solid; text-align: left; }
+.fl-banner.danger { background: var(--danger-soft); color: var(--danger-text); border-color: var(--danger); }
+.fl-banner.success { background: var(--success-soft); color: var(--success-text); border-color: var(--success); }
+.fl-banner.warning { background: var(--warning-soft); color: var(--warning-text); border-color: var(--warning); }
+.fl-banner.info { background: var(--primary-soft); color: var(--primary-text); border-color: var(--primary); }
+
+.fl-skeleton { border-radius: 12px; background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-hover) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%; animation: fl-shimmer 1.2s infinite; }
+@keyframes fl-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+/* 다크 모드에서 흰 배경·검은 글씨로 고정된 입력칸 보정 (수업 설명 칸 등) */
+.theme-dark textarea, .theme-dark input, .theme-dark select { color: var(--text); background-color: var(--surface); border-color: var(--border); }
+.theme-dark input::placeholder, .theme-dark textarea::placeholder { color: var(--text-3); }
+.theme-dark .badge.gray { background: var(--gray-soft); color: var(--text-2); }
+textarea { font-family: inherit; }
+
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text-2); cursor: pointer; white-space: nowrap; }
+.chip:hover { border-color: var(--primary); color: var(--text); }
+.chip .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 14px; font-size: 13.5px; color: var(--text-2); font-weight: 500; white-space: nowrap; }
+.tabs button.active { color: var(--primary-text); border-bottom-color: var(--primary); font-weight: 700; }
+.tabs button .count { margin-left: 5px; font-size: 11px; color: var(--text-3); font-weight: 600; }
+
+.topbar-facility { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.topbar-facility .name { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.sync-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); display: inline-block; }
+.sync-dot.off { background: var(--warning); }
+
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.muted { color: var(--text-3); font-size: 12px; }
+.row-click { cursor: pointer; }
+
+@media (max-width: 900px) {
+  .app-shell-responsive .sidebar { display: flex; flex-direction: row; align-items: center; gap: 8px; position: sticky; top: 0; z-index: 20; }
+  .app-shell-responsive .sidebar-brand { border: 0; padding: 0; margin: 0; flex-shrink: 0; }
+  .app-shell-responsive .sidebar nav { flex: 1; min-width: 0; }
+  .app-shell-responsive .topbar-search { display: none; }
+  .fl-brand-text small { display: none; }
+}
+@media (max-width: 600px) {
+  .page-title { font-size: 19px; }
+  .modal { padding: 18px; width: 100%; max-height: 92dvh; }
+  .modal-backdrop { padding: 8px; align-items: flex-end; }
+  .topbar-facility .name { max-width: 140px; font-size: 13px; }
+  .tabs button { padding: 9px 10px; font-size: 13px; }
+  .input { min-width: 0; }
+}
+/* 툴바 안의 select·날짜 입력은 내용 너비로 (전역 .select/.input 은 width:100%) */
+.toolbar > .select, .bd-search > .select, .search-row > .select, .segmented + .select { width: auto; max-width: 100%; flex: 0 1 auto; }
+.att-date .input { width: auto; }
+textarea.input { height: auto; padding: 10px 12px; }

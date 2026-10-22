@@ -13,6 +13,20 @@ const API = axios.create({
 });
 
 const AI_TIMEOUT = { timeout: 60000 }; // AI 분석/OCR 은 오래 걸릴 수 있음
+
+// 428 = 시설을 아직 고르지 않음(또는 접근 권한이 사라짐) → 화면이 시설 선택으로 이동하도록 알림
+export const FACILITY_REQUIRED_EVENT = "facilink:facility-required";
+// 서버 데이터 버전이 바뀌었을 때(다른 기기·다른 사용자의 변경 포함) 화면들이 다시 불러오도록 알림
+export const DATA_CHANGED_EVENT = "facilink:data-changed";
+API.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 428) {
+      window.dispatchEvent(new CustomEvent(FACILITY_REQUIRED_EVENT, { detail: error.response.data?.detail }));
+    }
+    return Promise.reject(error);
+  },
+);
 const data = (r) => r.data;
 
 /** 서버 오류 메시지(한국어 detail)를 꺼내는 공통 함수 */
@@ -36,6 +50,18 @@ export const signOut = () => API.post("/api/auth/logout").then(data);
 export const fetchAdminAccounts = () => API.get("/api/admin/accounts").then(data);
 export const createAdminAccount = (payload) => API.post("/api/admin/accounts", payload).then(data);
 export const updateAdminAccount = (accountId, payload) => API.patch(`/api/admin/accounts/${accountId}`, payload).then(data);
+export const deleteAdminAccount = (accountId) => API.delete(`/api/admin/accounts/${accountId}`);
+
+// ----- 시설 (관리자: 내 시설 목록·생성·수정·삭제·입장) -----
+export const fetchFacilities = () => API.get("/api/facilities").then(data);
+export const createFacility = (payload) => API.post("/api/facilities", payload).then(data);
+export const updateFacility = (id, payload) => API.put(`/api/facilities/${id}`, payload).then(data);
+/** 삭제(보관) — 실수 방지를 위해 시설 이름을 한 번 더 입력받아 서버가 확인 */
+export const deleteFacility = (id, confirmName) => API.delete(`/api/facilities/${id}`, { params: { confirm_name: confirmName } });
+export const enterFacility = (id) => API.post(`/api/facilities/${id}/enter`).then(data);
+export const exitFacility = () => API.post("/api/facilities/exit").then(data);
+/** 가벼운 동기화 확인 — {data_version} */
+export const fetchSyncVersion = () => API.get("/api/sync").then(data);
 
 // ----- 기관 설정 / 백업 -----
 export const fetchAppSettings = () => API.get("/api/settings").then(data);
@@ -95,6 +121,15 @@ export const createMemberNote = (memberId, content) => API.post(`/api/members/${
 export const deleteMemberNote = (noteId) => API.delete(`/api/member-notes/${noteId}`);
 /** 학부모 알림 보내기 → {sent, message} (연결된 학부모가 없으면 sent=0) */
 export const notifyMemberParents = (memberId, payload) => API.post(`/api/members/${memberId}/notify`, payload).then(data);
+export const fetchMember = (memberId) => API.get(`/api/members/${memberId}`).then(data);
+/** 수업별 출결 요약 + 최근 기록 + 12주 추이 */
+export const fetchMemberAttendanceSummary = (memberId, params) =>
+  API.get(`/api/members/${memberId}/attendance-summary`, { params }).then(data);
+
+// ----- 가입(수강) 신청 심사 -----
+export const fetchApplications = (status = "PENDING") => API.get("/api/applications", { params: { status } }).then(data);
+export const approveApplication = (id, payload = {}) => API.post(`/api/applications/${id}/approve`, payload).then(data);
+export const rejectApplication = (id, reason = "") => API.post(`/api/applications/${id}/reject`, { reason }).then(data);
 
 // ----- 수업 -----
 export const fetchClasses = () => API.get("/api/classes").then(data);
@@ -145,7 +180,16 @@ export const createNotice = (payload) => API.post("/api/notices", payload).then(
 export const updateNotice = (id, payload) => API.put(`/api/notices/${id}`, payload).then(data);
 export const deleteNotice = (id) => API.delete(`/api/notices/${id}`);
 
-// ----- 커뮤니티 피드 (관리자) -----
+// ----- 커뮤니티 게시판 (관리자) -----
+/** params: {category: ALL|NOTICE|FREE|QUESTION|PHOTO|INFO, q, field: title|content|title_content|author, page, size} */
+export const fetchCommunityBoard = (params) => API.get("/api/community/board", { params }).then(data);
+export const fetchCommunityPost = (id) => API.get(`/api/community/posts/${id}`).then(data);
+export const moderatePost = (id, decision) => API.post(`/api/community/posts/${id}/moderate`, { decision }).then(data);
+export const fetchModerationPosts = (status = "PENDING") => API.get("/api/community/moderation/posts", { params: { status } }).then(data);
+export const fetchCommunityMembers = () => API.get("/api/community/members").then(data);
+/** action: warn / mute / unmute / ban / unban */
+export const sanctionCommunityMember = (membershipId, payload) =>
+  API.post(`/api/community/members/${membershipId}/sanction`, payload).then(data);
 export const fetchCommunityPosts = () => API.get("/api/community/posts").then(data);
 export const createCommunityPost = (payload) => API.post("/api/community/posts", payload).then(data); // {content, photos:[base64...]}
 export const updateCommunityPost = (id, payload) => API.put(`/api/community/posts/${id}`, payload).then(data);
@@ -160,6 +204,22 @@ export const moderateComment = (commentId, decision) => API.post(`/api/community
 export const fetchModerationStats = () => API.get("/api/community/moderation/stats").then(data);
 export const downloadModerationDataset = () => API.get("/api/community/moderation/export", { responseType: "blob" }).then(data);
 
+// ----- 학부모: 시설 찾기·입장 / 자녀 프로필 / 가입 신청 (시설 선택 전에도 사용) -----
+export const searchFacilities = (params) => API.get("/api/parent/facilities/search", { params }).then(data);
+export const fetchMyFacilities = () => API.get("/api/parent/facilities/mine").then(data);
+export const fetchFacilityDetail = (id) => API.get(`/api/parent/facilities/${id}`).then(data);
+export const enterParentFacility = (id) => API.post(`/api/parent/facilities/${id}/enter`).then(data);
+export const exitParentFacility = () => API.post("/api/parent/facilities/exit").then(data);
+export const leaveParentFacility = (id) => API.delete(`/api/parent/facilities/${id}/membership`);
+export const fetchChildProfiles = () => API.get("/api/parent/child-profiles").then(data);
+export const createChildProfile = (payload) => API.post("/api/parent/child-profiles", payload).then(data);
+export const updateChildProfile = (id, payload) => API.put(`/api/parent/child-profiles/${id}`, payload).then(data);
+export const deleteChildProfile = (id) => API.delete(`/api/parent/child-profiles/${id}`);
+/** 가입 신청 — 예상 비용은 서버가 수업 수강료로 계산 */
+export const applyToFacility = (facilityId, payload) => API.post(`/api/parent/facilities/${facilityId}/applications`, payload).then(data);
+export const fetchParentApplications = () => API.get("/api/parent/applications").then(data);
+export const cancelParentApplication = (id) => API.post(`/api/parent/applications/${id}/cancel`).then(data);
+
 // ----- 학부모 포털 (학부모 세션 전용, 연결된 자녀 데이터만) -----
 export const fetchParentChildren = () => API.get("/api/parent/children").then(data);
 export const linkParentChild = (childName, phone) => API.post("/api/parent/children", { child_name: childName, phone }).then(data);
@@ -170,6 +230,13 @@ export const fetchParentAttendances = (memberId, days = 30) =>
 export const parentKakaoReady = (invoiceId) => API.post("/api/parent/payments/kakao-ready", { invoice_id: invoiceId }).then(data);
 export const fetchParentNotices = () => API.get("/api/parent/notices").then(data);
 export const fetchParentPosts = () => API.get("/api/parent/community/posts").then(data);
+export const createParentPost = (payload) => API.post("/api/parent/community/posts", payload).then(data);
+export const fetchParentBoard = (params) => API.get("/api/parent/community/board", { params }).then(data);
+export const fetchParentPost = (id) => API.get(`/api/parent/community/posts/${id}`).then(data);
+export const updateParentPost = (id, payload) => API.put(`/api/parent/community/posts/${id}`, payload).then(data);
+export const deleteParentPost = (id) => API.delete(`/api/parent/community/posts/${id}`);
+export const deleteParentComment = (commentId) => API.delete(`/api/parent/community/comments/${commentId}`);
+export const updateParentMembership = (nickname) => API.put("/api/parent/membership", { nickname }).then(data);
 export const likeParentPost = (id) => API.post(`/api/parent/community/posts/${id}/like`).then(data);
 export const fetchParentComments = (postId) => API.get(`/api/parent/community/posts/${postId}/comments`).then(data);
 export const createParentComment = (postId, content) =>

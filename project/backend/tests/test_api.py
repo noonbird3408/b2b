@@ -3,7 +3,7 @@ import json
 from datetime import date
 
 import main
-from conftest import login
+from conftest import login, parent_in, create_facility
 from fastapi.testclient import TestClient
 
 
@@ -47,7 +47,7 @@ def test_parent_sees_only_linked_child(owner):
     owner.post("/api/invoices", json={"member_id": other, "amount": 99000})
     owner.post("/api/attendances", json={"member_id": mine, "attendance_date": date.today().isoformat()})
 
-    parent = login("parent@example.com", "parent")
+    parent = parent_in("parent@example.com", owner.facility_id)
     assert parent.post("/api/parent/children", json={"child_name": "김민준", "phone": "010-0000-0000"}).status_code == 404
     res = parent.post("/api/parent/children", json={"child_name": "김민준", "phone": "01011112222"})
     assert res.status_code == 201 and res.json()["member_id"] == mine
@@ -63,8 +63,8 @@ def test_parent_sees_only_linked_child(owner):
     assert parent.post("/api/parent/payments/kakao-ready", json={"invoice_id": inv["invoice_id"]}).status_code == 503
 
 
-def test_parent_link_lockout():
-    parent = login("bruteforce@example.com", "parent")
+def test_parent_link_lockout(owner):
+    parent = parent_in("bruteforce@example.com", owner.facility_id)
     for _ in range(main.VERIFY_MAX_FAILURES):
         parent.post("/api/parent/children", json={"child_name": "없는학생", "phone": "010-9999-9999"})
     assert parent.post("/api/parent/children", json={"child_name": "없는학생", "phone": "010-9999-9999"}).status_code == 429
@@ -72,16 +72,24 @@ def test_parent_link_lockout():
 
 def test_parent_comment_author_is_server_side(owner):
     post = owner.post("/api/community/posts", json={"content": "오늘 수업 사진"}).json()
-    parent = login("commenter@example.com", "parent")
-    res = parent.post(f"/api/parent/community/posts/{post['post_id']}/comments", json={"content": "감사합니다"})
-    assert res.status_code == 201 and res.json()["author"].endswith("학부모")
+    parent = parent_in("commenter@example.com", owner.facility_id)
+    res = parent.post(f"/api/parent/community/posts/{post['post_id']}/comments",
+                      json={"content": "감사합니다", "author": "원장"})
+    assert res.status_code == 201 and res.json()["author"].endswith("학부모")   # 클라이언트가 보낸 이름 무시
 
 
 def test_staff_limited_to_shop(owner):
     assert owner.post("/api/admin/accounts", json={"email": "staff@example.com", "role": "staff"}).status_code == 201
     staff = login("staff@example.com", "admin")                      # 사전 등록 → 초대 코드 불필요
+    assert staff.get("/api/shop/products").status_code == 428          # 시설 선택 전
+    facilities = staff.get("/api/facilities").json()
+    assert [f["facility_id"] for f in facilities] == [owner.facility_id]
+    assert staff.post(f"/api/facilities/{owner.facility_id}/enter").status_code == 200
     assert staff.get("/api/shop/products").status_code == 200
-    assert staff.get("/api/members").status_code == 403
+    assert staff.get("/api/members").status_code == 200                # 직원: 학생·수업 조회 가능
+    assert staff.post("/api/members", json={"name": "x", "gender": "M", "age": 1,
+                                           "enrollment_date": date.today().isoformat()}).status_code == 403
+    assert staff.post("/api/facilities", json={"name": "직원 시설"}).status_code == 403
 
 
 def test_shop_recommendations_use_facility_signals(owner):
@@ -115,6 +123,27 @@ def test_enrollment_map_and_classes(owner):
     classes = owner.get("/api/classes").json()
     target = next(c for c in classes if c["class_id"] == cls["class_id"])
     assert target["students"][0]["name"] == "박지호"
+
+
+def test_classes_allow_open_ended_schedule(owner):
+    response = owner.post("/api/classes", json={
+        "name": "기간 미정 반", "teacher": "김코치",
+        "schedules": [{"day": "MON", "start": "14:00", "end": "15:00"}],
+        "color_index": 3,
+    })
+    assert response.status_code == 201, response.text
+    data = response.json()
+    assert data["start_date"] is None and data["end_date"] is None
+    assert data["color_index"] == 3
+
+    updated = owner.put(f"/api/classes/{data['class_id']}", json={
+        "name": "기간 지정 반", "teacher": "김코치",
+        "start_date": "2026-01-01", "end_date": "2026-12-31",
+        "schedules": [{"day": "MON", "start": "14:00", "end": "15:00"}],
+        "color_index": 1,
+    })
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["color_index"] == 1
 
 
 def test_ai_pseudonymizer_strips_pii():
@@ -207,7 +236,7 @@ def test_community_photos_and_parent_access(owner):
     # 수정: 첫 사진만 유지
     edited = owner.put(f"/api/community/posts/{post['post_id']}", json={"content": "수정", "photos": post["photos"][:1]}).json()
     assert edited["photos"] == post["photos"][:1]
-    parent = login("photo-parent@example.com", "parent")
+    parent = parent_in("photo-parent@example.com", owner.facility_id)
     feed = parent.get("/api/parent/community/posts").json()
     mine = next(p for p in feed if p["post_id"] == post["post_id"])
     assert mine["photos"][0].startswith("/api/parent/community/photos/")
@@ -221,7 +250,8 @@ def test_community_photos_and_parent_access(owner):
 def test_legacy_json_photos_are_migrated(owner):
     db = main.SessionLocal()
     try:
-        legacy = main.CommunityPost(author="관리자", content="옛 게시물", photos=json.dumps([PNG_1PX]))
+        legacy = main.CommunityPost(author="관리자", content="옛 게시물", photos=json.dumps([PNG_1PX]),
+                                    facility_id=owner.facility_id)
         db.add(legacy); db.commit(); post_id = legacy.post_id
     finally:
         db.close()

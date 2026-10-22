@@ -41,6 +41,30 @@ def login(email: str, role: str = None, invite_code: str = "") -> TestClient:
     return client
 
 
+def create_facility(client: TestClient, name: str, **extra) -> int:
+    """v9: 관리자는 시설을 만들고 '입장'해야 시설 데이터 API 를 쓸 수 있습니다."""
+    res = client.post("/api/facilities", json={"name": name, "facility_type": "도장", "region": "경기 용인시", **extra})
+    assert res.status_code == 201, res.text
+    facility_id = res.json()["facility_id"]
+    assert client.post(f"/api/facilities/{facility_id}/enter").status_code == 200
+    return facility_id
+
+
+def parent_in(email: str, facility_id: int) -> TestClient:
+    """학부모로 로그인 → 시설 입장(커뮤니티 멤버 가입)"""
+    client = login(email, "parent")
+    res = client.post(f"/api/parent/facilities/{facility_id}/enter")
+    assert res.status_code == 200, res.text
+    return client
+
+
 @pytest.fixture(scope="session")
 def owner():
-    return login("owner@example.com", "admin", "owner-invite-code")
+    client = login("owner@example.com", "admin", "owner-invite-code")
+    client.facility_id = create_facility(client, "테스트 태권도장")
+    return client
+
+
+@pytest.fixture(scope="session")
+def facility_id(owner):
+    return owner.facility_id

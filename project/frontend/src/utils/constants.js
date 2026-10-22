@@ -13,7 +13,7 @@ export const NOTIFICATION_META = {
   CHECK_IN: { icon: "🟢", admin: "/attendances", parent: "children" },
   CHECK_OUT: { icon: "🏠", admin: "/attendances", parent: "children" },
   ABSENT: { icon: "⚪", admin: "/attendances", parent: "children" },
-  NOTICE: { icon: "📢", admin: "/community", parent: "notices" },
+  NOTICE: { icon: "📢", admin: "/community", parent: "feed" },
   INVOICE: { icon: "🧾", admin: "/admin-checkout", parent: "pay" },
   PAYMENT: { icon: "💳", admin: "/admin-checkout", parent: "pay" },
   UNPAID: { icon: "⚠️", admin: "/admin-checkout", parent: "pay" },
@@ -21,6 +21,9 @@ export const NOTIFICATION_META = {
   COMMENT: { icon: "💬", admin: "/community", parent: "feed" },
   MODERATION: { icon: "🛡️", admin: "/community?tab=moderation", parent: "feed" },
   LINK: { icon: "🔗", admin: "/members", parent: "children" },
+  APPLICATION: { icon: "📝", admin: "/members?tab=applications", parent: "children" },
+  POST: { icon: "🗒️", admin: "/community", parent: "feed" },
+  SANCTION: { icon: "⛔", admin: "/community?tab=members", parent: "feed" },
 };
 
 /** "2026-11-04T14:05:00" → "3분 전" */

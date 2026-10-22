@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import Brand from "../components/Brand.jsx";
 import { useNavigate } from "react-router-dom";
 import {
   approveB2BOrder,
@@ -96,7 +97,7 @@ function B2BShopLive() {
       })
       .catch((authError) => {
         if (authError.message === "redirect") return;
-        if ([401, 403].includes(authError.response?.status)) navigate("/");
+        if ([401, 403, 428].includes(authError.response?.status)) navigate("/");
         else setError("계정 정보를 확인할 수 없습니다. 서버 연결을 확인하세요.");
       })
       .finally(() => setAuthLoading(false));
@@ -346,7 +347,7 @@ function B2BShopLive() {
   return (
     <div className="b2b-shop-shell">
       <header className="b2b-topbar">
-        <div className="b2b-brand"><span className="b2b-brand-mark">{academy.logo ? <img src={academy.logo} alt="기관 로고" /> : academy.name?.[0] || "B"}</span><div><strong>{academy.name || "기관 쇼핑몰"}</strong><small>{academy.branch || "B2B 구매 포털"}</small></div></div>
+        <Brand sub={academy.name || "B2B 구매"} />
         <div className="b2b-user-controls"><span>{account?.username} · {account?.role === "owner" ? "관리자" : "직원"}</span><button type="button" className="btn ghost sm" onClick={() => navigate("/shop")}>DDM 쇼핑몰 추천</button>{isOwner && <button type="button" className="btn ghost sm" onClick={() => navigate("/dashboard")}>관리자 화면</button>}<button type="button" className="btn ghost sm" onClick={logout}>로그아웃</button></div>
       </header>
       <main className="b2b-shop">
@@ -354,12 +355,11 @@ function B2BShopLive() {
         <div>
           <div className="b2b-eyebrow">기관 구매 · 통합 발주</div>
           <h1 className="page-title">B2B 쇼핑몰</h1>
-          <p className="page-subtitle">검색, 수업 인원 계산, 기관 견적, 구매 승인과 결제를 한곳에서 처리합니다.</p>
+          <p className="page-subtitle">교재·물품 발주와 견적</p>
         </div>
         <span className="b2b-role-chip">{tier === "VIP" ? "VIP 기관가" : "일반 기관가"}</span>
       </header>
 
-      <div className="b2b-demo-note">상품·주문·샘플·구매 이력 추천은 서버 데이터베이스와 연동됩니다. 카카오페이 및 세금계산서는 해당 서비스의 가맹점 설정 후 사용 가능합니다.</div>
 
       <section className="b2b-summary" aria-label="구매 현황">
         <div><span>계약 등급</span><strong>{tier === "VIP" ? "VIP" : "일반"} 기관가</strong><small>기관 등급과 수량 할인</small></div>
@@ -407,7 +407,7 @@ function B2BShopLive() {
               {recommendations.map((product) => <button type="button" key={product.sku} onClick={() => addToCart(product)}><strong>{product.name}</strong><span>{recommendationSource === "purchase_history" ? product.reason : "주문 이력이 쌓이면 구매 패턴에 맞춘 추천으로 바뀝니다."}</span></button>)}
             </div>
             <div className="b2b-catalog-head" id="b2b-catalog">
-              <div><h2>기관 전용 상품</h2><span>가격은 서버의 계약 등급 및 주문 수량에 따라 다시 계산됩니다.</span></div>
+              <div><h2>기관 전용 상품</h2></div>
               <label className="b2b-search"><span className="sr-only">상품 검색</span><input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="상품명 또는 코드 검색" /></label>
             </div>
             <div className="b2b-categories" role="group" aria-label="상품 분류">
@@ -446,14 +446,14 @@ function B2BShopLive() {
       )}
 
       {activeTab === "approvals" && (
-        <section className="b2b-orders-view"><div className="b2b-view-heading"><div><h2>구매 승인함</h2><p>직원이 요청한 주문을 관리자 계정에서 검토합니다.</p></div><span className={`b2b-role-chip ${isOwner ? "approver" : "requester"}`}>{isOwner ? "승인 담당자" : "요청자 보기"}</span></div>
+        <section className="b2b-orders-view"><div className="b2b-view-heading"><div><h2>구매 승인함</h2></div><span className={`b2b-role-chip ${isOwner ? "approver" : "requester"}`}>{isOwner ? "승인 담당자" : "요청자 보기"}</span></div>
           {!pendingOrders.length && <div className="b2b-empty">승인 대기 중인 주문이 없습니다.</div>}
           {pendingOrders.map((order) => <OrderRow key={order.order_id} order={order} canApprove={isOwner} onStatus={changeOrderStatus} onPay={payOrder} onQuote={() => setQuote({ items: order.items.map((item) => ({ ...item, unitPrice: item.unit_price })), total: order.total, createdAt: order.created_at, paymentMethod: order.payment_method })} />)}
         </section>
       )}
 
       {activeTab === "orders" && (
-        <section className="b2b-orders-view"><div className="b2b-view-heading"><div><h2>기관 주문 내역</h2><p>주문 품목을 다시 담아 반복 발주할 수 있습니다.</p></div><div className="b2b-refill-badge">소모품 재구매 주기 관리 {refillProducts.length}종</div></div>
+        <section className="b2b-orders-view"><div className="b2b-view-heading"><div><h2>기관 주문 내역</h2></div><div className="b2b-refill-badge">소모품 재구매 주기 관리 {refillProducts.length}종</div></div>
           <div className="b2b-refill-strip"><div><strong>소모품 재구매 확인</strong><span>{refillProducts.map((product) => product.name).join(" · ") || "등록된 소모품이 없습니다."}</span></div><button type="button" className="btn ghost sm" disabled={!refillProducts.length} onClick={() => refillProducts.forEach((product) => addToCart(product))}>소모품 담기</button></div>
           {!recentOrders.length && <div className="b2b-empty">아직 저장된 주문이 없습니다. 상품 발주 후 이곳에서 주문 상태를 확인하세요.</div>}
           {recentOrders.map((order) => <OrderRow key={order.order_id} order={order} canApprove={false} onStatus={changeOrderStatus} onPay={payOrder} onSettle={isOwner ? settleOrder : null} onReorder={reorder} onQuote={() => setQuote({ items: order.items.map((item) => ({ ...item, unitPrice: item.unit_price })), total: order.total, createdAt: order.created_at, paymentMethod: order.payment_method })} />)}

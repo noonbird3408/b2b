@@ -2,10 +2,22 @@
 import io
 from datetime import date, datetime, timedelta
 
+import pytest
+
 import main
-from conftest import login
+from conftest import login, parent_in
 
 PARENT_PHONE = "010-2468-1357"
+FACILITY = {}
+
+
+@pytest.fixture(autouse=True)
+def _facility(owner):
+    FACILITY["id"] = owner.facility_id
+
+
+def _parent(email):
+    return parent_in(email, FACILITY["id"])
 
 
 def _member(owner, name, phone=PARENT_PHONE):
@@ -16,7 +28,7 @@ def _member(owner, name, phone=PARENT_PHONE):
 
 
 def _linked_parent(email, child_name, phone=PARENT_PHONE):
-    parent = login(email, "parent")
+    parent = _parent(email)
     assert parent.post("/api/parent/children", json={"child_name": child_name, "phone": phone}).status_code == 201
     return parent
 
@@ -43,7 +55,7 @@ def test_attendance_mark_notifies_parent_and_checkout(owner):
     today = main._today().isoformat()
     res = owner.post("/api/attendances/mark", json={"member_id": member_id, "attendance_date": today, "status": "PRESENT"})
     assert res.status_code == 200 and res.json()["check_in_time"]
-    assert [n["title"] for n in _unread(parent, "CHECK_IN")] == ["알림학생 학생 등원"]
+    assert [n["title"] for n in _unread(parent, "CHECK_IN")] == ["알림학생 학생 출석"]
     # 같은 상태로 다시 저장해도 알림은 중복되지 않음 (upsert)
     owner.post("/api/attendances/mark", json={"member_id": member_id, "attendance_date": today, "status": "PRESENT"})
     assert len(_unread(parent, "CHECK_IN")) == 1
@@ -95,6 +107,7 @@ def test_late_detection_uses_class_schedule(owner):
     assert [s["start"] for s in cls["schedules"]] == ["14:00", "10:00"]                # 요일별 시간 저장
     owner.post(f"/api/classes/{cls['class_id']}/members/{member_id}")
     db = main.SessionLocal()
+    db.info["facility_id"] = FACILITY["id"]          # 요청 밖에서 직접 호출할 때는 시설 문맥을 지정
     try:
         at = lambda h, m: datetime.combine(today, datetime.min.time()).replace(hour=h, minute=m)  # noqa: E731
         assert main._auto_check_in_status(db, member_id, at(13, 50)) == "PRESENT"
@@ -134,7 +147,7 @@ def test_assignment_file_edit_and_submissions(owner):
                                            "end_date": "2026-12-31"}).json()
     owner.post(f"/api/classes/{cls['class_id']}/members/{member_id}")
     parent = _linked_parent("assign-parent@example.com", "과제학생", "010-7000-0001")
-    stranger = login("assign-stranger@example.com", "parent")
+    stranger = _parent("assign-stranger@example.com")
     res = owner.post(f"/api/classes/{cls['class_id']}/assignments",
                      data={"title": "연습 기록", "due_date": "2026-12-01", "content": "매일"},
                      files={"file": ("기록표.txt", io.BytesIO("내용".encode()), "text/plain")})
@@ -195,7 +208,7 @@ def test_member_notes_and_parent_notify(owner):
 def test_comment_moderation_flow(owner):
     _member(owner, "댓글학생", "010-3000-0001")
     writer = _linked_parent("bad-writer@example.com", "댓글학생", "010-3000-0001")
-    other = login("other-reader@example.com", "parent")
+    other = _parent("other-reader@example.com")
     post = owner.post("/api/community/posts", json={"content": "모니터링 테스트"}).json()
     bad = writer.post(f"/api/parent/community/posts/{post['post_id']}/comments", json={"content": "시1발 진짜"}).json()
     good = writer.post(f"/api/parent/community/posts/{post['post_id']}/comments", json={"content": "감사합니다"}).json()
@@ -217,7 +230,7 @@ def test_comment_moderation_flow(owner):
 
 def test_like_toggles_once_per_user(owner):
     post = owner.post("/api/community/posts", json={"content": "좋아요 테스트"}).json()
-    parent = login("liker@example.com", "parent")
+    parent = _parent("liker@example.com")
     assert parent.post(f"/api/parent/community/posts/{post['post_id']}/like").json() == {"post_id": post["post_id"], "like_count": 1, "liked": True}
     assert owner.post(f"/api/community/posts/{post['post_id']}/like").json()["like_count"] == 2
     assert parent.post(f"/api/parent/community/posts/{post['post_id']}/like").json()["like_count"] == 1   # 다시 누르면 취소
@@ -255,6 +268,7 @@ def test_demo_data_requires_force_when_members_exist(owner):
 def test_staff_can_use_kiosk_but_not_member_admin(owner):
     owner.post("/api/admin/accounts", json={"email": "front-desk@example.com", "role": "staff"})
     staff = login("front-desk@example.com", "admin")
+    assert staff.post(f"/api/facilities/{FACILITY['id']}/enter").status_code == 200
     assert staff.get("/api/kiosk/today").status_code == 200
     assert staff.get("/api/admin/summary").status_code == 200
     assert staff.get("/api/todos").status_code == 403

@@ -38,9 +38,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, Time, CHAR, Text,
-    Boolean, TIMESTAMP, ForeignKey, UniqueConstraint, func, and_, or_, inspect, text,
+    Boolean, TIMESTAMP, ForeignKey, UniqueConstraint, Index, func, and_, or_, inspect, text, event, case,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship, selectinload, defer
+from sqlalchemy.orm import (
+    declarative_base, sessionmaker, Session, relationship, selectinload, defer, with_loader_criteria,
+)
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, DataError
 from sqlalchemy.pool import NullPool
 
@@ -115,15 +117,15 @@ def _engine_kwargs() -> dict:
         # 연결이 안 될 때 Vercel 함수가 오래 멈추지 않도록 10초에서 끊음.
         kwargs["connect_args"] = {"prepare_threshold": None, "connect_timeout": 10}
     if IS_SERVERLESS:
-        # 서버리스 인스턴스는 수명이 짧아 자체 커넥션 풀 대신 Supabase 풀러에 맡김
+        # 서버리스 인스턴스는 수명이 짧아 자체 커넥션 풀 대신 Supabase 풀러에 맡김.
+        # v9: NullPool 은 매 요청 새 연결이라 pre_ping(SELECT 1 왕복)이 의미 없이 지연만 늘림 → 끔
         kwargs["poolclass"] = NullPool
+        kwargs["pool_pre_ping"] = False
     return kwargs
 
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs())
 if DB_DIALECT == "sqlite":
-    from sqlalchemy import event
-
     @event.listens_for(engine, "connect")
     def _sqlite_enforce_foreign_keys(dbapi_connection, _record):
         # SQLite 도 Supabase(PostgreSQL)처럼 외래키를 강제 → 로컬·테스트에서 같은 오류를 미리 발견
@@ -138,10 +140,87 @@ Base = declarative_base()
 # Base.metadata.create_all() 은 모든 모델 정의 뒤(파일 맨 아래)에서 호출합니다.
 
 
+# =====================================================================
+# v9 멀티 시설(멀티 테넌트) — 한 DB 에 여러 시설의 데이터를 두고 facility_id 로 구분
+#
+#   설계: 공유 테이블 + facility_id 컬럼(Shared schema, tenant column) 방식
+#     - 대안 1) 시설마다 스키마/DB 분리: 격리는 강하지만 Supabase 무료 플랜·마이그레이션 관리가 어려움
+#     - 대안 2) PostgreSQL RLS: DB 계정·세션 변수 설계가 필요하고 트랜잭션 풀러(6543)와 궁합이 나쁨
+#   → 애플리케이션 계층에서 "자동 필터"를 걸어 개발자가 WHERE 조건을 빠뜨려도 다른 시설 데이터가 보이지 않게 함
+#
+#   동작
+#     1) 요청 인증 단계(_authorize)에서 db.info["facility_id"] 에 선택한 시설을 기록
+#     2) do_orm_execute 이벤트: 모든 SELECT/UPDATE/DELETE 에 TenantMixin.facility_id == 현재 시설 조건을 자동 추가
+#        (조회·집계·JOIN·서브쿼리·관계 지연 로딩·db.get 모두 적용 — tests/test_tenancy.py 로 검증)
+#     3) before_flush 이벤트: 새로 추가되는 행에 facility_id 를 자동으로 채움
+#   시설 문맥이 없는 요청(로그인, 시설 목록, 카카오페이 콜백, Cron)은 필터 없이 동작합니다.
+# =====================================================================
+class TenantMixin:
+    """시설별로 나뉘는 테이블. facility_id 는 자동으로 채워지고 조회 시 자동으로 필터됩니다."""
+    facility_id = Column(Integer, index=True)
+
+
+# data_version 을 올리지 않는(화면 새로고침이 필요 없는) 테이블 — 읽음 표시·로그 등
+_NO_SYNC_TABLES = {"notifications", "activity_logs", "notice_reads", "shop_click_events"}
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _tenant_filter(state):
+    facility_id = state.session.info.get("facility_id")
+    if facility_id is None or state.execution_options.get("all_facilities"):
+        return
+    if state.is_select or state.is_update or state.is_delete:
+        state.statement = state.statement.options(with_loader_criteria(
+            TenantMixin, lambda cls: cls.facility_id == facility_id, include_aliases=True))
+        if (state.is_update or state.is_delete) and not state.session.info.get("no_sync"):
+            mapper = state.bind_mapper
+            if mapper is not None and mapper.local_table.name not in _NO_SYNC_TABLES:
+                state.session.info["data_changed"] = True
+
+
+@event.listens_for(Session, "before_flush")
+def _tenant_fill(session, flush_context, instances):
+    facility_id = session.info.get("facility_id")
+    changed = False
+    for obj in session.new:
+        if isinstance(obj, TenantMixin):
+            if getattr(obj, "facility_id", None) is None:
+                obj.facility_id = facility_id
+            if obj.__tablename__ not in _NO_SYNC_TABLES:
+                changed = True
+    if not changed:
+        changed = any(isinstance(o, TenantMixin) and o.__tablename__ not in _NO_SYNC_TABLES
+                      for o in list(session.dirty) + list(session.deleted))
+    if changed and not session.info.get("no_sync"):
+        session.info["data_changed"] = True
+
+
+@event.listens_for(Session, "after_flush_postexec")
+def _bump_data_version(session, flush_context):
+    """시설 데이터가 바뀌면 facilities.data_version + 1 — 다른 화면(관리자·학부모)이 폴링으로 감지해 즉시 새로고침"""
+    _flush_data_version(session)
+
+
+def _flush_data_version(session) -> None:
+    facility_id = session.info.get("facility_id")
+    if facility_id is None or not session.info.pop("data_changed", False):
+        return
+    session.connection().execute(
+        text("UPDATE facilities SET data_version = COALESCE(data_version, 0) + 1 WHERE facility_id = :f"),
+        {"f": facility_id})
+
+
+@event.listens_for(Session, "before_commit")
+def _bump_on_bulk(session):
+    # query.update()/delete() 는 flush 이벤트가 없으므로 커밋 직전에 반영
+    if session.info.get("data_changed"):
+        _flush_data_version(session)
+
+
 # ---------------------------------------------------------------------
 # ORM 모델
 # ---------------------------------------------------------------------
-class Member(Base):
+class Member(TenantMixin, Base):
     __tablename__ = "members"
     member_id        = Column(Integer, primary_key=True, autoincrement=True)
     name             = Column(String(50), nullable=False)
@@ -161,14 +240,13 @@ class Member(Base):
     photo_url        = Column(Text)   # 학생 프로필 사진 (base64 data URL)
 
 
-class Attendance(Base):
+class Attendance(TenantMixin, Base):
     __tablename__ = "attendances"
-    # [FIX] 같은 회원·같은 날짜 중복을 DB 차원에서 차단 (앱 레벨 검사만으로는 동시성에 취약)
-    __table_args__ = (
-        UniqueConstraint("member_id", "attendance_date", name="uq_attendance_member_date"),
-    )
+    # v9: 출결은 "학생 × 날짜 × 수업" 단위. class_id 가 비어 있으면 시설 출입(수업 무관) 기록.
+    #     중복 방지 유니크 인덱스(uq_attendance_member_date_class)는 클래스 정의 아래에서 만듭니다.
     attendance_id    = Column(Integer, primary_key=True, autoincrement=True)
-    member_id        = Column(Integer, ForeignKey("members.member_id"), nullable=False)
+    member_id        = Column(Integer, ForeignKey("members.member_id"), nullable=False, index=True)
+    class_id         = Column(Integer, index=True)
     attendance_date  = Column(Date,     nullable=False, index=True)
     status           = Column(String(10), default="PRESENT")
     check_in_time    = Column(Time)
@@ -178,7 +256,12 @@ class Attendance(Base):
     member           = relationship("Member")
 
 
-class Payment(Base):
+# 같은 학생이 같은 날 같은 수업에 두 번 기록되지 않도록 (수업 없는 기록은 class_id=0 으로 취급)
+Index("uq_attendance_member_date_class", Attendance.member_id, Attendance.attendance_date,
+      func.coalesce(Attendance.class_id, 0), unique=True)
+
+
+class Payment(TenantMixin, Base):
     __tablename__ = "payments"
     payment_id       = Column(Integer, primary_key=True, autoincrement=True)
     member_id        = Column(Integer, ForeignKey("members.member_id"), nullable=False)
@@ -191,7 +274,7 @@ class Payment(Base):
     member           = relationship("Member")
 
 
-class Notice(Base):
+class Notice(TenantMixin, Base):
     __tablename__ = "notices"
     notice_id        = Column(Integer, primary_key=True, autoincrement=True)
     title            = Column(String(200), nullable=False)
@@ -206,13 +289,13 @@ class Notice(Base):
 
 
 # 수업 (classes)
-class Class(Base):
+class Class(TenantMixin, Base):
     __tablename__ = "classes"
     class_id     = Column(Integer, primary_key=True, autoincrement=True)
     name         = Column(String(100), nullable=False)
     teacher      = Column(String(50),  nullable=False)
-    start_date   = Column(Date,        nullable=False)
-    end_date     = Column(Date,        nullable=False)
+    start_date   = Column(Date)
+    end_date     = Column(Date)
     days_of_week = Column(String(40),  default="")
     start_time   = Column(Time)
     end_time     = Column(Time)
@@ -220,6 +303,9 @@ class Class(Base):
     color_index  = Column(Integer, default=0)
     # v8.1: 요일별 수업 시간 JSON [{"day":"MON","start":"14:00","end":"15:00"}] — 요일마다 시간이 다를 때
     schedule_detail = Column(Text)
+    # v9: 수업 색(#RRGGBB, 캘린더 표시) · 월 수강료(학부모 가입 신청 시 예상 비용, 일괄 청구 금액)
+    color        = Column(String(9))
+    monthly_fee  = Column(Integer)
     created_at   = Column(TIMESTAMP, default=_now, server_default=func.now())
     updated_at   = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
     enrollments  = relationship("Enrollment", back_populates="cls",
@@ -227,15 +313,15 @@ class Class(Base):
 
 
 # 수강 (enrollments) - 학생-수업 N:M 매핑
-class Enrollment(Base):
+class Enrollment(TenantMixin, Base):
     __tablename__ = "enrollments"
     # [FIX] 같은 회원·같은 수업 중복 등록을 DB 차원에서 차단
     __table_args__ = (
         UniqueConstraint("member_id", "class_id", name="uq_enrollment_member_class"),
     )
     enrollment_id = Column(Integer, primary_key=True, autoincrement=True)
-    member_id     = Column(Integer, ForeignKey("members.member_id"), nullable=False)
-    class_id      = Column(Integer, ForeignKey("classes.class_id"),  nullable=False)
+    member_id     = Column(Integer, ForeignKey("members.member_id"), nullable=False, index=True)
+    class_id      = Column(Integer, ForeignKey("classes.class_id"),  nullable=False, index=True)
     enrolled_at   = Column(Date,    nullable=False, default=_today, server_default=func.current_date())
     status        = Column(String(10), default="ACTIVE")
     created_at    = Column(TIMESTAMP, default=_now, server_default=func.now())
@@ -244,7 +330,7 @@ class Enrollment(Base):
 
 
 # 수업관리 - 과제
-class Assignment(Base):
+class Assignment(TenantMixin, Base):
     __tablename__ = "assignments"
     assignment_id = Column(Integer, primary_key=True, autoincrement=True)
     class_id      = Column(Integer, ForeignKey("classes.class_id"), nullable=False)
@@ -256,7 +342,7 @@ class Assignment(Base):
 
 
 # v8.1: 과제 첨부 파일 — Vercel 은 파일을 영구 저장하지 않으므로 DB 에 보관 (파일당 4MB 이하)
-class AssignmentFile(Base):
+class AssignmentFile(TenantMixin, Base):
     __tablename__ = "assignment_files"
     assignment_id = Column(Integer, ForeignKey("assignments.assignment_id", ondelete="CASCADE"), primary_key=True)
     file_name     = Column(String(255), nullable=False)   # 원래 파일 이름(표시·다운로드용)
@@ -267,7 +353,7 @@ class AssignmentFile(Base):
 
 
 # v8.1: 과제 제출 현황 (학생별) — 관리자가 확인 표시, 학부모 포털에서 조회
-class AssignmentSubmission(Base):
+class AssignmentSubmission(TenantMixin, Base):
     __tablename__ = "assignment_submissions"
     __table_args__ = (UniqueConstraint("assignment_id", "member_id", name="uq_submission_assignment_member"),)
     submission_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -279,7 +365,7 @@ class AssignmentSubmission(Base):
 
 
 # v8.1: 학생 상담·특이사항 메모 (이력으로 쌓임 — 관리자 전용)
-class MemberNote(Base):
+class MemberNote(TenantMixin, Base):
     __tablename__ = "member_notes"
     note_id    = Column(Integer, primary_key=True, autoincrement=True)
     member_id  = Column(Integer, ForeignKey("members.member_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -290,7 +376,7 @@ class MemberNote(Base):
 
 # v8.1: 알림함 — 등·하원, 공지, 청구서, 결제 완료, 미납 안내, 과제, 댓글 검토 등.
 #        받는 사람은 Google 로그인 사용자(app_users). 화면은 주기적으로 새 알림을 조회(폴링)합니다.
-class Notification(Base):
+class Notification(TenantMixin, Base):
     __tablename__ = "notifications"
     notification_id = Column(Integer, primary_key=True, autoincrement=True)
     user_id    = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -305,7 +391,7 @@ class Notification(Base):
 
 
 # v8.1: 관리자 오늘의 업무 (브라우저 저장 → 계정별 서버 저장, 다른 기기에서도 동일)
-class AdminTodo(Base):
+class AdminTodo(TenantMixin, Base):
     __tablename__ = "admin_todos"
     todo_id    = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("admin_accounts.account_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -318,7 +404,7 @@ class AdminTodo(Base):
 
 # v8.1: 동작(이벤트) 로그 — 누가·언제·무엇을. 대시보드 '최근 활동'과 이용 분석에 사용.
 #        개인정보는 남기지 않고 대상 ID 와 요약만 기록합니다.
-class ActivityLog(Base):
+class ActivityLog(TenantMixin, Base):
     __tablename__ = "activity_logs"
     log_id     = Column(Integer, primary_key=True, autoincrement=True)
     actor_type = Column(String(10), nullable=False)        # admin / parent / kiosk / system
@@ -331,7 +417,7 @@ class ActivityLog(Base):
 
 
 # v8.1: 댓글 자동 모니터링 결과 + 관리자 판정 (판정 결과는 향후 AI 모델 학습 라벨로 활용)
-class CommentReview(Base):
+class CommentReview(TenantMixin, Base):
     __tablename__ = "comment_reviews"
     comment_id = Column(Integer, ForeignKey("community_comments.comment_id", ondelete="CASCADE"), primary_key=True)
     model      = Column(String(30), nullable=False, default="rule_v1")
@@ -345,7 +431,7 @@ class CommentReview(Base):
 
 # 카카오페이 결제 대기 (ready ~ approve 사이의 tid·주문정보 보관)
 # 인메모리 대신 DB에 저장 → 서버 재시작/다중 워커 환경에서도 안전.
-class PaymentPending(Base):
+class PaymentPending(TenantMixin, Base):
     __tablename__ = "payment_pending"
     partner_order_id = Column(String(64), primary_key=True)   # 주문 식별자
     tid              = Column(String(64), nullable=False)     # 카카오페이 거래 ID
@@ -360,7 +446,7 @@ class PaymentPending(Base):
 
 
 # [FEED] 커뮤니티 게시물 (밴드 스타일 피드) — 원장이 작성, 학부모가 열람
-class CommunityPost(Base):
+class CommunityPost(TenantMixin, Base):
     __tablename__ = "community_posts"
     post_id    = Column(Integer, primary_key=True, autoincrement=True)
     author     = Column(String(50), default="관리자")
@@ -368,8 +454,17 @@ class CommunityPost(Base):
     photos     = Column(Text)   # v7 이전 형식(사진 JSON). v8 부터는 community_photos 테이블 사용
     like_count = Column(Integer, default=0)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+    # v9: 게시판 형태 커뮤니티 — 제목·말머리·작성자(관리자/학부모)·고정·조회수·검토 상태
+    title       = Column(String(200))
+    category    = Column(String(20), default="FREE")      # FREE / QUESTION / PHOTO / INFO (공지는 notices 테이블)
+    user_id     = Column(Integer, index=True)             # 작성한 app_users (관리자 글도 기록)
+    author_role = Column(String(10), default="admin")     # admin / parent
+    is_pinned   = Column(Boolean, default=False)
+    view_count  = Column(Integer, default=0)
+    status      = Column(String(10), default="VISIBLE")   # VISIBLE / PENDING(자동 검토 대기) / HIDDEN
+    updated_at  = Column(TIMESTAMP)
 
-class CommunityComment(Base):
+class CommunityComment(TenantMixin, Base):
     __tablename__ = "community_comments"
     comment_id = Column(Integer, primary_key=True, autoincrement=True)
     post_id    = Column(Integer, ForeignKey("community_posts.post_id"), nullable=False, index=True)
@@ -378,11 +473,14 @@ class CommunityComment(Base):
     # v8.1: 작성한 학부모(app_users) — 본인 댓글의 '검토 중' 표시용. 관리자 댓글은 비어 있음
     user_id    = Column(Integer, index=True)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+    # v9: 관리자 댓글 작성자(app_users) — 학부모 댓글과 구분 (user_id 는 학부모 전용 의미를 유지)
+    author_role = Column(String(10), default="parent")
+    admin_user_id = Column(Integer)
     post       = relationship("CommunityPost")
 
 
 # v8.1: 좋아요 — 사용자당 게시물 1회 (새로고침해도 다시 누를 수 없음, 다시 누르면 취소)
-class CommunityLike(Base):
+class CommunityLike(TenantMixin, Base):
     __tablename__ = "community_likes"
     __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_community_like"),)
     like_id    = Column(Integer, primary_key=True, autoincrement=True)
@@ -392,7 +490,7 @@ class CommunityLike(Base):
 
 
 # v8.1: 공지 읽음 확인 — 학부모가 공지를 열람하면 기록, 관리자 화면에 '읽음 N가정' 표시
-class NoticeRead(Base):
+class NoticeRead(TenantMixin, Base):
     __tablename__ = "notice_reads"
     __table_args__ = (UniqueConstraint("notice_id", "user_id", name="uq_notice_read"),)
     read_id    = Column(Integer, primary_key=True, autoincrement=True)
@@ -404,7 +502,7 @@ class NoticeRead(Base):
 # v8: 커뮤니티 사진을 게시물 행(JSON)에서 분리 — 목록 응답에는 사진 URL 만 담고,
 #     사진은 /api/.../community/photos/{photo_id} 로 한 장씩 내려받습니다(브라우저 캐시 가능).
 #     v7 이전 게시물의 community_posts.photos(JSON)는 처음 조회될 때 이 테이블로 옮겨집니다.
-class CommunityPhoto(Base):
+class CommunityPhoto(TenantMixin, Base):
     __tablename__ = "community_photos"
     photo_id   = Column(Integer, primary_key=True, autoincrement=True)
     post_id    = Column(Integer, ForeignKey("community_posts.post_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -415,7 +513,7 @@ class CommunityPhoto(Base):
 
 
 # [PAY] 청구서(인보이스) — 원장이 발행, 학부모가 이름+연락처로 조회·결제
-class Invoice(Base):
+class Invoice(TenantMixin, Base):
     __tablename__ = "invoices"
     invoice_id = Column(Integer, primary_key=True, autoincrement=True)
     member_id  = Column(Integer, ForeignKey("members.member_id"), nullable=False, index=True)
@@ -464,13 +562,14 @@ class UserSession(Base):
     token_hash = Column(String(64), primary_key=True)
     user_id = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
     active_role = Column(String(10))            # None(선택 전) / parent / admin
+    facility_id = Column(Integer)               # v9: 지금 들어가 있는 시설 (역할별로 고름)
     expires_at = Column(TIMESTAMP, nullable=False, index=True)
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
 
 
 # 학부모(Google 계정) ↔ 자녀(members) 연결. 연결된 자녀의 데이터만 학부모 API 로 노출됩니다.
-class ParentLink(Base):
+class ParentLink(TenantMixin, Base):
     __tablename__ = "parent_links"
     __table_args__ = (UniqueConstraint("user_id", "member_id", name="uq_parent_link"),)
     link_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -481,10 +580,102 @@ class ParentLink(Base):
 
 
 class AcademySetting(Base):
+    """v8 이하 단일 시설 설정(키-값). v9 부터는 facilities 행에 저장하며, 이 테이블은 최초 마이그레이션 때만 읽습니다."""
     __tablename__ = "academy_settings"
     setting_key = Column(String(64), primary_key=True)
     setting_value = Column(Text, nullable=False)
     updated_at = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
+
+
+# ---------------------------------------------------------------------
+# v9 시설(테넌트) · 시설 직원 · 시설 회원(학부모) · 자녀 프로필 · 가입 신청
+# ---------------------------------------------------------------------
+class Facility(Base):
+    __tablename__ = "facilities"
+    facility_id   = Column(Integer, primary_key=True, autoincrement=True)
+    name          = Column(String(100), nullable=False)
+    facility_type = Column(String(10), nullable=False, default="학원")    # 학원 / 체육관 / 도장 / 기타
+    branch        = Column(String(100), nullable=False, default="")
+    region        = Column(String(50), nullable=False, default="", index=True)   # 검색용 지역(시·구)
+    address       = Column(String(200), nullable=False, default="")
+    phone         = Column(String(30), nullable=False, default="")
+    description   = Column(String(1000), nullable=False, default="")
+    logo          = Column(Text)                                         # 256px PNG data URL
+    is_public     = Column(Boolean, nullable=False, default=True)        # 학부모 검색 노출
+    settings_json = Column(Text)                                         # 원장 이름·날씨 지역·지각 기준 등
+    payment_json  = Column(Text)                                         # 기본 수강료·결제일·B2B 정산 방식
+    data_version  = Column(Integer, nullable=False, default=0)           # 데이터가 바뀔 때마다 +1 (화면 동기화)
+    created_by    = Column(Integer)                                      # 만든 app_users.user_id
+    created_at    = Column(TIMESTAMP, default=_now, server_default=func.now())
+    updated_at    = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
+    deleted_at    = Column(TIMESTAMP, index=True)                        # 삭제(보관) 시각 — 데이터는 남겨 둠
+
+
+class FacilityStaff(TenantMixin, Base):
+    """시설별 관리자 권한 (owner=원장, staff=직원). 한 계정이 여러 시설을 관리할 수 있습니다."""
+    __tablename__ = "facility_staff"
+    __table_args__ = (UniqueConstraint("facility_id", "account_id", name="uq_facility_staff"),)
+    staff_id   = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey("admin_accounts.account_id", ondelete="CASCADE"), nullable=False, index=True)
+    role       = Column(String(10), nullable=False, default="staff")
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+
+
+class FacilityMember(TenantMixin, Base):
+    """학부모가 '입장'한 시설 = 커뮤니티 멤버. 관리자 제재(경고·채팅 금지·강퇴)도 여기에 기록합니다."""
+    __tablename__ = "facility_members"
+    __table_args__ = (UniqueConstraint("facility_id", "user_id", name="uq_facility_member"),)
+    membership_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id       = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    nickname      = Column(String(50), nullable=False, default="")
+    status        = Column(String(10), nullable=False, default="ACTIVE")   # ACTIVE / BANNED
+    muted_until   = Column(TIMESTAMP)                                       # 이 시각까지 글·댓글 작성 금지
+    warnings      = Column(Integer, nullable=False, default=0)
+    sanction_note = Column(String(200))
+    joined_at     = Column(TIMESTAMP, default=_now, server_default=func.now())
+    last_seen_at  = Column(TIMESTAMP)
+
+
+class ChildProfile(Base):
+    """학부모가 등록한 자녀 정보(시설과 무관). 시설에 가입 신청할 때 이 정보로 신청서를 만듭니다."""
+    __tablename__ = "child_profiles"
+    child_id     = Column(Integer, primary_key=True, autoincrement=True)
+    user_id      = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    name         = Column(String(50), nullable=False)
+    gender       = Column(CHAR(1), nullable=False)
+    age          = Column(Integer, nullable=False)
+    school       = Column(String(100), nullable=False, default="")
+    parent_name  = Column(String(50), nullable=False, default="")
+    parent_phone = Column(String(20), nullable=False, default="")
+    relation     = Column(String(10), nullable=False, default="모")     # 모 / 부 / 기타 (연락처 저장 위치)
+    address      = Column(String(200), nullable=False, default="")
+    note         = Column(String(500), nullable=False, default="")       # 알레르기·특이사항 등
+    created_at   = Column(TIMESTAMP, default=_now, server_default=func.now())
+    updated_at   = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
+
+
+class EnrollmentApplication(TenantMixin, Base):
+    """학부모 → 시설 가입(수강) 신청. 승인되면 학생(members)·수강(enrollments)·자녀 연결(parent_links)이 생성됩니다."""
+    __tablename__ = "enrollment_applications"
+    application_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id        = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    child_id       = Column(Integer, index=True)
+    snapshot       = Column(Text, nullable=False)          # 신청 당시 자녀 정보(JSON) — 이후 프로필이 바뀌어도 그대로
+    class_ids      = Column(String(300), nullable=False, default="[]")
+    estimated_fee  = Column(Integer, nullable=False, default=0)
+    message        = Column(String(500), nullable=False, default="")
+    status         = Column(String(10), nullable=False, default="PENDING", index=True)  # PENDING/APPROVED/REJECTED/CANCELED
+    member_id      = Column(Integer)                       # 승인 후 만들어진 학생
+    reject_reason  = Column(String(200))
+    created_at     = Column(TIMESTAMP, default=_now, server_default=func.now())
+    decided_at     = Column(TIMESTAMP)
+
+
+class AppMeta(Base):
+    """스키마 버전 등 운영 메타 정보 — 콜드 스타트 때 이 값만 확인하고 마이그레이션을 건너뜁니다."""
+    __tablename__ = "app_meta"
+    meta_key   = Column(String(64), primary_key=True)
+    meta_value = Column(String(200), nullable=False)
 
 
 class B2BProduct(Base):
@@ -502,7 +693,7 @@ class B2BProduct(Base):
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
 
 
-class B2BOrder(Base):
+class B2BOrder(TenantMixin, Base):
     __tablename__ = "b2b_orders"
     order_id = Column(Integer, primary_key=True, autoincrement=True)
     order_number = Column(String(40), nullable=False, unique=True, index=True)
@@ -520,7 +711,7 @@ class B2BOrder(Base):
     account = relationship("AdminAccount")
 
 
-class B2BOrderItem(Base):
+class B2BOrderItem(TenantMixin, Base):
     __tablename__ = "b2b_order_items"
     item_id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(Integer, ForeignKey("b2b_orders.order_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -532,7 +723,7 @@ class B2BOrderItem(Base):
     unit_price = Column(Integer, nullable=False)
 
 
-class B2BSampleRequest(Base):
+class B2BSampleRequest(TenantMixin, Base):
     __tablename__ = "b2b_sample_requests"
     request_id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("admin_accounts.account_id"), nullable=False, index=True)
@@ -542,7 +733,7 @@ class B2BSampleRequest(Base):
     product = relationship("B2BProduct")
 
 
-class B2BPaymentPending(Base):
+class B2BPaymentPending(TenantMixin, Base):
     __tablename__ = "b2b_payment_pending"
     partner_order_id = Column(String(64), primary_key=True)
     tid = Column(String(64), nullable=False)
@@ -574,7 +765,7 @@ class ShopProduct(Base):
 
 
 # 쇼핑몰 상품 클릭 로그 (누가·언제·무엇을) — 추천 고도화를 위한 동작 데이터
-class ShopClickEvent(Base):
+class ShopClickEvent(TenantMixin, Base):
     __tablename__ = "shop_click_events"
     event_id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("admin_accounts.account_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -603,6 +794,9 @@ class MemberOut(BaseModel):
     photo_url: Optional[str] = None
     unpaid_amount: int = 0          # v8.1: 미납 청구서 합계 (미납 기준 = UNPAID 청구서가 있는가)
     unpaid_count: int = 0
+    # v9: 학생 목록 기본 화면 — 수강 수업과 오늘 수업별 출결 [{class_id,name,color,scheduled_today,status}]
+    classes: List[dict] = []
+    parent_linked: bool = False
     class Config: from_attributes = True
 
 
@@ -663,12 +857,15 @@ class AttendanceOut(BaseModel):
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     note: Optional[str] = None
+    class_id: Optional[int] = None          # v9: 수업별 출결 (없으면 시설 출입 기록)
+    class_name: Optional[str] = None
     class Config: from_attributes = True
 
 
 class AttendanceCreate(BaseModel):
     member_id: int
     attendance_date: date
+    class_id: Optional[int] = None
     status: str = Field("PRESENT", max_length=10)
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
@@ -735,13 +932,16 @@ class ClassOut(BaseModel):
     class_id: int
     name: str
     teacher: str
-    start_date: date
-    end_date: date
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     days_of_week: str = ""
     start_time: Optional[str] = None
     end_time:   Optional[str] = None
     description: Optional[str] = None
     color_index: int = 0
+    color: Optional[str] = None     # v9: 수업 색 (#RRGGBB)
+    monthly_fee: Optional[int] = None
+    fee: int = 0                    # v9: 실제 적용 수강료 (반 수강료 → 설정의 반별 수강료 → 기본 수강료 순)
     student_count: int = 0
     students: List[MemberBrief] = []
     schedules: List[dict] = []      # v8.1: [{"day":"MON","start":"14:00","end":"15:00"}]
@@ -750,8 +950,8 @@ class ClassOut(BaseModel):
 class ClassCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     teacher: str = Field(max_length=50)
-    start_date: date
-    end_date: date
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     days_of_week: str = Field("", max_length=40)        # "MON,WED,FRI"
     start_time: Optional[str] = None  # "14:00"
     end_time:   Optional[str] = None  # "15:30"
@@ -759,11 +959,29 @@ class ClassCreate(BaseModel):
     color_index: int = 0
     # v8.1: 요일별 시간. 보내면 days_of_week/start_time/end_time 보다 우선합니다.
     schedules: Optional[List["ScheduleItem"]] = None
+    # v9: 수업 색 · 월 수강료 · 수강생 명단(보내면 그 명단으로 맞춤)
+    color: Optional[str] = Field(None, max_length=9)
+    monthly_fee: Optional[int] = Field(None, ge=0, le=100_000_000)
+    student_ids: Optional[List[int]] = Field(None, max_length=500)
 
     @field_validator("start_time", "end_time", mode="before")
     @classmethod
     def empty_time_to_none(cls, v):
         return None if v == "" else v
+
+    @field_validator("start_date", "end_date", "monthly_fee", mode="before")
+    @classmethod
+    def empty_to_none(cls, v):
+        return None if v == "" else v
+
+    @field_validator("color")
+    @classmethod
+    def valid_color(cls, v):
+        if v in (None, ""):
+            return None
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+            raise ValueError("색은 #RRGGBB 형식이어야 합니다.")
+        return v.upper()
 
 
 class ScheduleItem(BaseModel):
@@ -887,7 +1105,7 @@ async def lifespan(app: "FastAPI"):
 # ---------------------------------------------------------------------
 # 앱 설정
 # ---------------------------------------------------------------------
-app = FastAPI(title="시설 통합 관리 API", version="0.8.1", lifespan=lifespan,
+app = FastAPI(title="facilink API", version="0.9.0", lifespan=lifespan,
               # 운영(Vercel)에서는 API 문서 화면을 숨김 — 엔드포인트 목록 노출 최소화
               docs_url=None if IS_SERVERLESS else "/docs",
               redoc_url=None, openapi_url=None if IS_SERVERLESS else "/openapi.json")
@@ -1101,7 +1319,7 @@ def _account_to_out(account: AdminAccount) -> dict:
         "email": account.email,
         "username": account.username,
         "provider": account.provider,
-        "role": account.role,
+        "role": _facility_role(account),
         "pricing_tier": account.pricing_tier,
         "is_active": bool(account.is_active),
     }
@@ -1165,8 +1383,15 @@ _PUBLIC_API_PATHS = {
     "/api/payments/kakao-success", "/api/payments/kakao-cancel", "/api/payments/kakao-fail",
     "/api/cron/cleanup", "/api/health",
 }
-# 직원(staff) 계정도 사용할 수 있는 관리자 영역 (쇼핑몰·발주 + 출석 키오스크 + 알림함·상단 요약)
-_STAFF_API_PREFIXES = ("/api/b2b/", "/api/shop/", "/api/kiosk/", "/api/notifications", "/api/admin/summary")
+# 직원(staff) 계정도 사용할 수 있는 관리자 영역 (쇼핑몰·발주 + 출석 키오스크 + 알림함·상단 요약 + 출석 체크)
+_STAFF_API_PREFIXES = ("/api/b2b/", "/api/shop/", "/api/kiosk/", "/api/notifications", "/api/admin/summary",
+                       "/api/attendances", "/api/sync")
+# 직원이 조회만 할 수 있는 영역 (출석 체크 화면에 필요한 학생·수업 목록)
+_STAFF_READ_PREFIXES = ("/api/members", "/api/classes", "/api/enrollments")
+# 시설을 고르기 전에도 쓸 수 있는 API (시설 목록·생성·입장 / 학부모 시설 검색·자녀 프로필·가입 신청 현황)
+_ADMIN_GLOBAL_PREFIXES = ("/api/facilities",)
+_PARENT_GLOBAL_PREFIXES = ("/api/parent/facilities", "/api/parent/child-profiles", "/api/parent/applications")
+FACILITY_REQUIRED_STATUS = 428   # 프론트는 이 코드를 받으면 시설 선택 화면으로 이동
 
 
 def _public_api_request(method: str, path: str) -> bool:
@@ -1184,7 +1409,8 @@ def _json_error(request: Request, status_code: int, detail: str) -> JSONResponse
 
 
 def _authorize(request: Request, db: Session):
-    """세션·역할 검사. 통과하면 None, 막아야 하면 (상태코드, 메시지)를 돌려줌."""
+    """세션·역할·시설 검사. 통과하면 None, 막아야 하면 (상태코드, 메시지)를 돌려줌.
+    통과하면 db.info["facility_id"] 가 설정되어 이후 모든 조회가 그 시설로 자동 제한됩니다."""
     path = request.url.path
     session, user = _resolve_user_session(db, request.cookies.get(AUTH_COOKIE_NAME))
     if not session:
@@ -1194,15 +1420,49 @@ def _authorize(request: Request, db: Session):
     if path.startswith("/api/parent/"):
         if session.active_role != "parent":
             return 403, "학부모 모드를 선택한 뒤 이용하세요."
+        if path.startswith(_PARENT_GLOBAL_PREFIXES):
+            return None
+        if not session.facility_id:
+            return FACILITY_REQUIRED_STATUS, "이용할 시설을 먼저 선택하세요."
+        row = (db.query(FacilityMember, Facility)
+                 .join(Facility, Facility.facility_id == FacilityMember.facility_id)
+                 .filter(FacilityMember.user_id == user.user_id, FacilityMember.facility_id == session.facility_id,
+                         Facility.deleted_at.is_(None)).first())
+        if not row:
+            return FACILITY_REQUIRED_STATUS, "이 시설에 입장한 기록이 없습니다. 시설을 다시 선택하세요."
+        membership, facility = row
+        if membership.status == "BANNED":
+            return 403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다. 시설로 문의하세요."
+        request.state.membership = membership
+        request.state.facility = facility
+        db.info["facility_id"] = facility.facility_id
         return None
     if session.active_role != "admin":
         return 403, "관리자 모드를 선택한 뒤 이용하세요."
     account = _admin_account_for(db, user)
     if not account:
         return 403, "관리자 권한이 없는 계정입니다."
-    if account.role != "owner" and not path.startswith(_STAFF_API_PREFIXES):
-        return 403, "원장(관리자) 권한이 필요합니다."
     request.state.account = account
+    if path.startswith(_ADMIN_GLOBAL_PREFIXES):
+        return None
+    if not session.facility_id:
+        return FACILITY_REQUIRED_STATUS, "관리할 시설을 먼저 선택하세요."
+    row = (db.query(FacilityStaff.role, Facility)
+             .join(Facility, Facility.facility_id == FacilityStaff.facility_id)
+             .filter(FacilityStaff.account_id == account.account_id, FacilityStaff.facility_id == session.facility_id,
+                     Facility.deleted_at.is_(None)).first())
+    if not row:
+        return FACILITY_REQUIRED_STATUS, "이 시설의 관리 권한이 없습니다. 시설을 다시 선택하세요."
+    role, facility = row
+    account.facility_role = role          # 매핑되지 않은 임시 속성 (DB 에 저장되지 않음)
+    request.state.facility = facility
+    db.info["facility_id"] = facility.facility_id
+    if role != "owner":
+        allowed = path.startswith(_STAFF_API_PREFIXES) or (
+            request.method == "GET" and path.startswith(_STAFF_READ_PREFIXES)
+            and not path.endswith("/notes"))      # 상담 기록은 원장만
+        if not allowed:
+            return 403, "원장(관리자) 권한이 필요합니다."
     return None
 
 
@@ -1252,10 +1512,22 @@ def current_account(request: Request) -> AdminAccount:
     return account
 
 
+def _facility_role(account: AdminAccount) -> str:
+    """현재 시설에서의 역할 (owner/staff). 시설을 고르기 전에는 계정의 기본 역할"""
+    return getattr(account, "facility_role", None) or account.role
+
+
 def owner_account(account: AdminAccount = Depends(current_account)) -> AdminAccount:
-    if account.role != "owner":
+    if _facility_role(account) != "owner":
         raise HTTPException(403, "원장 권한이 필요합니다.")
     return account
+
+
+def current_facility(request: Request) -> "Facility":
+    facility = getattr(request.state, "facility", None)
+    if facility is None:
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+    return facility
 
 
 def current_parent(request: Request) -> AppUser:
@@ -1274,7 +1546,7 @@ def current_parent(request: Request) -> AppUser:
 #   알림·로그 행은 원래 작업과 같은 트랜잭션에 추가되므로 작업이 커밋될 때만 함께 저장됩니다.
 # =====================================================================
 NOTIFICATION_KINDS = {"CHECK_IN", "CHECK_OUT", "ABSENT", "NOTICE", "INVOICE", "PAYMENT", "UNPAID",
-                      "ASSIGNMENT", "COMMENT", "MODERATION", "LINK"}
+                      "ASSIGNMENT", "COMMENT", "MODERATION", "LINK", "APPLICATION", "SANCTION", "POST"}
 
 
 def _log(db: Session, actor_type: str, actor_id: Optional[int], action: str,
@@ -1317,19 +1589,25 @@ def _notify_parents(db: Session, member_ids, kind: str, title: str, body: str = 
 
 
 def _notify_all_parents(db: Session, kind: str, title: str, body: str = "", link: str = "") -> int:
-    """연결된 자녀가 있는 모든 학부모에게 1건씩 (전체 공지 등)"""
+    """이 시설에 입장한 모든 학부모(커뮤니티 멤버)와 자녀가 연결된 학부모에게 1건씩 (전체 공지 등)"""
     user_ids = {uid for (uid,) in db.query(ParentLink.user_id).distinct().all()}
+    user_ids |= {uid for (uid,) in db.query(FacilityMember.user_id).filter(FacilityMember.status == "ACTIVE").all()}
     for user_id in user_ids:
         db.add(Notification(user_id=user_id, audience="parent", kind=kind, title=title[:200],
                             body=(body or "")[:1000], link=link or None))
     return len(user_ids)
 
 
-def _owner_user_ids(db: Session) -> List[int]:
-    """원장(owner) 관리자 계정에 해당하는 Google 사용자 ID"""
+def _owner_user_ids(db: Session, facility_id: Optional[int] = None) -> List[int]:
+    """현재 시설의 원장(owner) 계정에 해당하는 Google 사용자 ID"""
+    facility_id = facility_id or db.info.get("facility_id")
+    if not facility_id:
+        return []
     return [uid for (uid,) in (db.query(AppUser.user_id)
                                  .join(AdminAccount, func.lower(AdminAccount.email) == func.lower(AppUser.email))
-                                 .filter(AdminAccount.role == "owner", AdminAccount.is_active.is_(True)).all())]
+                                 .join(FacilityStaff, FacilityStaff.account_id == AdminAccount.account_id)
+                                 .filter(FacilityStaff.facility_id == facility_id, FacilityStaff.role == "owner",
+                                         AdminAccount.is_active.is_(True)).distinct().all())]
 
 
 def _notify_admins(db: Session, kind: str, title: str, body: str = "", link: str = "",
@@ -1404,14 +1682,36 @@ def _signup_role(db: Session, invite_code: str) -> str:
     raise HTTPException(403, "초대 코드가 유효하지 않습니다.")
 
 
+def _facility_brief(f: "Facility", my_role: Optional[str] = None) -> dict:
+    return {"facility_id": f.facility_id, "name": f.name, "branch": f.branch or "", "facility_type": f.facility_type,
+            "region": f.region or "", "logo": f.logo or "", "my_role": my_role}
+
+
 def _me_out(db: Session, session: UserSession, user: AppUser) -> dict:
     account = _admin_account_for(db, user)
+    facility, my_role = None, None
+    if session.facility_id:
+        facility = db.query(Facility).filter(Facility.facility_id == session.facility_id,
+                                             Facility.deleted_at.is_(None)).first()
+        if facility and session.active_role == "admin" and account:
+            my_role = (db.query(FacilityStaff.role)
+                         .filter(FacilityStaff.facility_id == facility.facility_id,
+                                 FacilityStaff.account_id == account.account_id)
+                         .execution_options(all_facilities=True).scalar())
+            if not my_role:
+                facility = None
+        elif facility and session.active_role == "parent":
+            my_role = "parent"
+    if account and my_role and my_role != "parent":
+        account.facility_role = my_role
     return {
         "user": {"email": user.email, "name": user.name, "picture": user.picture},
         "active_role": session.active_role,
         "admin": _account_to_out(account) if account else None,
         "can_admin": bool(account),
-        "children_count": db.query(ParentLink).filter(ParentLink.user_id == user.user_id).count(),
+        # 원장 계정(owner)만 새 시설을 만들 수 있음 (직원 초대로 들어온 계정은 초대받은 시설만 관리)
+        "can_create_facility": bool(account and account.role == "owner"),
+        "facility": _facility_brief(facility, my_role) if facility else None,
     }
 
 
@@ -1505,9 +1805,9 @@ def auth_me(request: Request, db: Session = Depends(get_db)):
 def select_role(payload: RoleSelectRequest, request: Request, db: Session = Depends(get_db)):
     """로그인 후 역할 선택. 관리자 권한은 서버에서만 판정합니다(화면 분기만으로 보호하지 않음)."""
     session, user = _session_from_request(request, db)
+    session.facility_id = None          # v9: 역할을 바꾸면 시설도 다시 고름
     if payload.role == "parent":
         session.active_role = "parent"
-        _log(db, "parent", user.user_id, "auth.parent", None, None, "학부모 모드 진입")
     elif payload.role == "admin":
         account = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == user.email.lower()).first()
         if account and not account.is_active:
@@ -1546,43 +1846,72 @@ def auth_logout(request: Request, response: Response, db: Session = Depends(get_
 
 @app.get("/api/admin/accounts")
 def list_admin_accounts(db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
-    return [_account_to_out(row) for row in db.query(AdminAccount).order_by(AdminAccount.account_id).all()]
+    """이 시설의 관리자·직원 목록"""
+    rows = (db.query(AdminAccount, FacilityStaff.role)
+              .join(FacilityStaff, FacilityStaff.account_id == AdminAccount.account_id)
+              .order_by(FacilityStaff.staff_id).all())
+    out = []
+    for row, role in rows:
+        item = _account_to_out(row)
+        item["role"] = role
+        out.append(item)
+    return out
 
 
 @app.post("/api/admin/accounts", status_code=201)
 def create_admin_account(payload: AdminAccountCreate, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
-    """원장이 관리자/직원 Google 이메일을 미리 등록 → 해당 사용자는 초대 코드 없이 '관리자' 선택 가능"""
+    """원장이 관리자/직원 Google 이메일을 이 시설에 등록 → 그 사용자는 '관리자' 선택 후 이 시설에 들어올 수 있음"""
     email = payload.email.strip().lower()
     if not EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(400, "올바른 이메일 주소를 입력하세요.")
     if payload.role not in {"owner", "staff"}:
         raise HTTPException(400, "역할은 owner 또는 staff 여야 합니다.")
-    if db.query(AdminAccount).filter(func.lower(AdminAccount.email) == email).first():
-        raise HTTPException(409, "이미 등록된 이메일입니다.")
-    row = AdminAccount(email=email, username=(payload.username.strip() or email.split("@")[0])[:100],
-                       provider="google", role=payload.role)
-    db.add(row)
+    row = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == email).first()
+    if not row:
+        # 새 계정은 '직원' 기본 권한 — 다른 시설을 새로 만들 수는 없고 초대받은 시설만 관리
+        row = AdminAccount(email=email, username=(payload.username.strip() or email.split("@")[0])[:100],
+                           provider="google", role="staff")
+        db.add(row)
+        db.flush()
+    if db.query(FacilityStaff).filter(FacilityStaff.account_id == row.account_id).first():
+        raise HTTPException(409, "이미 이 시설에 등록된 계정입니다.")
+    db.add(FacilityStaff(account_id=row.account_id, role=payload.role))
     db.commit()
     db.refresh(row)
-    return _account_to_out(row)
+    return {**_account_to_out(row), "role": payload.role}
+
+
+def _owner_count(db: Session) -> int:
+    return db.query(func.count(FacilityStaff.staff_id)).filter(FacilityStaff.role == "owner").scalar() or 0
 
 
 @app.patch("/api/admin/accounts/{account_id}")
 def update_admin_account(account_id: int, payload: AccountAccessUpdate, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    staff = db.query(FacilityStaff).filter(FacilityStaff.account_id == account_id).first()
     target = db.query(AdminAccount).filter(AdminAccount.account_id == account_id).first()
-    if not target:
-        raise HTTPException(404, "계정을 찾을 수 없습니다.")
+    if not staff or not target:
+        raise HTTPException(404, "이 시설의 계정을 찾을 수 없습니다.")
     if payload.role not in {"owner", "staff"} or payload.pricing_tier not in {"STANDARD", "VIP"}:
         raise HTTPException(400, "계정 역할 또는 계약 등급이 올바르지 않습니다.")
-    if target.account_id == account.account_id and payload.role != "owner":
-        owner_count = db.query(AdminAccount).filter(AdminAccount.role == "owner", AdminAccount.is_active.is_(True)).count()
-        if owner_count <= 1:
-            raise HTTPException(409, "마지막 관리자 계정의 관리자 권한은 해제할 수 없습니다.")
-    target.role = payload.role
+    if staff.role == "owner" and payload.role != "owner" and _owner_count(db) <= 1:
+        raise HTTPException(409, "마지막 원장 계정의 권한은 해제할 수 없습니다.")
+    staff.role = payload.role
     target.pricing_tier = payload.pricing_tier
     db.commit()
     db.refresh(target)
-    return _account_to_out(target)
+    return {**_account_to_out(target), "role": staff.role}
+
+
+@app.delete("/api/admin/accounts/{account_id}", status_code=204)
+def remove_admin_account(account_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    """이 시설의 관리 권한만 회수 (계정 자체와 다른 시설 권한은 유지)"""
+    staff = db.query(FacilityStaff).filter(FacilityStaff.account_id == account_id).first()
+    if not staff:
+        raise HTTPException(404, "이 시설의 계정을 찾을 수 없습니다.")
+    if staff.role == "owner" and _owner_count(db) <= 1:
+        raise HTTPException(409, "마지막 원장 계정은 삭제할 수 없습니다.")
+    db.delete(staff)
+    db.commit()
 
 
 FACILITY_TYPES = ("학원", "체육관", "도장", "기타")
@@ -1602,15 +1931,42 @@ DEFAULT_PAYMENT_SETTINGS = {
 }
 
 
-def _read_settings(db: Session, key: str, default: dict) -> dict:
-    row = db.query(AcademySetting).filter(AcademySetting.setting_key == key).first()
-    if not row:
-        return default.copy()
+# v9: 설정은 시설(facilities) 행에 저장. academy 의 이름·지점·연락처 등은 시설 컬럼, 나머지는 settings_json
+_ACADEMY_COLUMN_MAP = {"name": "name", "branch": "branch", "phone": "phone", "address": "address", "logo": "logo",
+                       "facilityType": "facility_type", "region": "region", "description": "description"}
+
+
+def _facility_of(db: Session, facility_id: Optional[int] = None) -> "Facility":
+    facility_id = facility_id or db.info.get("facility_id")
+    if not facility_id:
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+    cached = db.info.get("_facility_obj")
+    if cached is not None and cached.facility_id == facility_id:
+        return cached
+    facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
+    if not facility:
+        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+    db.info["_facility_obj"] = facility
+    return facility
+
+
+def _json_dict(value: Optional[str]) -> dict:
     try:
-        value = json.loads(row.setting_value)
-        return value if isinstance(value, dict) else default.copy()
+        parsed = json.loads(value) if value else {}
+        return parsed if isinstance(parsed, dict) else {}
     except (ValueError, TypeError):
-        return default.copy()
+        return {}
+
+
+def _read_settings(db: Session, key: str, default: dict, facility_id: Optional[int] = None) -> dict:
+    facility = _facility_of(db, facility_id)
+    if key == "payment_settings":
+        return {**default, **_json_dict(facility.payment_json)}
+    academy = {**default, **_json_dict(facility.settings_json)}
+    for akey, column in _ACADEMY_COLUMN_MAP.items():
+        academy[akey] = getattr(facility, column) or ("" if akey != "facilityType" else "학원")
+    academy["isPublic"] = bool(facility.is_public)
+    return academy
 
 
 SETTINGS_MAX_CHARS = 600_000        # 설정 JSON 전체(로고 포함) 상한
@@ -1627,16 +1983,24 @@ def _validate_settings_size(academy: dict, payment: dict) -> None:
         raise HTTPException(413, "설정 데이터가 너무 큽니다.")
 
 
-def _write_settings(db: Session, academy: dict, payment: dict) -> None:
+def _write_settings(db: Session, academy: dict, payment: dict, commit: bool = True) -> None:
     _validate_settings_size(academy, payment)
-    for key, value in (("academy_info", academy), ("payment_settings", payment)):
-        row = db.query(AcademySetting).filter(AcademySetting.setting_key == key).first()
-        encoded = json.dumps(value, ensure_ascii=False)
-        if row:
-            row.setting_value = encoded
-        else:
-            db.add(AcademySetting(setting_key=key, setting_value=encoded))
-    db.commit()
+    facility = _facility_of(db)
+    for akey, column in _ACADEMY_COLUMN_MAP.items():
+        value = academy.get(akey)
+        if value is None:
+            continue
+        limit = Facility.__table__.c[column].type.length
+        value = str(value).strip()
+        setattr(facility, column, value[:limit] if limit else value)
+    if "isPublic" in academy:
+        facility.is_public = bool(academy.get("isPublic"))
+    extra = {k: v for k, v in academy.items() if k not in _ACADEMY_COLUMN_MAP and k != "isPublic"}
+    facility.settings_json = json.dumps(extra, ensure_ascii=False)
+    facility.payment_json = json.dumps(payment, ensure_ascii=False)
+    db.info["data_changed"] = True
+    if commit:
+        db.commit()
 
 
 @app.get("/api/settings")
@@ -1684,9 +2048,508 @@ def get_academy_info(db: Session = Depends(get_db), account: AdminAccount = Depe
 
 def _brand(db: Session) -> dict:
     """화면 상단·학부모 포털에 표시할 기관 정보 (연락처·주소 외 민감 정보 없음)"""
-    academy = {**DEFAULT_ACADEMY_SETTINGS, **_read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS)}
-    return {key: academy.get(key) for key in ("name", "branch", "principal", "role", "logo", "facilityType",
-                                              "weatherCity", "lateGraceMinutes")}
+    academy = _read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS)
+    out = {key: academy.get(key) for key in ("name", "branch", "principal", "role", "logo", "facilityType",
+                                             "weatherCity", "lateGraceMinutes", "region")}
+    out["facility_id"] = db.info.get("facility_id")
+    return out
+
+
+# =====================================================================
+# v9 시설 관리 (관리자) — 시설 생성·수정·삭제·입장. 시설을 고르기 전에도 호출 가능(_ADMIN_GLOBAL_PREFIXES)
+#   - 이 구간의 요청은 시설 문맥(db.info["facility_id"])이 없으므로, 모든 조회에 facility_id 조건을 직접 겁니다.
+# =====================================================================
+class FacilityIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    facility_type: str = Field("학원", max_length=10)
+    branch: str = Field("", max_length=100)
+    region: str = Field("", max_length=50)
+    address: str = Field("", max_length=200)
+    phone: str = Field("", max_length=30)
+    description: str = Field("", max_length=1000)
+    is_public: bool = True
+    principal: str = Field("", max_length=50)
+    base_tuition_fee: Optional[int] = Field(None, ge=0, le=100_000_000)
+
+    @field_validator("facility_type")
+    @classmethod
+    def valid_type(cls, v):
+        if v not in FACILITY_TYPES:
+            raise ValueError(f"시설 유형은 {', '.join(FACILITY_TYPES)} 중 하나여야 합니다.")
+        return v
+
+
+def _facility_counts(db: Session, facility_ids: List[int]) -> dict:
+    """시설별 재원생·학부모·대기 중인 가입 신청 수 (시설 문맥 없이 GROUP BY 3회)"""
+    ids = list(facility_ids) or [-1]
+    q = lambda col, *conds: dict(db.query(col, func.count()).filter(col.in_(ids), *conds).group_by(col)
+                                 .execution_options(all_facilities=True).all())
+    return {
+        "students": q(Member.facility_id, Member.status == "ACTIVE"),
+        "parents": q(FacilityMember.facility_id, FacilityMember.status == "ACTIVE"),
+        "pending": q(EnrollmentApplication.facility_id, EnrollmentApplication.status == "PENDING"),
+        "classes": q(Class.facility_id),
+    }
+
+
+def _facility_admin_out(f: Facility, role: str, counts: dict) -> dict:
+    settings = _json_dict(f.settings_json)
+    return {**_facility_brief(f, role), "address": f.address or "", "phone": f.phone or "",
+            "description": f.description or "", "is_public": bool(f.is_public),
+            "principal": settings.get("principal") or "",
+            "base_tuition_fee": _json_dict(f.payment_json).get("baseTuitionFee"),
+            "student_count": int(counts["students"].get(f.facility_id, 0)),
+            "parent_count": int(counts["parents"].get(f.facility_id, 0)),
+            "class_count": int(counts["classes"].get(f.facility_id, 0)),
+            "pending_applications": int(counts["pending"].get(f.facility_id, 0)),
+            "created_at": f.created_at.isoformat() if f.created_at else None}
+
+
+def _my_staff_role(db: Session, account: AdminAccount, facility_id: int) -> Optional[str]:
+    return (db.query(FacilityStaff.role)
+              .join(Facility, Facility.facility_id == FacilityStaff.facility_id)
+              .filter(FacilityStaff.facility_id == facility_id, FacilityStaff.account_id == account.account_id,
+                      Facility.deleted_at.is_(None))
+              .execution_options(all_facilities=True).scalar())
+
+
+@app.get("/api/facilities")
+def my_facilities(db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    rows = (db.query(Facility, FacilityStaff.role)
+              .join(FacilityStaff, FacilityStaff.facility_id == Facility.facility_id)
+              .filter(FacilityStaff.account_id == account.account_id, Facility.deleted_at.is_(None))
+              .order_by(Facility.name).execution_options(all_facilities=True).all())
+    counts = _facility_counts(db, [f.facility_id for f, _ in rows])
+    return [_facility_admin_out(f, role, counts) for f, role in rows]
+
+
+@app.post("/api/facilities", status_code=201)
+def create_facility(payload: FacilityIn, request: Request, db: Session = Depends(get_db),
+                    account: AdminAccount = Depends(current_account)):
+    if account.role != "owner":
+        raise HTTPException(403, "새 시설은 원장 계정만 만들 수 있습니다. (직원 계정은 초대받은 시설만 관리)")
+    if db.query(func.count(FacilityStaff.staff_id)).filter(
+            FacilityStaff.account_id == account.account_id, FacilityStaff.role == "owner").execution_options(
+            all_facilities=True).scalar() >= 20:
+        raise HTTPException(400, "한 계정이 만들 수 있는 시설은 20개까지입니다.")
+    user = request.state.user
+    facility = Facility(name=payload.name.strip(), facility_type=payload.facility_type, branch=payload.branch.strip(),
+                        region=payload.region.strip(), address=payload.address.strip(), phone=payload.phone.strip(),
+                        description=payload.description.strip(), is_public=payload.is_public, created_by=user.user_id,
+                        settings_json=json.dumps({"principal": payload.principal.strip() or (user.name or ""),
+                                                  "role": "원장", "weatherCity": "용인", "lateGraceMinutes": 10},
+                                                 ensure_ascii=False),
+                        payment_json=json.dumps({**DEFAULT_PAYMENT_SETTINGS, **(
+                            {"baseTuitionFee": payload.base_tuition_fee} if payload.base_tuition_fee is not None else {})},
+                            ensure_ascii=False))
+    db.add(facility)
+    db.flush()
+    db.add(FacilityStaff(facility_id=facility.facility_id, account_id=account.account_id, role="owner"))
+    db.commit()
+    db.refresh(facility)
+    return _facility_admin_out(facility, "owner", _facility_counts(db, [facility.facility_id]))
+
+
+@app.put("/api/facilities/{facility_id}")
+def update_facility(facility_id: int, payload: FacilityIn, db: Session = Depends(get_db),
+                    account: AdminAccount = Depends(current_account)):
+    if _my_staff_role(db, account, facility_id) != "owner":
+        raise HTTPException(403, "이 시설의 원장만 정보를 수정할 수 있습니다.")
+    facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
+    facility.name, facility.facility_type = payload.name.strip(), payload.facility_type
+    facility.branch, facility.region = payload.branch.strip(), payload.region.strip()
+    facility.address, facility.phone = payload.address.strip(), payload.phone.strip()
+    facility.description, facility.is_public = payload.description.strip(), payload.is_public
+    settings = _json_dict(facility.settings_json)
+    if payload.principal.strip():
+        settings["principal"] = payload.principal.strip()
+    facility.settings_json = json.dumps(settings, ensure_ascii=False)
+    if payload.base_tuition_fee is not None:
+        payment = {**DEFAULT_PAYMENT_SETTINGS, **_json_dict(facility.payment_json), "baseTuitionFee": payload.base_tuition_fee}
+        facility.payment_json = json.dumps(payment, ensure_ascii=False)
+    facility.data_version = (facility.data_version or 0) + 1
+    db.commit()
+    db.refresh(facility)
+    return _facility_admin_out(facility, "owner", _facility_counts(db, [facility_id]))
+
+
+@app.delete("/api/facilities/{facility_id}", status_code=204)
+def delete_facility(facility_id: int, confirm_name: str = Query(..., max_length=100), db: Session = Depends(get_db),
+                    account: AdminAccount = Depends(current_account)):
+    """시설 삭제 = 보관 처리(deleted_at). 학생·결제 기록은 지우지 않아 실수로 지워도 DB 에서 복구할 수 있습니다."""
+    if _my_staff_role(db, account, facility_id) != "owner":
+        raise HTTPException(403, "이 시설의 원장만 삭제할 수 있습니다.")
+    facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
+    if confirm_name.strip() != facility.name:
+        raise HTTPException(400, "확인을 위해 시설 이름을 정확히 입력하세요.")
+    facility.deleted_at = _now()
+    db.query(UserSession).filter(UserSession.facility_id == facility_id).update(
+        {"facility_id": None}, synchronize_session=False)
+    db.commit()
+
+
+@app.post("/api/facilities/{facility_id}/enter")
+def enter_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
+                   account: AdminAccount = Depends(current_account)):
+    if not _my_staff_role(db, account, facility_id):
+        raise HTTPException(403, "이 시설의 관리 권한이 없습니다.")
+    session = request.state.session
+    session.facility_id = facility_id
+    db.commit()
+    return _me_out(db, session, request.state.user)
+
+
+@app.post("/api/facilities/exit")
+def exit_facility(request: Request, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    session = request.state.session
+    session.facility_id = None
+    db.commit()
+    return _me_out(db, session, request.state.user)
+
+
+# =====================================================================
+# v9 학부모: 시설 검색·입장 / 자녀 프로필 / 가입(수강) 신청
+#   - 시설을 고르기 전에도 호출 가능(_PARENT_GLOBAL_PREFIXES). 시설 데이터는 공개 정보(이름·소개·수업 시간표·수강료)만.
+# =====================================================================
+def _class_fee(c: "Class", payment: dict) -> int:
+    """수업 수강료 = 수업에 입력한 월 수강료 → 설정의 반별 수강료 → 기본 수강료"""
+    if c.monthly_fee is not None:
+        return int(c.monthly_fee)
+    for item in payment.get("classFees") or []:
+        try:
+            if int(item.get("classId")) == c.class_id and int(item.get("fee") or 0) > 0:
+                return int(item.get("fee"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return int(payment.get("baseTuitionFee") or 0)
+
+
+def _public_facility(db: Session, facility_id: int) -> Facility:
+    facility = db.query(Facility).filter(Facility.facility_id == facility_id, Facility.deleted_at.is_(None)).first()
+    if not facility:
+        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+    return facility
+
+
+def _membership(db: Session, user: AppUser, facility_id: int) -> Optional[FacilityMember]:
+    return (db.query(FacilityMember).filter(FacilityMember.user_id == user.user_id,
+                                            FacilityMember.facility_id == facility_id)
+              .execution_options(all_facilities=True).first())
+
+
+def _open_classes(db: Session, facility_id: int) -> List["Class"]:
+    return (db.query(Class).filter(Class.facility_id == facility_id,
+                                   or_(Class.end_date.is_(None), Class.end_date >= _today()))
+              .order_by(Class.name).execution_options(all_facilities=True).all())
+
+
+def _public_class_out(c: "Class", payment: dict, counts: dict) -> dict:
+    return {"class_id": c.class_id, "name": c.name, "teacher": c.teacher, "description": c.description or "",
+            "schedules": _class_schedule(c), "fee": _class_fee(c, payment), "color": _class_color(c),
+            "start_date": c.start_date.isoformat() if c.start_date else None,
+            "end_date": c.end_date.isoformat() if c.end_date else None,
+            "student_count": int(counts.get(c.class_id, 0))}
+
+
+def _facility_public_out(f: Facility, joined: bool = False, status: Optional[str] = None) -> dict:
+    return {**_facility_brief(f), "address": f.address or "", "phone": f.phone or "",
+            "description": f.description or "", "joined": joined, "membership_status": status}
+
+
+@app.get("/api/parent/facilities/search")
+def parent_search_facilities(q: str = Query("", max_length=50), facility_type: str = Query("", max_length=10),
+                             region: str = Query("", max_length=50), db: Session = Depends(get_db),
+                             user: AppUser = Depends(current_parent)):
+    query = db.query(Facility).filter(Facility.deleted_at.is_(None), Facility.is_public.is_(True))
+    for word in [w for w in re.split(r"\s+", q.strip()) if w][:4]:
+        safe = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
+        query = query.filter(or_(Facility.name.like(pattern, escape="\\"), Facility.branch.like(pattern, escape="\\"),
+                                 Facility.region.like(pattern, escape="\\"), Facility.address.like(pattern, escape="\\")))
+    if facility_type in FACILITY_TYPES:
+        query = query.filter(Facility.facility_type == facility_type)
+    if region.strip():
+        safe = region.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = query.filter(or_(Facility.region.like(f"%{safe}%", escape="\\"), Facility.address.like(f"%{safe}%", escape="\\")))
+    rows = query.order_by(Facility.name).limit(50).all()
+    mine = {m.facility_id: m.status for m in db.query(FacilityMember).filter(FacilityMember.user_id == user.user_id)
+            .execution_options(all_facilities=True)}
+    counts = _facility_counts(db, [f.facility_id for f in rows])
+    return [{**_facility_public_out(f, f.facility_id in mine, mine.get(f.facility_id)),
+             "class_count": int(counts["classes"].get(f.facility_id, 0)),
+             "student_count": int(counts["students"].get(f.facility_id, 0))} for f in rows]
+
+
+@app.get("/api/parent/facilities/mine")
+def parent_my_facilities(request: Request, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    rows = (db.query(Facility, FacilityMember)
+              .join(FacilityMember, FacilityMember.facility_id == Facility.facility_id)
+              .filter(FacilityMember.user_id == user.user_id, Facility.deleted_at.is_(None))
+              .order_by(FacilityMember.joined_at.desc()).execution_options(all_facilities=True).all())
+    ids = [f.facility_id for f, _ in rows]
+    kids: dict = {}
+    for facility_id, name in (db.query(ParentLink.facility_id, Member.name)
+                                .join(Member, Member.member_id == ParentLink.member_id)
+                                .filter(ParentLink.user_id == user.user_id, ParentLink.facility_id.in_(ids or [-1]))
+                                .execution_options(all_facilities=True).all()):
+        kids.setdefault(facility_id, []).append(name)
+    unread = dict(db.query(Notification.facility_id, func.count(Notification.notification_id))
+                    .filter(Notification.user_id == user.user_id, Notification.audience == "parent",
+                            Notification.is_read.is_(False), Notification.facility_id.in_(ids or [-1]))
+                    .group_by(Notification.facility_id).execution_options(all_facilities=True).all())
+    current = request.state.session.facility_id
+    return [{**_facility_public_out(f, True, m.status), "children": kids.get(f.facility_id, []),
+             "unread": int(unread.get(f.facility_id, 0)), "current": f.facility_id == current,
+             "nickname": m.nickname} for f, m in rows]
+
+
+@app.get("/api/parent/facilities/{facility_id}")
+def parent_facility_detail(facility_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    facility = _public_facility(db, facility_id)
+    membership = _membership(db, user, facility_id)
+    if not facility.is_public and not membership:
+        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+    payment = {**DEFAULT_PAYMENT_SETTINGS, **_json_dict(facility.payment_json)}
+    classes = _open_classes(db, facility_id)
+    counts = dict(db.query(Enrollment.class_id, func.count(Enrollment.enrollment_id))
+                    .filter(Enrollment.facility_id == facility_id).group_by(Enrollment.class_id)
+                    .execution_options(all_facilities=True).all())
+    settings = _json_dict(facility.settings_json)
+    return {**_facility_public_out(facility, bool(membership), membership.status if membership else None),
+            "principal": settings.get("principal") or "", "base_tuition_fee": int(payment.get("baseTuitionFee") or 0),
+            "classes": [_public_class_out(c, payment, counts) for c in classes]}
+
+
+def _new_membership(user: AppUser, facility_id: int) -> FacilityMember:
+    return FacilityMember(facility_id=facility_id, user_id=user.user_id, nickname=_parent_display_name(user),
+                          status="ACTIVE", last_seen_at=_now())
+
+
+@app.post("/api/parent/facilities/{facility_id}/enter")
+def parent_enter_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
+                          user: AppUser = Depends(current_parent)):
+    """시설 입장 — 처음이면 커뮤니티 멤버로 가입(공개 시설만). 강퇴된 시설은 입장 불가"""
+    facility = _public_facility(db, facility_id)
+    membership = _membership(db, user, facility_id)
+    if membership and membership.status == "BANNED":
+        raise HTTPException(403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다.")
+    if not membership:
+        if not facility.is_public:
+            raise HTTPException(404, "시설을 찾을 수 없습니다.")
+        db.add(_new_membership(user, facility_id))
+        db.info["facility_id"] = facility_id
+        _log(db, "parent", user.user_id, "facility.join", None, None, "시설 입장(커뮤니티 가입)")
+    else:
+        membership.last_seen_at = _now()
+    session = request.state.session
+    session.facility_id = facility_id
+    db.commit()
+    return _me_out(db, session, user)
+
+
+@app.post("/api/parent/facilities/exit")
+def parent_exit_facility(request: Request, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    session = request.state.session
+    session.facility_id = None
+    db.commit()
+    return _me_out(db, session, user)
+
+
+@app.delete("/api/parent/facilities/{facility_id}/membership", status_code=204)
+def parent_leave_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
+                          user: AppUser = Depends(current_parent)):
+    """시설 탈퇴(커뮤니티 멤버 해제 + 자녀 연결 해제). 제재 중인 계정은 탈퇴로 제재를 피할 수 없도록 막습니다."""
+    membership = _membership(db, user, facility_id)
+    if not membership:
+        raise HTTPException(404, "입장한 시설이 아닙니다.")
+    if membership.status == "BANNED" or (membership.muted_until and membership.muted_until > _now()):
+        raise HTTPException(409, "제재 기간에는 시설을 탈퇴할 수 없습니다.")
+    db.query(ParentLink).filter(ParentLink.user_id == user.user_id, ParentLink.facility_id == facility_id).execution_options(
+        all_facilities=True).delete(synchronize_session=False)
+    db.delete(membership)
+    if request.state.session.facility_id == facility_id:
+        request.state.session.facility_id = None
+    db.commit()
+
+
+# ---------- 자녀 프로필 (시설과 무관, 본인 것만) ----------
+class ChildProfileIn(BaseModel):
+    name: str = Field(min_length=1, max_length=50)
+    gender: str
+    age: int = Field(ge=1, le=100)
+    school: str = Field("", max_length=100)
+    parent_name: str = Field("", max_length=50)
+    parent_phone: str = Field(min_length=9, max_length=20)
+    relation: str = Field("모", max_length=10)
+    address: str = Field("", max_length=200)
+    note: str = Field("", max_length=500)
+
+    @field_validator("gender")
+    @classmethod
+    def valid_gender(cls, v):
+        if v not in ("M", "F"):
+            raise ValueError("성별은 M 또는 F 여야 합니다.")
+        return v
+
+    @field_validator("parent_phone")
+    @classmethod
+    def valid_phone(cls, v):
+        if len(re.sub(r"\D", "", v or "")) < 9:
+            raise ValueError("보호자 연락처를 정확히 입력하세요.")
+        return v.strip()
+
+    @field_validator("relation")
+    @classmethod
+    def valid_relation(cls, v):
+        return v if v in ("모", "부", "기타") else "기타"
+
+
+def _child_out(c: ChildProfile) -> dict:
+    return {"child_id": c.child_id, "name": c.name, "gender": c.gender, "age": c.age, "school": c.school,
+            "parent_name": c.parent_name, "parent_phone": c.parent_phone, "relation": c.relation,
+            "address": c.address, "note": c.note}
+
+
+def _own_child(db: Session, user: AppUser, child_id: int) -> ChildProfile:
+    row = db.query(ChildProfile).filter(ChildProfile.child_id == child_id, ChildProfile.user_id == user.user_id).first()
+    if not row:
+        raise HTTPException(404, "자녀 정보를 찾을 수 없습니다.")
+    return row
+
+
+@app.get("/api/parent/child-profiles")
+def list_child_profiles(db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    return [_child_out(c) for c in db.query(ChildProfile).filter(ChildProfile.user_id == user.user_id)
+            .order_by(ChildProfile.child_id).all()]
+
+
+@app.post("/api/parent/child-profiles", status_code=201)
+def create_child_profile(payload: ChildProfileIn, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    if db.query(func.count(ChildProfile.child_id)).filter(ChildProfile.user_id == user.user_id).scalar() >= 10:
+        raise HTTPException(400, "자녀는 10명까지 등록할 수 있습니다.")
+    row = ChildProfile(user_id=user.user_id, **payload.model_dump())
+    db.add(row); db.commit(); db.refresh(row)
+    return _child_out(row)
+
+
+@app.put("/api/parent/child-profiles/{child_id}")
+def update_child_profile(child_id: int, payload: ChildProfileIn, db: Session = Depends(get_db),
+                         user: AppUser = Depends(current_parent)):
+    row = _own_child(db, user, child_id)
+    for key, value in payload.model_dump().items():
+        setattr(row, key, value)
+    db.commit(); db.refresh(row)
+    return _child_out(row)
+
+
+@app.delete("/api/parent/child-profiles/{child_id}", status_code=204)
+def delete_child_profile(child_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    row = _own_child(db, user, child_id)
+    if (db.query(EnrollmentApplication.application_id)
+          .filter(EnrollmentApplication.child_id == child_id, EnrollmentApplication.status == "PENDING")
+          .execution_options(all_facilities=True).first()):
+        raise HTTPException(409, "심사 중인 가입 신청이 있어 삭제할 수 없습니다. 신청을 먼저 취소하세요.")
+    db.delete(row); db.commit()
+
+
+# ---------- 가입(수강) 신청 ----------
+class ApplicationIn(BaseModel):
+    child_id: int
+    class_ids: List[int] = Field(default_factory=list, max_length=20)
+    message: str = Field("", max_length=500)
+
+
+def _application_out(a: EnrollmentApplication, class_names: dict, facility_name: Optional[str] = None,
+                     admin: bool = False) -> dict:
+    snap = _json_dict(a.snapshot)
+    try:
+        class_ids = [int(x) for x in json.loads(a.class_ids or "[]")]
+    except (ValueError, TypeError):
+        class_ids = []
+    child = {k: snap.get(k) for k in ("name", "gender", "age", "school")}
+    if admin:   # 관리자에게는 연락처·주소·특이사항까지 (학생 등록에 필요)
+        child.update({k: snap.get(k) for k in ("parent_name", "parent_phone", "relation", "address", "note")})
+    return {"application_id": a.application_id, "facility_id": a.facility_id, "facility_name": facility_name,
+            "child_id": a.child_id, "child": child, "class_ids": class_ids,
+            "classes": [{"class_id": cid, "name": class_names.get(cid, "(삭제된 수업)")} for cid in class_ids],
+            "estimated_fee": a.estimated_fee, "message": a.message, "status": a.status,
+            "member_id": a.member_id, "reject_reason": a.reject_reason,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "decided_at": a.decided_at.isoformat() if a.decided_at else None}
+
+
+@app.post("/api/parent/facilities/{facility_id}/applications", status_code=201)
+def parent_apply(facility_id: int, payload: ApplicationIn, db: Session = Depends(get_db),
+                 user: AppUser = Depends(current_parent)):
+    """자녀 가입 신청: 고른 수업의 수강료를 서버가 계산(예상 비용)하고, 시설 원장에게 알림"""
+    facility = _public_facility(db, facility_id)
+    membership = _membership(db, user, facility_id)
+    if membership and membership.status == "BANNED":
+        raise HTTPException(403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다.")
+    if not membership and not facility.is_public:
+        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+    child = _own_child(db, user, payload.child_id)
+    db.info["facility_id"] = facility_id          # 이후 조회·저장은 이 시설로 자동 제한
+    duplicate = (db.query(EnrollmentApplication)
+                   .filter(EnrollmentApplication.child_id == child.child_id,
+                           EnrollmentApplication.status.in_(("PENDING", "APPROVED"))).first())
+    if duplicate:
+        raise HTTPException(409, "이 자녀는 이미 이 시설에 신청했거나 등록되어 있습니다.")
+    class_ids = list(dict.fromkeys(payload.class_ids))
+    classes = {c.class_id: c for c in _open_classes(db, facility_id)}
+    unknown = [cid for cid in class_ids if cid not in classes]
+    if unknown:
+        raise HTTPException(400, "신청할 수 없는 수업이 포함되어 있습니다. 화면을 새로고침하세요.")
+    payment = _read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS, facility_id)
+    estimated = sum(_class_fee(classes[cid], payment) for cid in class_ids) if class_ids else int(payment.get("baseTuitionFee") or 0)
+    if not membership:
+        db.add(_new_membership(user, facility_id))
+    row = EnrollmentApplication(user_id=user.user_id, child_id=child.child_id, snapshot=json.dumps(_child_out(child), ensure_ascii=False),
+                                class_ids=json.dumps(class_ids), estimated_fee=estimated, message=payload.message.strip())
+    db.add(row)
+    db.flush()
+    names = ", ".join(classes[cid].name for cid in class_ids) or "수업 미선택"
+    _notify_admins(db, "APPLICATION", f"새 가입 신청: {child.name} ({child.age}세)",
+                   f"{names} · 예상 {estimated:,}원", "members?tab=applications")
+    _log(db, "parent", user.user_id, "application.create", "application", row.application_id, f"가입 신청 ({names})")
+    db.commit()
+    db.refresh(row)
+    return _application_out(row, {c: classes[c].name for c in class_ids}, facility.name)
+
+
+@app.get("/api/parent/applications")
+def parent_applications(db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    rows = (db.query(EnrollmentApplication, Facility.name)
+              .join(Facility, Facility.facility_id == EnrollmentApplication.facility_id)
+              .filter(EnrollmentApplication.user_id == user.user_id, Facility.deleted_at.is_(None))
+              .order_by(EnrollmentApplication.created_at.desc()).limit(50)
+              .execution_options(all_facilities=True).all())
+    ids = set()
+    for a, _ in rows:
+        try:
+            ids.update(int(x) for x in json.loads(a.class_ids or "[]"))
+        except (ValueError, TypeError):
+            pass
+    names = dict(db.query(Class.class_id, Class.name).filter(Class.class_id.in_(ids or {-1}))
+                   .execution_options(all_facilities=True).all())
+    return [_application_out(a, names, fname) for a, fname in rows]
+
+
+@app.post("/api/parent/applications/{application_id}/cancel")
+def parent_cancel_application(application_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    row = (db.query(EnrollmentApplication)
+             .filter(EnrollmentApplication.application_id == application_id, EnrollmentApplication.user_id == user.user_id)
+             .execution_options(all_facilities=True).first())
+    if not row:
+        raise HTTPException(404, "신청서를 찾을 수 없습니다.")
+    if row.status != "PENDING":
+        raise HTTPException(409, "심사 중인 신청만 취소할 수 있습니다.")
+    row.status = "CANCELED"
+    row.decided_at = _now()
+    db.info["facility_id"] = row.facility_id
+    db.info["data_changed"] = True
+    db.commit()
+    return {"application_id": application_id, "status": "CANCELED"}
 
 
 # ---------------------------------------------------------------------
@@ -1695,12 +2558,12 @@ def _brand(db: Session) -> dict:
 @app.get("/api/admin/summary")
 def admin_summary(request: Request, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
     user = request.state.user
-    since = _now() - timedelta(hours=24)
+    facility = request.state.facility
     pending_reviews = (db.query(func.count(CommentReview.comment_id))
                          .filter(CommentReview.flagged.is_(True), CommentReview.decision.is_(None)).scalar() or 0)
-    unpaid = db.query(func.count(Invoice.invoice_id)).filter(Invoice.status == "UNPAID").scalar() or 0
-    new_comments = (db.query(func.count(CommunityComment.comment_id))
-                      .filter(CommunityComment.user_id.isnot(None), CommunityComment.created_at >= since).scalar() or 0)
+    pending_posts = db.query(func.count(CommunityPost.post_id)).filter(CommunityPost.status == "PENDING").scalar() or 0
+    pending_apps = (db.query(func.count(EnrollmentApplication.application_id))
+                      .filter(EnrollmentApplication.status == "PENDING").scalar() or 0)
     todos = (db.query(AdminTodo).filter(AdminTodo.account_id == account.account_id, AdminTodo.done.is_(False),
                                         AdminTodo.due_time != "").order_by(AdminTodo.due_time).all())
     unread = (db.query(func.count(Notification.notification_id))
@@ -1709,12 +2572,20 @@ def admin_summary(request: Request, db: Session = Depends(get_db), account: Admi
     return {
         "brand": _brand(db),
         "account": _account_to_out(account),
+        "facility": _facility_brief(facility, _facility_role(account)),
+        "data_version": int(facility.data_version or 0),
         "unread_notifications": int(unread),
-        "badges": {"unpaid_invoices": int(unpaid), "moderation_pending": int(pending_reviews),
-                   "community_new": int(new_comments)},
+        "badges": {"moderation_pending": int(pending_reviews) + int(pending_posts),
+                   "applications_pending": int(pending_apps)},
         "todos": [{"todo_id": t.todo_id, "due_time": t.due_time, "text": t.text} for t in todos],
         "server_time": _now().isoformat(timespec="seconds"),
     }
+
+
+@app.get("/api/sync")
+def sync_version(request: Request, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """가벼운 동기화 확인 — 데이터 버전만 (화면은 값이 바뀌었을 때만 다시 불러옴)"""
+    return {"data_version": int(request.state.facility.data_version or 0)}
 
 
 @app.get("/api/notifications")
@@ -2044,7 +2915,7 @@ def b2b_recommendations(sku: Optional[str] = None, db: Session = Depends(get_db)
 @app.get("/api/b2b/orders")
 def list_b2b_orders(status: Optional[str] = None, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
     query = db.query(B2BOrder)
-    if account.role != "owner":
+    if _facility_role(account) != "owner":
         query = query.filter(B2BOrder.account_id == account.account_id)
     if status:
         query = query.filter(B2BOrder.status == status)
@@ -2084,7 +2955,7 @@ def create_b2b_order(payload: B2BOrderCreate, db: Session = Depends(get_db), acc
             product_id=product.product_id, sku=product.sku, product_name=product.name,
             unit=product.unit, quantity=quantity, unit_price=unit_price,
         ))
-    status_value = "PENDING_APPROVAL" if account.role != "owner" else (
+    status_value = "PENDING_APPROVAL" if _facility_role(account) != "owner" else (
         "AWAITING_PAYMENT" if payment_method == "카카오페이" else "SETTLEMENT_PENDING"
     )
     order = B2BOrder(
@@ -2149,7 +3020,7 @@ def b2b_payment_ready(order_id: int, request: Request, db: Session = Depends(get
         raise HTTPException(404, "주문을 찾을 수 없습니다.")
     if order.status != "AWAITING_PAYMENT" or order.payment_method != "카카오페이":
         raise HTTPException(409, "카카오페이 결제를 진행할 수 있는 주문 상태가 아닙니다.")
-    if order.account_id != account.account_id and account.role != "owner":
+    if order.account_id != account.account_id and _facility_role(account) != "owner":
         raise HTTPException(403, "다른 계정이 생성한 주문은 결제할 수 없습니다.")
     headers = _kakao_headers()
     base = _public_base_url(request, BACKEND_BASE_URL)
@@ -2263,7 +3134,8 @@ def _unpaid_by_member(db: Session, member_ids=None) -> dict:
     return {mid: (int(total), int(cnt)) for mid, total, cnt in query.group_by(Invoice.member_id).all()}
 
 
-def _member_out(m: Member, has_photo: bool, unpaid: tuple = (0, 0)) -> dict:
+def _member_out(m: Member, has_photo: bool, unpaid: tuple = (0, 0), classes: Optional[List[dict]] = None,
+                parent_linked: bool = False) -> dict:
     """관리자 화면용 학생 정보. 사진은 base64 대신 사진 URL 로 내려 줍니다."""
     return {
         "unpaid_amount": unpaid[0], "unpaid_count": unpaid[1],
@@ -2273,7 +3145,50 @@ def _member_out(m: Member, has_photo: bool, unpaid: tuple = (0, 0)) -> dict:
         "father_phone": m.father_phone, "mother_phone": m.mother_phone, "address": m.address,
         "status": m.status or "ACTIVE",
         "photo_url": _member_photo_url(m) if has_photo else None,
+        "classes": classes or [], "parent_linked": parent_linked,
     }
+
+
+def _member_class_overview(db: Session, member_ids: Optional[List[int]] = None, day: Optional[date] = None) -> dict:
+    """학생 ID → [{class_id, name, color, scheduled_today, time, status}] — 오늘 그 수업 출결(없으면 None)"""
+    day = day or _today()
+    query = (db.query(Enrollment.member_id, Class)
+               .join(Class, Class.class_id == Enrollment.class_id))
+    if member_ids is not None:
+        query = query.filter(Enrollment.member_id.in_(member_ids or [-1]))
+    rows = query.order_by(Class.name).all()
+    att = {}
+    att_query = db.query(Attendance.member_id, Attendance.class_id, Attendance.status).filter(Attendance.attendance_date == day)
+    if member_ids is not None:
+        att_query = att_query.filter(Attendance.member_id.in_(member_ids or [-1]))
+    day_level = {}
+    for mid, cid, st in att_query.all():
+        if cid:
+            att[(mid, cid)] = st
+        else:
+            day_level[mid] = st          # 수업과 무관한 시설 출입 기록(v8 이전 데이터 포함)
+    # 수업별 최근 30일 출석률 = (출석 + 지각) ÷ 출결 기록 수 — 한 번의 GROUP BY 로 계산
+    rate_query = (db.query(Attendance.member_id, Attendance.class_id, func.count(Attendance.attendance_id),
+                           func.sum(case((Attendance.status.in_(("PRESENT", "LATE")), 1), else_=0)))
+                    .filter(Attendance.attendance_date > day - timedelta(days=30), Attendance.attendance_date <= day,
+                            Attendance.class_id.isnot(None)))
+    if member_ids is not None:
+        rate_query = rate_query.filter(Attendance.member_id.in_(member_ids or [-1]))
+    rates = {(mid, cid): (int(total or 0), int(ok or 0))
+             for mid, cid, total, ok in rate_query.group_by(Attendance.member_id, Attendance.class_id).all()}
+    result: dict = {}
+    for member_id, c in rows:
+        sessions = _sessions_on(c, day)
+        total, ok = rates.get((member_id, c.class_id), (0, 0))
+        status = att.get((member_id, c.class_id))
+        if status is None and sessions and member_id in day_level:
+            status = day_level[member_id]
+        result.setdefault(member_id, []).append({
+            "class_id": c.class_id, "name": c.name, "color": _class_color(c),
+            "scheduled_today": bool(sessions),
+            "time": f"{sessions[0]['start']}~{sessions[0]['end']}" if sessions and sessions[0]["start"] else None,
+            "status": status, "records_30d": total, "rate_30d": _pct(ok, total)})
+    return result
 
 
 _HAS_PHOTO = (func.coalesce(func.length(Member.photo_url), 0) > 0).label("has_photo")
@@ -2318,7 +3233,10 @@ def list_members(
                      .filter(Enrollment.class_id == class_id)
     rows = query.add_columns(_HAS_PHOTO).order_by(Member.member_id).all()
     unpaid = _unpaid_by_member(db)
-    return [_member_out(m, has_photo, unpaid.get(m.member_id, (0, 0))) for m, has_photo in rows]
+    overview = _member_class_overview(db)
+    linked = {mid for (mid,) in db.query(ParentLink.member_id).distinct()}
+    return [_member_out(m, has_photo, unpaid.get(m.member_id, (0, 0)), overview.get(m.member_id, []),
+                        m.member_id in linked) for m, has_photo in rows]
 
 
 @app.get("/api/enrollments/by-member")
@@ -2338,7 +3256,49 @@ def get_member(member_id: int, db: Session = Depends(get_db)):
     m = db.query(Member).filter(Member.member_id == member_id).first()
     if not m:
         raise HTTPException(404, "회원을 찾을 수 없습니다.")
-    return _member_out(m, bool(m.photo_url), _unpaid_by_member(db, [member_id]).get(member_id, (0, 0)))
+    linked = bool(db.query(ParentLink.link_id).filter(ParentLink.member_id == member_id).first())
+    return _member_out(m, bool(m.photo_url), _unpaid_by_member(db, [member_id]).get(member_id, (0, 0)),
+                       _member_class_overview(db, [member_id]).get(member_id, []), linked)
+
+
+@app.get("/api/members/{member_id}/attendance-summary")
+def member_attendance_summary(member_id: int, days: int = Query(90, ge=7, le=365), db: Session = Depends(get_db)):
+    """학생 상세: 전체 출결 기록 + 출석률(전체·수업별·주별 추이)
+    출석률 = (출석 + 지각) ÷ 출결 기록 수 (기록이 없는 수업일은 제외)"""
+    if not db.query(Member.member_id).filter(Member.member_id == member_id).first():
+        raise HTTPException(404, "회원을 찾을 수 없습니다.")
+    since = _today() - timedelta(days=days - 1)
+    rows = (db.query(Attendance, Class.name)
+              .outerjoin(Class, Class.class_id == Attendance.class_id)
+              .filter(Attendance.member_id == member_id)
+              .order_by(Attendance.attendance_date.desc(), Attendance.attendance_id.desc()).limit(500).all())
+    items = [{**_att_to_out(a, None), "class_name": cname} for a, cname in rows]
+    recent = [a for a, _ in rows if a.attendance_date >= since]
+    def rate(records):
+        return _pct(sum(1 for r in records if r.status in ("PRESENT", "LATE")), len(records))
+    by_class: dict = {}
+    for a, cname in rows:
+        if a.attendance_date >= since:
+            by_class.setdefault((a.class_id, cname or "수업 무관"), []).append(a)
+    weeks = []
+    monday = _today() - timedelta(days=_today().weekday())
+    for i in range(11, -1, -1):
+        start = monday - timedelta(weeks=i)
+        week_rows = [a for a, _ in rows if start <= a.attendance_date < start + timedelta(days=7)]
+        weeks.append({"week_start": start.isoformat(), "rate": rate(week_rows), "records": len(week_rows)})
+    counts = {k: sum(1 for a in recent if a.status == k) for k in ATTENDANCE_STATUSES}
+    streak = 0
+    for a, _ in rows:
+        if a.status != "ABSENT":
+            break
+        streak += 1
+    return {"member_id": member_id, "days": days, "items": items,
+            "summary": {"records": len(recent), "present": counts["PRESENT"], "late": counts["LATE"],
+                        "absent": counts["ABSENT"], "rate": rate(recent), "absent_streak": streak},
+            "by_class": [{"class_id": cid, "class_name": name, "records": len(rs), "rate": rate(rs)}
+                         for (cid, name), rs in sorted(by_class.items(), key=lambda kv: kv[0][1])],
+            "weekly": weeks,
+            "definition": "출석률 = (출석 + 지각) ÷ 출결 기록 수 (최근 기간, 기록 없는 날 제외)"}
 
 
 # ---------- v8.1 상담·특이사항 기록 (기존 '특이사항 저장'은 서버에 저장되지 않던 문제) ----------
@@ -2451,14 +3411,114 @@ def update_member(member_id: int, payload: MemberUpdate, db: Session = Depends(g
     data["photo_url"] = _resolve_member_photo(data.get("photo_url"), m.photo_url)
     for key, value in data.items():
         setattr(m, key, value)
+    if m.status == "WITHDRAWN" and not m.withdrawal_date:
+        m.withdrawal_date = _today()
     db.commit(); db.refresh(m)
-    return _member_out(m, bool(m.photo_url), _unpaid_by_member(db, [member_id]).get(member_id, (0, 0)))
+    linked = bool(db.query(ParentLink.link_id).filter(ParentLink.member_id == member_id).first())
+    return _member_out(m, bool(m.photo_url), _unpaid_by_member(db, [member_id]).get(member_id, (0, 0)),
+                       _member_class_overview(db, [member_id]).get(member_id, []), linked)
+
+
+# =====================================================================
+# v9 가입 신청 심사 (관리자) — 승인하면 학생·수강·학부모 연결이 한 번에 만들어집니다
+# =====================================================================
+class ApplicationDecision(BaseModel):
+    class_ids: Optional[List[int]] = Field(None, max_length=20)   # 승인 시 수업 조정 (비우면 신청한 수업)
+    enrollment_date: Optional[date] = None
+    create_invoice: bool = False                                 # 승인과 함께 첫 달 청구서 발행
+    reason: str = Field("", max_length=200)                      # 반려 사유
+
+
+def _class_name_map(db: Session) -> dict:
+    return dict(db.query(Class.class_id, Class.name).all())
+
+
+@app.get("/api/applications")
+def list_applications(status: Optional[str] = Query(None, max_length=10), db: Session = Depends(get_db)):
+    query = db.query(EnrollmentApplication)
+    if status:
+        query = query.filter(EnrollmentApplication.status == status)
+    rows = query.order_by(EnrollmentApplication.status != "PENDING", EnrollmentApplication.created_at.desc()).limit(200).all()
+    names = _class_name_map(db)
+    return [_application_out(a, names, admin=True) for a in rows]
+
+
+def _pending_application(db: Session, application_id: int) -> EnrollmentApplication:
+    row = db.query(EnrollmentApplication).filter(EnrollmentApplication.application_id == application_id).with_for_update().first()
+    if not row:
+        raise HTTPException(404, "신청서를 찾을 수 없습니다.")
+    if row.status != "PENDING":
+        raise HTTPException(409, "이미 처리된 신청입니다.")
+    return row
+
+
+@app.post("/api/applications/{application_id}/approve")
+def approve_application(application_id: int, payload: ApplicationDecision, request: Request, db: Session = Depends(get_db),
+                        account: AdminAccount = Depends(owner_account)):
+    row = _pending_application(db, application_id)
+    snap = _json_dict(row.snapshot)
+    try:
+        requested = [int(x) for x in json.loads(row.class_ids or "[]")]
+    except (ValueError, TypeError):
+        requested = []
+    class_ids = list(dict.fromkeys(payload.class_ids if payload.class_ids is not None else requested))
+    classes = {c.class_id: c for c in db.query(Class).filter(Class.class_id.in_(class_ids or [-1])).all()}
+    if len(classes) != len(class_ids):
+        raise HTTPException(400, "존재하지 않는 수업이 포함되어 있습니다.")
+    relation = snap.get("relation") or "모"
+    phone, pname = snap.get("parent_phone") or "", snap.get("parent_name") or ""
+    member = Member(name=(snap.get("name") or "")[:50], gender=snap.get("gender") if snap.get("gender") in ("M", "F") else "M",
+                    age=int(snap.get("age") or 0), enrollment_date=payload.enrollment_date or _today(), status="ACTIVE",
+                    mother_name=pname if relation != "부" else None, mother_phone=phone if relation != "부" else None,
+                    father_name=pname if relation == "부" else None, father_phone=phone if relation == "부" else None,
+                    address=(snap.get("address") or "")[:200] or None)
+    db.add(member)
+    db.flush()
+    for cid in class_ids:
+        db.add(Enrollment(member_id=member.member_id, class_id=cid))
+    if not db.query(ParentLink).filter(ParentLink.user_id == row.user_id, ParentLink.member_id == member.member_id).first():
+        db.add(ParentLink(user_id=row.user_id, member_id=member.member_id))
+    if not db.query(FacilityMember).filter(FacilityMember.user_id == row.user_id).first():
+        user = db.query(AppUser).filter(AppUser.user_id == row.user_id).first()
+        db.add(_new_membership(user, member.facility_id or db.info["facility_id"]))
+    if snap.get("note"):
+        db.add(MemberNote(member_id=member.member_id, author="가입 신청서", content=str(snap.get("note"))[:2000]))
+    payment = _read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS)
+    fee = sum(_class_fee(classes[c], payment) for c in class_ids) if class_ids else int(payment.get("baseTuitionFee") or 0)
+    if payload.create_invoice and fee > 0:
+        iv = Invoice(member_id=member.member_id, item_name=f"{_today().month}월 수강료", amount=fee, status="UNPAID",
+                     due_date=_today() + timedelta(days=7))
+        db.add(iv)
+        db.flush()
+    row.status, row.member_id, row.decided_at = "APPROVED", member.member_id, _now()
+    names = ", ".join(classes[c].name for c in class_ids) or "수업 미배정"
+    db.add(Notification(user_id=row.user_id, audience="parent", kind="APPLICATION", member_id=member.member_id,
+                        title=f"{member.name} 학생 가입이 승인되었습니다", link="children",
+                        body=f"수강 수업: {names}" + (f" · 첫 달 청구서 {fee:,}원이 발행되었습니다." if payload.create_invoice and fee > 0 else "")))
+    _log(db, "admin", account.account_id, "application.approve", "member", member.member_id, f"가입 승인 ({names})")
+    db.commit()
+    return {"application_id": application_id, "status": "APPROVED", "member_id": member.member_id, "fee": fee}
+
+
+@app.post("/api/applications/{application_id}/reject")
+def reject_application(application_id: int, payload: ApplicationDecision, db: Session = Depends(get_db),
+                       account: AdminAccount = Depends(owner_account)):
+    row = _pending_application(db, application_id)
+    row.status, row.decided_at = "REJECTED", _now()
+    row.reject_reason = payload.reason.strip() or None
+    name = _json_dict(row.snapshot).get("name") or "자녀"
+    db.add(Notification(user_id=row.user_id, audience="parent", kind="APPLICATION", link="children",
+                        title=f"{name} 학생 가입 신청이 반려되었습니다",
+                        body=payload.reason.strip() or "자세한 내용은 시설로 문의해 주세요."))
+    _log(db, "admin", account.account_id, "application.reject", "application", application_id, "가입 반려")
+    db.commit()
+    return {"application_id": application_id, "status": "REJECTED"}
 
 
 # ---------------------------------------------------------------------
 # 출결 (attendances) API
 # ---------------------------------------------------------------------
-def _att_to_out(a: Attendance, member_name: Optional[str] = None) -> dict:
+def _att_to_out(a: Attendance, member_name: Optional[str] = None, class_name: Optional[str] = None) -> dict:
     return {
         "attendance_id": a.attendance_id,
         "member_id": a.member_id,
@@ -2468,6 +3528,8 @@ def _att_to_out(a: Attendance, member_name: Optional[str] = None) -> dict:
         "check_in_time":  a.check_in_time.strftime("%H:%M")  if a.check_in_time  else None,
         "check_out_time": a.check_out_time.strftime("%H:%M") if a.check_out_time else None,
         "note": a.note,
+        "class_id": a.class_id,
+        "class_name": class_name,
     }
 
 
@@ -2475,17 +3537,39 @@ def _att_to_out(a: Attendance, member_name: Optional[str] = None) -> dict:
 def list_attendances(
     target_date: Optional[date] = Query(None, description="조회 기준일"),
     member_id: Optional[int] = None,
+    class_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     # [PERF] 행마다 member 를 지연 로딩(사진 base64 포함)하던 N+1 → 이름 컬럼만 JOIN
-    query = db.query(Attendance, Member.name).outerjoin(Member, Member.member_id == Attendance.member_id)
+    query = (db.query(Attendance, Member.name, Class.name)
+               .outerjoin(Member, Member.member_id == Attendance.member_id)
+               .outerjoin(Class, Class.class_id == Attendance.class_id))
     if target_date:
         query = query.filter(Attendance.attendance_date == target_date)
     if member_id:
         query = query.filter(Attendance.member_id == member_id)
+    if class_id:
+        query = query.filter(Attendance.class_id == class_id)
     rows = query.order_by(Attendance.attendance_date.desc(),
-                          Attendance.check_in_time.asc()).all()
-    return [_att_to_out(a, name) for a, name in rows]
+                          Attendance.check_in_time.asc()).limit(2000).all()
+    return [_att_to_out(a, name, cname) for a, name, cname in rows]
+
+
+def _attendance_row(db: Session, member_id: int, day: date, class_id: Optional[int]) -> Optional[Attendance]:
+    query = db.query(Attendance).filter(Attendance.member_id == member_id, Attendance.attendance_date == day)
+    query = query.filter(Attendance.class_id == class_id) if class_id else query.filter(Attendance.class_id.is_(None))
+    return query.first()
+
+
+def _validate_class_for_member(db: Session, member_id: int, class_id: Optional[int]) -> Optional["Class"]:
+    if not class_id:
+        return None
+    cls = db.query(Class).filter(Class.class_id == class_id).first()
+    if not cls:
+        raise HTTPException(404, "수업을 찾을 수 없습니다.")
+    if not db.query(Enrollment.enrollment_id).filter(Enrollment.member_id == member_id, Enrollment.class_id == class_id).first():
+        raise HTTPException(400, "이 수업을 수강하는 학생이 아닙니다.")
+    return cls
 
 
 @app.post("/api/attendances", response_model=AttendanceOut, status_code=201)
@@ -2493,21 +3577,16 @@ def create_attendance(payload: AttendanceCreate, request: Request, db: Session =
     member = db.query(Member).filter(Member.member_id == payload.member_id).first()
     if not member:
         raise HTTPException(404, "회원을 찾을 수 없습니다.")
-
-    # 같은 날 같은 회원 중복 방지 (DB UNIQUE 제약과 이중 방어)
-    exists = (
-        db.query(Attendance)
-        .filter(Attendance.member_id == payload.member_id,
-                Attendance.attendance_date == payload.attendance_date)
-        .first()
-    )
-    if exists:
+    cls = _validate_class_for_member(db, member.member_id, payload.class_id)
+    # 같은 날 같은 회원·같은 수업 중복 방지 (DB UNIQUE 인덱스와 이중 방어)
+    if _attendance_row(db, payload.member_id, payload.attendance_date, payload.class_id):
         raise HTTPException(400, "해당 날짜에 이미 출결 기록이 있습니다.")
     if payload.status not in ATTENDANCE_STATUSES:
         raise HTTPException(400, "출결 상태는 PRESENT / LATE / ABSENT 중 하나여야 합니다.")
 
     a = Attendance(
         member_id=payload.member_id,
+        class_id=payload.class_id or None,
         attendance_date=payload.attendance_date,
         status=payload.status,
         check_in_time=_parse_time(payload.check_in_time),    # [FIX] 문자열 → time 변환
@@ -2516,9 +3595,9 @@ def create_attendance(payload: AttendanceCreate, request: Request, db: Session =
     )
     db.add(a)
     actor_type, actor_id, _ = _actor(request)
-    _after_attendance_change(db, member, a, None, actor_type, actor_id)
+    _after_attendance_change(db, member, a, None, actor_type, actor_id, cls.name if cls else None)
     db.commit(); db.refresh(a)
-    return _att_to_out(a)
+    return _att_to_out(a, member.name, cls.name if cls else None)
 
 
 @app.delete("/api/attendances/{attendance_id}", status_code=204)
@@ -2530,14 +3609,21 @@ def delete_attendance(attendance_id: int, db: Session = Depends(get_db)):
 
 
 # =====================================================================
-# v8.1 수업 시간표 · 출결 처리 공통 (키오스크·출석 화면 공용)
-#   출결은 "학생 1명 × 하루 1건"(시설 출입 기준)으로 기록합니다. 여러 반을 듣는 학생도 하루 1번만 체크.
+# 수업 시간표 · 출결 처리 공통 (키오스크·출석 화면 공용)
+#   v9: 출결은 "학생 × 날짜 × 수업" 단위. 키오스크 등원은 그날 그 학생의 수업마다 기록하고(시작 시각 기준 지각 판정),
+#       그날 수업이 없으면 수업과 무관한 시설 출입 기록 1건을 남깁니다.
 # =====================================================================
 ATTENDANCE_STATUSES = ("PRESENT", "LATE", "ABSENT")
 STATUS_KO = {"PRESENT": "출석", "LATE": "지각", "ABSENT": "결석"}
 WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 _KO_DAY = {"월": "MON", "화": "TUE", "수": "WED", "목": "THU", "금": "FRI", "토": "SAT", "일": "SUN",
            "매일": "DAILY", "DAILY": "DAILY"}
+CLASS_PALETTE = ["#3B82F6", "#10B981", "#8B5CF6", "#F59E0B", "#14B8A6", "#EF4444", "#EC4899", "#6366F1"]
+
+
+def _class_color(c: "Class") -> str:
+    """수업 색 — 직접 고른 색이 없으면 색 번호(이전 버전)로 팔레트에서 선택"""
+    return c.color or CLASS_PALETTE[(c.color_index or 0) % len(CLASS_PALETTE)]
 
 
 def _normalize_day(day: str) -> str:
@@ -2567,7 +3653,7 @@ def _sessions_on(c: "Class", day: date) -> List[dict]:
     if (c.start_date and day < c.start_date) or (c.end_date and day > c.end_date):
         return []
     code = WEEKDAY_CODES[day.weekday()]
-    return [s for s in _class_schedule(c) if s["day"] in (code, "DAILY")]
+    return sorted([s for s in _class_schedule(c) if s["day"] in (code, "DAILY")], key=lambda s: s["start"] or "99:99")
 
 
 def _member_sessions_today(db: Session, member_id: int, day: date) -> List[dict]:
@@ -2580,61 +3666,60 @@ def _member_sessions_today(db: Session, member_id: int, day: date) -> List[dict]
     return sorted(sessions, key=lambda x: x["start"] or "99:99")
 
 
+def _session_status(sess: dict, now: datetime, grace: int) -> str:
+    """등원 시각 기준 출석/지각: 수업 시작 + 유예시간 이후면 지각"""
+    if not sess.get("start"):
+        return "PRESENT"
+    hh, mm = map(int, sess["start"].split(":"))
+    start_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return "PRESENT" if now <= start_at + timedelta(minutes=grace) else "LATE"
+
+
 def _auto_check_in_status(db: Session, member_id: int, now: datetime) -> str:
-    """키오스크 등원 시 출석/지각 자동 판정: 오늘 가장 이른 수업 시작 + 유예시간이 지났으면 지각"""
+    """(이전 버전 호환) 오늘 가장 이른 수업 기준 출석/지각"""
     grace = int(_brand(db).get("lateGraceMinutes") or 10)
-    for sess in _member_sessions_today(db, member_id, now.date()):
-        if not sess["start"]:
-            continue
-        hh, mm = map(int, sess["start"].split(":"))
-        start_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        end_at = start_at + timedelta(hours=3)
-        if sess["end"]:
-            eh, em = map(int, sess["end"].split(":"))
-            end_at = now.replace(hour=eh, minute=em, second=0, microsecond=0)
-        if now <= start_at + timedelta(minutes=grace):
-            return "PRESENT"
-        if now <= end_at:
-            return "LATE"
-    return "PRESENT"
+    sessions = [s for s in _member_sessions_today(db, member_id, now.date()) if s["start"]]
+    return _session_status(sessions[0], now, grace) if sessions else "PRESENT"
 
 
 def _after_attendance_change(db: Session, member: Member, row: Attendance, before: Optional[str],
-                             actor_type: str, actor_id: Optional[int]) -> None:
+                             actor_type: str, actor_id: Optional[int], class_name: Optional[str] = None) -> None:
     """출결이 바뀌면 동작 로그 + (오늘 기록이면) 학부모 알림"""
+    label = f"[{class_name}] " if class_name else ""
     _log(db, actor_type, actor_id, "attendance.mark", "member", member.member_id,
-         f"{row.attendance_date} {STATUS_KO.get(row.status, row.status)}")
+         f"{row.attendance_date} {label}{STATUS_KO.get(row.status, row.status)}")
     if row.attendance_date != _today() or before == row.status:
         return
     at = row.check_in_time.strftime("%H:%M") if row.check_in_time else _now().strftime("%H:%M")
     if row.status == "PRESENT":
-        _notify_parents(db, [member.member_id], "CHECK_IN", f"{member.name} 학생 등원", f"{at}에 안전하게 등원했습니다.", "children")
+        _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석", f"{at}에 출석했습니다.", "children")
     elif row.status == "LATE":
-        _notify_parents(db, [member.member_id], "CHECK_IN", f"{member.name} 학생 등원(지각)", f"{at}에 등원했습니다.", "children")
+        _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석(지각)", f"{at}에 출석했습니다.", "children")
     elif row.status == "ABSENT":
-        _notify_parents(db, [member.member_id], "ABSENT", f"{member.name} 학생 결석",
-                        "오늘 결석으로 처리되었습니다. 사정이 있으시면 시설로 연락 주세요.", "children")
+        _notify_parents(db, [member.member_id], "ABSENT", f"{label}{member.name} 학생 결석",
+                        "결석으로 처리되었습니다. 사정이 있으시면 시설로 연락 주세요.", "children")
 
 
 def _mark_attendance(db: Session, member: Member, day: date, status: str, actor_type: str,
-                     actor_id: Optional[int], note: Optional[str] = None) -> Attendance:
-    """출결 저장(있으면 변경, 없으면 생성) — 상태 변경 시 삭제 후 재생성하던 2회 요청을 1회로"""
+                     actor_id: Optional[int], note: Optional[str] = None, class_id: Optional[int] = None,
+                     class_name: Optional[str] = None, at: Optional[time] = None) -> Attendance:
+    """출결 저장(있으면 변경, 없으면 생성)"""
     if status not in ATTENDANCE_STATUSES:
         raise HTTPException(400, "출결 상태는 PRESENT / LATE / ABSENT 중 하나여야 합니다.")
-    row = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == day).first()
+    row = _attendance_row(db, member.member_id, day, class_id)
     before = row.status if row else None
     if not row:
-        row = Attendance(member_id=member.member_id, attendance_date=day)
+        row = Attendance(member_id=member.member_id, attendance_date=day, class_id=class_id or None)
         db.add(row)
     row.status = status
     if status == "ABSENT":
         row.check_in_time = row.check_out_time = None
     elif not row.check_in_time:
-        row.check_in_time = _now().time().replace(second=0, microsecond=0) if day == _today() else None
+        row.check_in_time = at or (_now().time().replace(second=0, microsecond=0) if day == _today() else None)
     if note is not None:
         row.note = note[:200] or None
     db.flush()
-    _after_attendance_change(db, member, row, before, actor_type, actor_id)
+    _after_attendance_change(db, member, row, before, actor_type, actor_id, class_name)
     return row
 
 
@@ -2643,6 +3728,7 @@ class AttendanceMark(BaseModel):
     attendance_date: date
     status: str = Field(max_length=10)
     note: Optional[str] = Field(None, max_length=200)
+    class_id: Optional[int] = None
 
 
 class AttendanceBulk(BaseModel):
@@ -2650,6 +3736,7 @@ class AttendanceBulk(BaseModel):
     member_ids: List[int] = Field(max_length=500)
     status: str = Field(max_length=10)
     only_unchecked: bool = True
+    class_id: Optional[int] = None
 
 
 @app.post("/api/attendances/mark", response_model=AttendanceOut)
@@ -2657,26 +3744,38 @@ def mark_attendance(payload: AttendanceMark, request: Request, db: Session = Dep
     member = db.query(Member).filter(Member.member_id == payload.member_id).first()
     if not member:
         raise HTTPException(404, "회원을 찾을 수 없습니다.")
+    cls = _validate_class_for_member(db, member.member_id, payload.class_id)
     actor_type, actor_id, _ = _actor(request)
-    row = _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id, payload.note)
+    row = _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id, payload.note,
+                           payload.class_id, cls.name if cls else None)
     db.commit(); db.refresh(row)
-    return _att_to_out(row, member.name)
+    return _att_to_out(row, member.name, cls.name if cls else None)
 
 
 @app.post("/api/attendances/bulk")
 def bulk_attendance(payload: AttendanceBulk, request: Request, db: Session = Depends(get_db)):
-    """미체크 전원 출석 / 출석 마감(결석) — 학생 수만큼 보내던 요청을 1회로"""
+    """미체크 전원 출석 / 출석 마감(결석) — 학생 수만큼 보내던 요청을 1회로 (수업을 고르면 그 수업 출결)"""
     if payload.status not in ATTENDANCE_STATUSES:
         raise HTTPException(400, "출결 상태는 PRESENT / LATE / ABSENT 중 하나여야 합니다.")
-    members = db.query(Member).filter(Member.member_id.in_(payload.member_ids or [-1]), Member.status == "ACTIVE").all()
-    checked = {mid for (mid,) in db.query(Attendance.member_id).filter(
-        Attendance.attendance_date == payload.attendance_date, Attendance.member_id.in_([m.member_id for m in members] or [-1]))}
+    query = db.query(Member).filter(Member.member_id.in_(payload.member_ids or [-1]), Member.status == "ACTIVE")
+    cls = None
+    if payload.class_id:
+        cls = db.query(Class).filter(Class.class_id == payload.class_id).first()
+        if not cls:
+            raise HTTPException(404, "수업을 찾을 수 없습니다.")
+        query = query.join(Enrollment, Enrollment.member_id == Member.member_id).filter(Enrollment.class_id == cls.class_id)
+    members = query.all()
+    checked_q = db.query(Attendance.member_id).filter(
+        Attendance.attendance_date == payload.attendance_date, Attendance.member_id.in_([m.member_id for m in members] or [-1]))
+    checked_q = checked_q.filter(Attendance.class_id == cls.class_id) if cls else checked_q.filter(Attendance.class_id.is_(None))
+    checked = {mid for (mid,) in checked_q}
     actor_type, actor_id, _ = _actor(request)
     changed = 0
     for member in members:
         if payload.only_unchecked and member.member_id in checked:
             continue
-        _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id)
+        _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id,
+                         class_id=cls.class_id if cls else None, class_name=cls.name if cls else None)
         changed += 1
     db.commit()
     return {"changed": changed, "skipped": len(members) - changed}
@@ -2688,26 +3787,28 @@ def checkout_attendance(attendance_id: int, request: Request, db: Session = Depe
     if not row:
         raise HTTPException(404, "출결 기록을 찾을 수 없습니다.")
     member = db.query(Member).filter(Member.member_id == row.member_id).first()
+    cname = db.query(Class.name).filter(Class.class_id == row.class_id).scalar() if row.class_id else None
     actor_type, actor_id, _ = _actor(request)
-    _check_out(db, member, row, actor_type, actor_id)
+    _check_out(db, member, [row], actor_type, actor_id)
     db.commit(); db.refresh(row)
-    return _att_to_out(row, member.name)
+    return _att_to_out(row, member.name, cname)
 
 
-def _check_out(db: Session, member: Member, row: Attendance, actor_type: str, actor_id: Optional[int]) -> None:
-    if row.status == "ABSENT":
-        raise HTTPException(409, "결석 처리된 학생은 하원 처리할 수 없습니다.")
-    if row.check_out_time:
-        raise HTTPException(409, "이미 하원 처리되었습니다.")
-    row.check_out_time = _now().time().replace(second=0, microsecond=0)
-    _log(db, actor_type, actor_id, "attendance.checkout", "member", member.member_id, f"{row.attendance_date} 하원")
-    if row.attendance_date == _today():
+def _check_out(db: Session, member: Member, rows: List[Attendance], actor_type: str, actor_id: Optional[int]) -> None:
+    rows = [r for r in rows if r.status != "ABSENT" and not r.check_out_time]
+    if not rows:
+        raise HTTPException(409, "하원 처리할 출석 기록이 없습니다(결석이거나 이미 하원).")
+    now_t = _now().time().replace(second=0, microsecond=0)
+    for row in rows:
+        row.check_out_time = now_t
+    _log(db, actor_type, actor_id, "attendance.checkout", "member", member.member_id, f"{rows[0].attendance_date} 하원")
+    if rows[0].attendance_date == _today():
         _notify_parents(db, [member.member_id], "CHECK_OUT", f"{member.name} 학생 하원",
-                        f"{row.check_out_time.strftime('%H:%M')}에 하원했습니다.", "children")
+                        f"{now_t.strftime('%H:%M')}에 하원했습니다.", "children")
 
 
 # ---------------------------------------------------------------------
-# v8.1 출석 키오스크 — 태블릿에서 보호자 연락처 뒤 4자리 → 등원/하원 (관리자·직원 세션으로 연 화면)
+# 출석 키오스크 — 태블릿에서 보호자 연락처 뒤 4자리 → 등원/하원 (관리자·직원 세션으로 연 화면)
 #   이름은 가려서(김*준) 보여 주고, 학부모에게 즉시 알림이 갑니다.
 # ---------------------------------------------------------------------
 class KioskCheck(BaseModel):
@@ -2715,14 +3816,21 @@ class KioskCheck(BaseModel):
     action: str = Field(max_length=5)   # in / out
 
 
-def _kiosk_member_out(db: Session, m: Member, today_row: Optional[Attendance], class_names: List[str]) -> dict:
-    status = today_row.status if today_row else None
-    next_action = "in" if not today_row or status == "ABSENT" else ("done" if today_row.check_out_time else "out")
+_STATUS_RANK = {"PRESENT": 3, "LATE": 2, "ABSENT": 1}
+
+
+def _kiosk_member_out(db: Session, m: Member, today_rows: List[Attendance], class_names: List[str]) -> dict:
+    attended = [r for r in today_rows if r.status in ("PRESENT", "LATE")]
+    status = max((r.status for r in today_rows), key=lambda s: _STATUS_RANK.get(s, 0)) if today_rows else None
+    check_in = min((r.check_in_time for r in attended if r.check_in_time), default=None)
+    open_rows = [r for r in attended if not r.check_out_time]
+    check_out = max((r.check_out_time for r in attended if r.check_out_time), default=None) if not open_rows else None
+    next_action = "in" if not attended else ("out" if open_rows else "done")
     return {
         "member_id": m.member_id, "masked_name": _mask_name(m.name), "classes": class_names,
         "today_status": status,
-        "check_in_time": today_row.check_in_time.strftime("%H:%M") if today_row and today_row.check_in_time else None,
-        "check_out_time": today_row.check_out_time.strftime("%H:%M") if today_row and today_row.check_out_time else None,
+        "check_in_time": check_in.strftime("%H:%M") if check_in else None,
+        "check_out_time": check_out.strftime("%H:%M") if check_out else None,
         "next_action": next_action,
     }
 
@@ -2737,13 +3845,14 @@ def kiosk_lookup(digits: str = Query(..., min_length=4, max_length=4), db: Sessi
                              _digits_expr(Member.mother_phone).like(f"%{digits}")))
                  .order_by(Member.name).limit(10).all())
     ids = [m.member_id for m in members]
-    today_rows = {a.member_id: a for a in db.query(Attendance).filter(
-        Attendance.attendance_date == _today(), Attendance.member_id.in_(ids or [-1]))}
+    today_rows: dict = {}
+    for a in db.query(Attendance).filter(Attendance.attendance_date == _today(), Attendance.member_id.in_(ids or [-1])):
+        today_rows.setdefault(a.member_id, []).append(a)
     class_map: dict = {}
     for member_id, name in (db.query(Enrollment.member_id, Class.name).join(Class, Class.class_id == Enrollment.class_id)
                               .filter(Enrollment.member_id.in_(ids or [-1])).all()):
         class_map.setdefault(member_id, []).append(name)
-    return [_kiosk_member_out(db, m, today_rows.get(m.member_id), class_map.get(m.member_id, [])) for m in members]
+    return [_kiosk_member_out(db, m, today_rows.get(m.member_id, []), class_map.get(m.member_id, [])) for m in members]
 
 
 @app.post("/api/kiosk/check")
@@ -2752,23 +3861,41 @@ def kiosk_check(payload: KioskCheck, request: Request, db: Session = Depends(get
     if not member:
         raise HTTPException(404, "학생을 찾을 수 없습니다.")
     actor_id = getattr(request.state, "account", None) and request.state.account.account_id
-    today = _today()
-    row = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == today).first()
+    today, now = _today(), _now()
+    rows = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == today).all()
     if payload.action == "in":
-        if row and row.status in ("PRESENT", "LATE"):
-            raise HTTPException(409, f"{_mask_name(member.name)} 학생은 이미 {row.check_in_time.strftime('%H:%M') if row.check_in_time else ''} 등원했습니다.")
-        status = _auto_check_in_status(db, member.member_id, _now())
-        row = _mark_attendance(db, member, today, status, "kiosk", actor_id)
-        message = f"{_mask_name(member.name)} 학생 {'등원 완료' if status == 'PRESENT' else '등원 (지각)'}"
+        attended = [r for r in rows if r.status in ("PRESENT", "LATE")]
+        if attended:
+            first = min((r.check_in_time for r in attended if r.check_in_time), default=None)
+            raise HTTPException(409, f"{_mask_name(member.name)} 학생은 이미 {first.strftime('%H:%M') if first else ''} 등원했습니다.")
+        grace = int(_brand(db).get("lateGraceMinutes") or 10)
+        sessions = _member_sessions_today(db, member.member_id, today)
+        at = now.time().replace(second=0, microsecond=0)
+        statuses = []
+        seen = set()
+        for sess in sessions:
+            if sess["class_id"] in seen:
+                continue
+            seen.add(sess["class_id"])
+            st = _session_status(sess, now, grace)
+            statuses.append(st)
+            _mark_attendance(db, member, today, st, "kiosk", actor_id, class_id=sess["class_id"],
+                             class_name=sess["class_name"], at=at)
+        if not sessions:
+            statuses.append("PRESENT")
+            _mark_attendance(db, member, today, "PRESENT", "kiosk", actor_id, at=at)
+        late = statuses and statuses[0] == "LATE"
+        message = f"{_mask_name(member.name)} 학생 {'등원 (지각)' if late else '등원 완료'}"
     elif payload.action == "out":
-        if not row or row.status == "ABSENT":
+        if not any(r.status in ("PRESENT", "LATE") for r in rows):
             raise HTTPException(409, "오늘 등원 기록이 없습니다. 먼저 등원을 눌러 주세요.")
-        _check_out(db, member, row, "kiosk", actor_id)
+        _check_out(db, member, rows, "kiosk", actor_id)
         message = f"{_mask_name(member.name)} 학생 하원 완료"
     else:
         raise HTTPException(400, "action 은 in 또는 out 이어야 합니다.")
-    db.commit(); db.refresh(row)
-    return {**_kiosk_member_out(db, member, row, []), "message": message,
+    db.commit()
+    rows = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == today).all()
+    return {**_kiosk_member_out(db, member, rows, []), "message": message,
             "parent_notified": bool(_parent_user_ids(db, [member.member_id]))}
 
 
@@ -2776,17 +3903,26 @@ def kiosk_check(payload: KioskCheck, request: Request, db: Session = Depends(get
 def kiosk_today(db: Session = Depends(get_db)):
     today = _today()
     rows = db.query(Attendance).filter(Attendance.attendance_date == today).all()
-    checked_in = sum(1 for a in rows if a.status in ("PRESENT", "LATE"))
-    checked_out = sum(1 for a in rows if a.check_out_time)
+    by_member: dict = {}
+    for a in rows:
+        by_member.setdefault(a.member_id, []).append(a)
+    checked_in = sum(1 for rs in by_member.values() if any(r.status in ("PRESENT", "LATE") for r in rs))
+    checked_out = sum(1 for rs in by_member.values()
+                      if any(r.check_out_time for r in rs) and not any(r.status != "ABSENT" and not r.check_out_time for r in rs))
     recent = (db.query(Attendance, Member.name).join(Member, Member.member_id == Attendance.member_id)
                 .filter(Attendance.attendance_date == today, Attendance.status != "ABSENT")
-                .order_by(func.coalesce(Attendance.check_out_time, Attendance.check_in_time).desc()).limit(6).all())
+                .order_by(func.coalesce(Attendance.check_out_time, Attendance.check_in_time).desc()).limit(20).all())
+    seen, recent_out = set(), []
+    for a, name in recent:
+        if a.member_id in seen:
+            continue
+        seen.add(a.member_id)
+        recent_out.append({"masked_name": _mask_name(name), "status": a.status,
+                           "time": (a.check_out_time or a.check_in_time).strftime("%H:%M") if (a.check_out_time or a.check_in_time) else None,
+                           "action": "out" if a.check_out_time else "in"})
     active = db.query(func.count(Member.member_id)).filter(Member.status == "ACTIVE").scalar() or 0
     return {"brand": _brand(db), "date": today.isoformat(), "active_members": int(active),
-            "checked_in": checked_in, "checked_out": checked_out,
-            "recent": [{"masked_name": _mask_name(name), "status": a.status,
-                        "time": (a.check_out_time or a.check_in_time).strftime("%H:%M") if (a.check_out_time or a.check_in_time) else None,
-                        "action": "out" if a.check_out_time else "in"} for a, name in recent]}
+            "checked_in": checked_in, "checked_out": checked_out, "recent": recent_out[:6]}
 
 
 # ---------------------------------------------------------------------
@@ -2961,6 +4097,7 @@ def _approve_b2b_kakao_payment(order_id: str, pg_token: str, db: Session, front:
     ).with_for_update().first()
     if not pending:
         return None
+    db.info["facility_id"] = pending.facility_id      # 공개 콜백 → 결제 대기 행의 시설로 이후 조회·기록을 제한
     order = db.query(B2BOrder).filter(B2BOrder.order_id == pending.order_id).first()
     if pending.status != "READY" or not order:
         return RedirectResponse(f"{front}/b2b-shop?payment=fail&reason=already")
@@ -3005,6 +4142,8 @@ def kakao_success(request: Request, order_id: str = Query(..., max_length=64), p
     if not pending:
         # 주문 정보가 없는 경우 (잘못된 접근 등)
         return RedirectResponse(f"{front}/checkout?kakao=fail&reason=expired")
+    # 공개 콜백(세션 없음) → 결제 대기 행의 시설로 이후 조회·기록을 제한 (결제·알림·data_version 이 그 시설에 기록됨)
+    db.info["facility_id"] = pending.facility_id
     result_url = f"{front}{_payment_result_path(pending.partner_user_id)}"
     if pending.status != "READY":
         # 이미 처리된 주문 — 중복 승인 방지
@@ -3062,7 +4201,7 @@ def kakao_success(request: Request, order_id: str = Query(..., max_length=64), p
                         f"{pending.amount:,}원이 카카오페이로 결제되었습니다.", "pay")
         if not (pending.partner_user_id or "").startswith("admin"):
             _notify_admins(db, "PAYMENT", f"{member.name} 학생 학부모 결제 완료",
-                           f"{pending.item_name} {pending.amount:,}원 (카카오페이)", "checkout", member.member_id)
+                           f"{pending.item_name} {pending.amount:,}원 (카카오페이)", "admin-checkout", member.member_id)
     _log(db, "parent" if (pending.partner_user_id or "").startswith("parent") else "admin", None,
          "payment.kakao", "member", pending.member_id, f"{pending.amount:,}원 카카오페이")
     db.commit()
@@ -3217,6 +4356,8 @@ def list_notices(class_id: Optional[int] = None, db: Session = Depends(get_db)):
 def create_notice(payload: NoticeCreate, request: Request, db: Session = Depends(get_db)):
     class_name = _validate_notice_class(db, payload.class_id)
     n = Notice(**payload.model_dump(exclude={"notify_parents"}))
+    if "author" not in payload.model_fields_set or not payload.author.strip():
+        n.author = _admin_author(db, request)        # 작성자를 보내지 않으면 기관 설정의 원장 이름
     if not payload.class_id:
         n.class_id = None
     db.add(n); db.flush()
@@ -3245,13 +4386,15 @@ def delete_notice(notice_id: int, db: Session = Depends(get_db)):
 
 @app.put("/api/notices/{notice_id}", response_model=NoticeOut)
 def update_notice(notice_id: int, payload: NoticeCreate, db: Session = Depends(get_db)):
+    # 작성자는 보낸 경우에만 바꿈 (고정·수정 때 원래 작성자가 '관리자'로 덮이지 않도록)
     n = db.query(Notice).filter(Notice.notice_id == notice_id).first()
     if not n:
         raise HTTPException(404, "공지사항을 찾을 수 없습니다.")
     _validate_notice_class(db, payload.class_id)
     n.title = payload.title
     n.content = payload.content
-    n.author = payload.author
+    if "author" in payload.model_fields_set and payload.author.strip():
+        n.author = payload.author
     n.category = payload.category
     n.is_pinned = payload.is_pinned
     n.class_id = payload.class_id or None
@@ -3261,16 +4404,34 @@ def update_notice(notice_id: int, payload: NoticeCreate, db: Session = Depends(g
 
 
 # ---------------------------------------------------------------------
-# 커뮤니티 피드 (밴드 스타일) — 학부모 열람 / 원장 작성
+# 커뮤니티 (v9: 게시판형) — 공지(notices) + 게시글(community_posts)을 한 게시판으로
+#   - 말머리: 공지 / 자유 / 질문 / 활동·사진 / 정보·후기
+#   - 검색: 제목 / 내용 / 제목+내용 / 작성자, 페이지 단위 조회 (집계·검색·정렬은 서버)
+#   - 관리자·학부모 모두 글·댓글 작성. 학부모 글·댓글은 자동 모니터링 → 의심 시 '검토 대기'
+#   - 멤버 관리: 경고 · 채팅(글·댓글) 금지 · 강퇴 (facility_members)
 # ---------------------------------------------------------------------
+POST_CATEGORIES = {"FREE": "자유", "QUESTION": "질문", "PHOTO": "활동·사진", "INFO": "정보·후기"}
+BOARD_CATEGORIES = {"NOTICE": "공지", **POST_CATEGORIES}
+NOTICE_KINDS = {"GENERAL": "일반", "EVENT": "행사", "URGENT": "긴급"}
+SEARCH_FIELDS = ("title", "content", "title_content", "author")
+
+
 class CommunityPostCreate(BaseModel):
+    title: str = Field("", max_length=200)
     content: str = Field("", max_length=10000)
-    author: str = Field("관리자", max_length=50)
+    category: str = Field("FREE", max_length=20)
+    author: str = Field("관리자", max_length=50)      # (이전 버전 호환 — 작성자는 서버가 정함)
     photos: List[str] = []   # 새 사진: data URL (프론트가 줄여서 보냄)
+    is_pinned: bool = False
+
 
 class CommunityPostUpdate(BaseModel):
+    title: Optional[str] = Field(None, max_length=200)
     content: str = Field("", max_length=10000)
+    category: Optional[str] = Field(None, max_length=20)
     photos: List[str] = []   # 기존 사진은 받은 사진 URL 그대로, 새 사진은 data URL
+    is_pinned: Optional[bool] = None
+
 
 class CommunityCommentCreate(BaseModel):
     content: str = Field(min_length=1, max_length=1000)
@@ -3323,17 +4484,34 @@ def _photo_ids_by_post(db: Session, post_ids: List[int]) -> dict:
     return result
 
 
+def _post_title(p: CommunityPost) -> str:
+    if p.title:
+        return p.title
+    first = (p.content or "").strip().split("\n", 1)[0]
+    return (first[:40] + ("…" if len(first) > 40 else "")) if first else "사진 게시물"
+
+
 def _post_to_out(p: CommunityPost, photo_ids: List[int], parent: bool = False,
-                 comment_count: int = 0, liked: bool = False) -> dict:
+                 comment_count: int = 0, liked: bool = False, viewer_user_id: Optional[int] = None) -> dict:
+    category = p.category if p.category in POST_CATEGORIES else "FREE"
     return {
+        "kind": "post", "key": f"p{p.post_id}",
         "post_id": p.post_id,
+        "title": _post_title(p),
         "author": p.author,
+        "author_role": p.author_role or "admin",
+        "category": category, "category_label": POST_CATEGORIES[category],
         "content": p.content,
         "photos": [_community_photo_path(pid, parent) for pid in photo_ids],
         "like_count": p.like_count or 0,
         "liked": liked,                     # v8.1: 내가 좋아요를 눌렀는지
         "comment_count": comment_count,     # v8.1: 보이는 댓글 수
+        "view_count": p.view_count or 0,
+        "is_pinned": bool(p.is_pinned),
+        "status": p.status or "VISIBLE",
+        "mine": bool(viewer_user_id and p.user_id == viewer_user_id),
         "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
 
@@ -3360,21 +4538,32 @@ def _liked_posts(db: Session, user_id: Optional[int], post_ids: List[int]) -> se
         CommunityLike.user_id == user_id, CommunityLike.post_id.in_(post_ids))}
 
 
-def _list_posts(db: Session, parent: bool, limit: int, user_id: Optional[int] = None) -> List[dict]:
-    rows = (db.query(CommunityPost).options(defer(CommunityPost.photos))
-              .order_by(CommunityPost.created_at.desc(), CommunityPost.post_id.desc()).limit(limit).all())
+def _posts_out(db: Session, rows: List[CommunityPost], parent: bool, user_id: Optional[int]) -> List[dict]:
     ids = [p.post_id for p in rows]
     _migrate_legacy_photos(db, ids)
     photo_map = _photo_ids_by_post(db, ids)
     counts = _comment_counts(db, ids)
     liked = _liked_posts(db, user_id, ids)
-    return [_post_to_out(p, photo_map.get(p.post_id, []), parent, int(counts.get(p.post_id, 0)), p.post_id in liked)
+    return [_post_to_out(p, photo_map.get(p.post_id, []), parent, int(counts.get(p.post_id, 0)), p.post_id in liked, user_id)
             for p in rows]
 
 
-def _single_post_out(db: Session, p: CommunityPost) -> dict:
-    return _post_to_out(p, _photo_ids_by_post(db, [p.post_id]).get(p.post_id, []),
-                        comment_count=int(_comment_counts(db, [p.post_id]).get(p.post_id, 0)))
+def _list_posts(db: Session, parent: bool, limit: int, user_id: Optional[int] = None) -> List[dict]:
+    """(이전 버전 호환) 피드 목록 — 학부모에게는 공개 글 + 본인 검토 대기 글"""
+    query = db.query(CommunityPost).options(defer(CommunityPost.photos))
+    if parent:
+        query = query.filter(_parent_post_visibility(user_id))
+    rows = query.order_by(CommunityPost.created_at.desc(), CommunityPost.post_id.desc()).limit(limit).all()
+    return _posts_out(db, rows, parent, user_id)
+
+
+def _single_post_out(db: Session, p: CommunityPost, parent: bool = False, user_id: Optional[int] = None) -> dict:
+    return _posts_out(db, [p], parent, user_id)[0]
+
+
+def _parent_post_visibility(user_id: Optional[int]):
+    return or_(func.coalesce(CommunityPost.status, "VISIBLE") == "VISIBLE",
+               and_(CommunityPost.status == "PENDING", CommunityPost.user_id == user_id))
 
 
 def _parse_photo_items(items: List[str], existing_ids: Optional[set] = None) -> list:
@@ -3396,10 +4585,126 @@ def _parse_photo_items(items: List[str], existing_ids: Optional[set] = None) -> 
     return parsed
 
 
+def _like_pattern(q: str) -> str:
+    safe = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{safe}%"
+
+
+def _search_condition(field: str, pattern: str, title_col, content_col, author_col):
+    title = func.coalesce(title_col, "")
+    if field == "title":
+        return title.like(pattern, escape="\\")
+    if field == "content":
+        return content_col.like(pattern, escape="\\")
+    if field == "author":
+        return author_col.like(pattern, escape="\\")
+    return or_(title.like(pattern, escape="\\"), content_col.like(pattern, escape="\\"))
+
+
+def _notice_board_out(n: Notice, class_names: dict, read_counts: Optional[dict] = None,
+                      targets: Optional[dict] = None, read_ids: Optional[set] = None,
+                      my_classes: Optional[dict] = None) -> dict:
+    out = {"kind": "notice", "key": f"n{n.notice_id}", "notice_id": n.notice_id, "title": n.title,
+           "content": n.content, "author": n.author, "author_role": "admin",
+           "category": "NOTICE", "category_label": "공지",
+           "notice_category": n.category if n.category in NOTICE_KINDS else "GENERAL",
+           "notice_category_label": NOTICE_KINDS.get(n.category, "일반"),
+           "is_pinned": bool(n.is_pinned), "class_id": n.class_id,
+           "class_name": class_names.get(n.class_id) if n.class_id else None,
+           "created_at": n.created_at.isoformat() if n.created_at else None}
+    if read_counts is not None:
+        out["read_count"] = int(read_counts.get(n.notice_id, 0))
+        out["target_count"] = int((targets or {}).get(n.class_id or 0, 0))
+    if read_ids is not None:
+        out["is_read"] = n.notice_id in read_ids
+        out["for_children"] = (my_classes or {}).get(n.class_id, []) if n.class_id else []
+    return out
+
+
+def _board(db: Session, *, parent_user: Optional[AppUser], category: str, q: str, field: str,
+           page: int, size: int) -> dict:
+    """공지 + 게시글을 최신순으로 합친 게시판 페이지. 각 출처에서 page*size 개만 읽어 병합 후 자름"""
+    if category not in ("ALL", *BOARD_CATEGORIES):
+        raise HTTPException(400, "말머리가 올바르지 않습니다.")
+    field = field if field in SEARCH_FIELDS else "title_content"
+    pattern = _like_pattern(q) if q.strip() else None
+    user_id = parent_user.user_id if parent_user else None
+    my_classes = _parent_class_children(db, parent_user) if parent_user else {}
+
+    notice_q = None if category not in ("ALL", "NOTICE") else db.query(Notice)
+    if notice_q is not None:
+        if parent_user:
+            notice_q = notice_q.filter(or_(Notice.class_id.is_(None), Notice.class_id.in_(list(my_classes) or [-1])))
+        if pattern:
+            notice_q = notice_q.filter(_search_condition(field, pattern, Notice.title, Notice.content, Notice.author))
+    post_q = None if category == "NOTICE" else db.query(CommunityPost).options(defer(CommunityPost.photos))
+    if post_q is not None:
+        if category in POST_CATEGORIES:
+            post_q = post_q.filter(func.coalesce(CommunityPost.category, "FREE") == category)
+        if parent_user:
+            post_q = post_q.filter(_parent_post_visibility(user_id))
+        if pattern:
+            post_q = post_q.filter(_search_condition(field, pattern, CommunityPost.title, CommunityPost.content,
+                                                     CommunityPost.author))
+    total = (notice_q.count() if notice_q is not None else 0) + (post_q.count() if post_q is not None else 0)
+    take = page * size
+    notices = notice_q.order_by(Notice.created_at.desc(), Notice.notice_id.desc()).limit(take).all() if notice_q is not None else []
+    posts = post_q.order_by(CommunityPost.created_at.desc(), CommunityPost.post_id.desc()).limit(take).all() if post_q is not None else []
+    merged = sorted([("n", n.created_at or datetime.min, n) for n in notices] + [("p", p.created_at or datetime.min, p) for p in posts],
+                    key=lambda x: x[1], reverse=True)[(page - 1) * size: page * size]
+
+    pinned_notices, pinned_posts = [], []
+    if page == 1 and not pattern and category in ("ALL", "NOTICE"):
+        pq = db.query(Notice).filter(Notice.is_pinned.is_(True))
+        if parent_user:
+            pq = pq.filter(or_(Notice.class_id.is_(None), Notice.class_id.in_(list(my_classes) or [-1])))
+        pinned_notices = pq.order_by(Notice.created_at.desc()).limit(5).all()
+    if page == 1 and not pattern and category in ("ALL", *POST_CATEGORIES):
+        pp = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.is_pinned.is_(True))
+        if category in POST_CATEGORIES:
+            pp = pp.filter(func.coalesce(CommunityPost.category, "FREE") == category)
+        if parent_user:
+            pp = pp.filter(_parent_post_visibility(user_id))
+        pinned_posts = pp.order_by(CommunityPost.created_at.desc()).limit(3).all()
+
+    all_notices = [x for k, _, x in merged if k == "n"] + pinned_notices
+    all_posts = [x for k, _, x in merged if k == "p"] + pinned_posts
+    class_names = dict(db.query(Class.class_id, Class.name).all())
+    if parent_user:
+        read_ids = {nid for (nid,) in db.query(NoticeRead.notice_id).filter(NoticeRead.user_id == user_id)}
+        notice_out = lambda n: _notice_board_out(n, class_names, read_ids=read_ids, my_classes=my_classes)
+    else:
+        ids = [n.notice_id for n in all_notices]
+        read_counts = dict(db.query(NoticeRead.notice_id, func.count(NoticeRead.read_id))
+                             .filter(NoticeRead.notice_id.in_(ids or [-1])).group_by(NoticeRead.notice_id).all())
+        targets = _notice_targets(db)
+        notice_out = lambda n: _notice_board_out(n, class_names, read_counts, targets)
+    post_out = {d["post_id"]: d for d in _posts_out(db, list({p.post_id: p for p in all_posts}.values()), bool(parent_user), user_id)}
+    items = [notice_out(x) if k == "n" else post_out[x.post_id] for k, _, x in merged]
+    pinned = [notice_out(n) for n in pinned_notices] + [post_out[p.post_id] for p in pinned_posts]
+    return {"items": items, "pinned": pinned, "total": total, "page": page, "size": size,
+            "pages": max(1, (total + size - 1) // size), "categories": BOARD_CATEGORIES}
+
+
+@app.get("/api/community/board")
+def community_board(category: str = Query("ALL", max_length=20), q: str = Query("", max_length=100),
+                    field: str = Query("title_content", max_length=20), page: int = Query(1, ge=1, le=1000),
+                    size: int = Query(15, ge=5, le=50), db: Session = Depends(get_db)):
+    return _board(db, parent_user=None, category=category, q=q, field=field, page=page, size=size)
+
+
 @app.get("/api/community/posts")
 def list_community_posts(request: Request, limit: int = Query(100, ge=1, le=300), db: Session = Depends(get_db)):
     """피드 목록 (최신순, 관리자). 사진은 URL 로만 내려 줍니다."""
     return _list_posts(db, parent=False, limit=limit, user_id=request.state.user.user_id)
+
+
+@app.get("/api/community/posts/{post_id}")
+def get_community_post(post_id: int, request: Request, db: Session = Depends(get_db)):
+    p = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    if not p:
+        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+    return _single_post_out(db, p, user_id=request.state.user.user_id)
 
 
 @app.get("/api/community/photos/{photo_id}")
@@ -3410,24 +4715,57 @@ def get_community_photo(photo_id: int, db: Session = Depends(get_db)):
     return _image_response(row.mime_type, row.data)
 
 
+def _admin_author(db: Session, request: Request) -> str:
+    """관리자 글·댓글의 작성자 표시 — 기관 설정의 원장 이름(없으면 계정 이름)"""
+    account = getattr(request.state, "account", None)
+    name = ""
+    try:
+        name = (_read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS).get("principal") or "").strip()
+    except HTTPException:
+        pass
+    if account is not None and _facility_role(account) != "owner":
+        name = ""      # 직원 계정은 원장 이름 대신 본인 계정 이름으로 표시
+    return (name or (account.username if account else "") or "관리자")[:50]
+
+
+def _save_new_photos(db: Session, post_id: int, items: list) -> None:
+    for position, (kind, value) in enumerate(items):
+        if kind == "keep":
+            db.query(CommunityPhoto).filter(CommunityPhoto.photo_id == value).update({"position": position}, synchronize_session=False)
+        else:
+            mime, body = value
+            db.add(CommunityPhoto(post_id=post_id, position=position, mime_type=mime, data=body))
+
+
+def _post_category(value: Optional[str]) -> str:
+    if value and value not in POST_CATEGORIES:
+        raise HTTPException(400, "말머리가 올바르지 않습니다.")
+    return value or "FREE"
+
+
 @app.post("/api/community/posts", status_code=201)
-def create_community_post(payload: CommunityPostCreate, db: Session = Depends(get_db)):
-    """게시물 작성 (원장). 사진은 data URL 리스트로 받아 사진 테이블에 따로 저장합니다."""
+def create_community_post(payload: CommunityPostCreate, request: Request, db: Session = Depends(get_db)):
+    """게시물 작성 (관리자). 사진은 data URL 리스트로 받아 사진 테이블에 따로 저장합니다."""
     photos = _parse_photo_items(payload.photos or [])
     if not payload.content.strip() and not photos:
         raise HTTPException(400, "내용 또는 사진을 입력하세요.")
-    p = CommunityPost(author=payload.author or "관리자", content=payload.content, photos=None)
+    user = request.state.user
+    p = CommunityPost(author=_admin_author(db, request), title=payload.title.strip() or None, content=payload.content,
+                      category=_post_category(payload.category), user_id=user.user_id, author_role="admin",
+                      is_pinned=payload.is_pinned, status="VISIBLE", photos=None)
     db.add(p)
     db.flush()
-    for position, (_, (mime, body)) in enumerate(photos):
-        db.add(CommunityPhoto(post_id=p.post_id, position=position, mime_type=mime, data=body))
+    _save_new_photos(db, p.post_id, photos)
     db.commit(); db.refresh(p)
-    return _single_post_out(db, p)
+    return _single_post_out(db, p, user_id=user.user_id)
 
 
 def _toggle_like(db: Session, post_id: int, user: AppUser, actor_type: str) -> dict:
     """좋아요 토글 — 사용자당 1회. 다시 누르면 취소 (기존: 누를 때마다 무제한 증가)"""
-    p = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    query = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id)
+    if actor_type == "parent":
+        query = query.filter(_parent_post_visibility(user.user_id))
+    p = query.first()
     if not p:
         raise HTTPException(404, "게시물을 찾을 수 없습니다.")
     existing = db.query(CommunityLike).filter(CommunityLike.post_id == post_id, CommunityLike.user_id == user.user_id).first()
@@ -3449,27 +4787,30 @@ def like_community_post(post_id: int, request: Request, db: Session = Depends(ge
     return _toggle_like(db, post_id, request.state.user, "admin")
 
 
-@app.delete("/api/community/posts/{post_id}", status_code=204)
-def delete_community_post(post_id: int, db: Session = Depends(get_db)):
-    p = db.query(CommunityPost).filter(CommunityPost.post_id == post_id).first()
-    if not p:
-        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+def _delete_post(db: Session, p: CommunityPost) -> None:
     # PostgreSQL 외래키: 댓글(검토 기록)·사진·좋아요를 먼저 지움
+    post_id = p.post_id
     comment_ids = [cid for (cid,) in db.query(CommunityComment.comment_id).filter(CommunityComment.post_id == post_id)]
     if comment_ids:
         db.query(CommentReview).filter(CommentReview.comment_id.in_(comment_ids)).delete(synchronize_session=False)
     db.query(CommunityLike).filter(CommunityLike.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityComment).filter(CommunityComment.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityPhoto).filter(CommunityPhoto.post_id == post_id).delete(synchronize_session=False)
-    db.delete(p); db.commit()
+    db.delete(p)
 
-@app.put("/api/community/posts/{post_id}")
-def update_community_post(post_id: int, payload: CommunityPostUpdate, db: Session = Depends(get_db)):
-    p = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+
+@app.delete("/api/community/posts/{post_id}", status_code=204)
+def delete_community_post(post_id: int, db: Session = Depends(get_db)):
+    p = db.query(CommunityPost).filter(CommunityPost.post_id == post_id).first()
     if not p:
         raise HTTPException(404, "게시물을 찾을 수 없습니다.")
-    _migrate_legacy_photos(db, [post_id])
-    existing = {pid for (pid,) in db.query(CommunityPhoto.photo_id).filter(CommunityPhoto.post_id == post_id)}
+    _delete_post(db, p)
+    db.commit()
+
+
+def _update_post(db: Session, p: CommunityPost, payload: CommunityPostUpdate) -> None:
+    _migrate_legacy_photos(db, [p.post_id])
+    existing = {pid for (pid,) in db.query(CommunityPhoto.photo_id).filter(CommunityPhoto.post_id == p.post_id)}
     items = _parse_photo_items(payload.photos or [], existing)
     if not payload.content.strip() and not items:
         raise HTTPException(400, "내용 또는 사진을 입력하세요.")
@@ -3477,22 +4818,74 @@ def update_community_post(post_id: int, payload: CommunityPostUpdate, db: Sessio
     removed = existing - kept
     if removed:
         db.query(CommunityPhoto).filter(CommunityPhoto.photo_id.in_(removed)).delete(synchronize_session=False)
-    for position, (kind, value) in enumerate(items):
-        if kind == "keep":
-            db.query(CommunityPhoto).filter(CommunityPhoto.photo_id == value).update({"position": position}, synchronize_session=False)
-        else:
-            mime, body = value
-            db.add(CommunityPhoto(post_id=post_id, position=position, mime_type=mime, data=body))
+    _save_new_photos(db, p.post_id, items)
     p.content = payload.content
+    if payload.title is not None:
+        p.title = payload.title.strip() or None
+    if payload.category is not None:
+        p.category = _post_category(payload.category)
+    p.updated_at = _now()
+
+
+@app.put("/api/community/posts/{post_id}")
+def update_community_post(post_id: int, payload: CommunityPostUpdate, request: Request, db: Session = Depends(get_db)):
+    p = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    if not p:
+        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+    if (p.author_role or "admin") == "parent" and (payload.content != p.content or payload.title not in (None, p.title)):
+        raise HTTPException(403, "학부모가 쓴 글의 내용은 수정할 수 없습니다. 고정·숨김·삭제만 할 수 있습니다.")
+    if (p.author_role or "admin") == "parent":
+        if payload.is_pinned is not None:
+            p.is_pinned = payload.is_pinned
+        if payload.category is not None:
+            p.category = _post_category(payload.category)
+    else:
+        _update_post(db, p, payload)
+        if payload.is_pinned is not None:
+            p.is_pinned = payload.is_pinned
     db.commit()
     db.refresh(p)
-    return _single_post_out(db, p)
+    return _single_post_out(db, p, user_id=request.state.user.user_id)
+
+
+class PostModeration(BaseModel):
+    decision: str = Field(max_length=10)        # APPROVED(공개) / HIDDEN(숨김)
+
+
+@app.post("/api/community/posts/{post_id}/moderate")
+def moderate_post(post_id: int, payload: PostModeration, request: Request, db: Session = Depends(get_db)):
+    if payload.decision not in ("APPROVED", "HIDDEN"):
+        raise HTTPException(400, "decision 은 APPROVED(공개) 또는 HIDDEN(숨김) 이어야 합니다.")
+    p = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    if not p:
+        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+    p.status = "VISIBLE" if payload.decision == "APPROVED" else "HIDDEN"
+    actor_type, actor_id, _ = _actor(request)
+    _log(db, actor_type, actor_id, "moderation.post", "post", post_id, payload.decision)
+    if p.user_id and p.author_role == "parent":
+        db.add(Notification(user_id=p.user_id, audience="parent", kind="POST", link="feed",
+                            title="게시글이 공개되었습니다" if p.status == "VISIBLE" else "게시글이 숨김 처리되었습니다",
+                            body=_post_title(p)))
+    db.commit()
+    return _single_post_out(db, p, user_id=request.state.user.user_id)
+
+
+@app.get("/api/community/moderation/posts")
+def moderation_posts(status: str = Query("PENDING", max_length=10), db: Session = Depends(get_db)):
+    """검토가 필요한 학부모 게시글 (자동 모니터링 결과)"""
+    query = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.author_role == "parent")
+    if status in ("PENDING", "HIDDEN", "VISIBLE"):
+        query = query.filter(CommunityPost.status == status)
+    rows = query.order_by(CommunityPost.created_at.desc()).limit(100).all()
+    return _posts_out(db, rows, False, None)
+
 
 def _comment_out(c: CommunityComment, review: Optional[CommentReview] = None, viewer_user_id: Optional[int] = None,
                  admin: bool = False) -> dict:
     out = {"comment_id": c.comment_id, "post_id": c.post_id, "author": c.author, "content": c.content,
+           "author_role": "parent" if c.user_id else "admin",
            "created_at": c.created_at.isoformat() if c.created_at else None,
-           "mine": bool(viewer_user_id and c.user_id == viewer_user_id),
+           "mine": bool(viewer_user_id and (c.user_id == viewer_user_id or c.admin_user_id == viewer_user_id)),
            "pending_review": bool(review and review.flagged and review.decision is None)}
     if admin:
         out["from_parent"] = c.user_id is not None
@@ -3510,9 +4903,10 @@ def _comments_with_reviews(db: Session, post_id: int):
 
 
 @app.get("/api/community/posts/{post_id}/comments")
-def list_community_comments(post_id: int, db: Session = Depends(get_db)):
+def list_community_comments(post_id: int, request: Request, db: Session = Depends(get_db)):
     """관리자: 모든 댓글 + 자동 검토 결과"""
-    return [_comment_out(c, r, admin=True) for c, r in _comments_with_reviews(db, post_id)]
+    return [_comment_out(c, r, viewer_user_id=request.state.user.user_id, admin=True)
+            for c, r in _comments_with_reviews(db, post_id)]
 
 
 def _parent_visible_comments(db: Session, post_id: int, user_id: int) -> List[dict]:
@@ -3528,15 +4922,23 @@ def _parent_visible_comments(db: Session, post_id: int, user_id: int) -> List[di
 
 
 @app.post("/api/community/posts/{post_id}/comments", status_code=201)
-def create_community_comment(post_id: int, payload: CommunityCommentCreate, db: Session = Depends(get_db)):
+def create_community_comment(post_id: int, payload: CommunityCommentCreate, request: Request, db: Session = Depends(get_db)):
     content = payload.content.strip()
     if not content:
         raise HTTPException(400, "댓글 내용을 입력하세요.")
-    if not db.query(CommunityPost.post_id).filter(CommunityPost.post_id == post_id).first():
+    post = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    if not post:
         raise HTTPException(404, "게시물을 찾을 수 없습니다.")
-    c = CommunityComment(post_id=post_id, author=payload.author or "관리자", content=content)
-    db.add(c); db.commit(); db.refresh(c)
-    return _comment_out(c, admin=True)
+    user = request.state.user
+    c = CommunityComment(post_id=post_id, author=_admin_author(db, request), content=content,
+                         author_role="admin", admin_user_id=user.user_id)
+    db.add(c); db.flush()
+    if post.user_id and post.author_role == "parent":
+        db.add(Notification(user_id=post.user_id, audience="parent", kind="COMMENT", link="feed",
+                            title=f"내 글에 관리자 댓글: {_post_title(post)[:40]}", body=content[:120]))
+    db.commit(); db.refresh(c)
+    return _comment_out(c, viewer_user_id=user.user_id, admin=True)
+
 
 @app.delete("/api/community/comments/{comment_id}", status_code=204)
 def delete_community_comment(comment_id: int, db: Session = Depends(get_db)):
@@ -3545,6 +4947,83 @@ def delete_community_comment(comment_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "댓글을 찾을 수 없습니다.")
     db.query(CommentReview).filter(CommentReview.comment_id == comment_id).delete(synchronize_session=False)
     db.delete(c); db.commit()
+
+
+# ---------- 커뮤니티 멤버 관리 (관리자) — 경고 · 채팅 금지 · 강퇴 ----------
+class SanctionRequest(BaseModel):
+    action: str = Field(max_length=10)        # warn / mute / unmute / ban / unban
+    days: int = Field(3, ge=1, le=365)        # mute 기간(일)
+    reason: str = Field("", max_length=200)
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = (email or "").partition("@")
+    return f"{local[:2]}{'*' * max(1, len(local) - 2)}@{domain}" if domain else "-"
+
+
+@app.get("/api/community/members")
+def community_members(db: Session = Depends(get_db)):
+    rows = (db.query(FacilityMember, AppUser.name, AppUser.email)
+              .join(AppUser, AppUser.user_id == FacilityMember.user_id)
+              .order_by(FacilityMember.status.desc(), FacilityMember.joined_at.desc()).limit(1000).all())
+    user_ids = [m.user_id for m, _, _ in rows]
+    kids: dict = {}
+    for uid, name in (db.query(ParentLink.user_id, Member.name).join(Member, Member.member_id == ParentLink.member_id)
+                        .filter(ParentLink.user_id.in_(user_ids or [-1])).all()):
+        kids.setdefault(uid, []).append(name)
+    posts = dict(db.query(CommunityPost.user_id, func.count(CommunityPost.post_id))
+                   .filter(CommunityPost.author_role == "parent", CommunityPost.user_id.in_(user_ids or [-1]))
+                   .group_by(CommunityPost.user_id).all())
+    comments = dict(db.query(CommunityComment.user_id, func.count(CommunityComment.comment_id))
+                      .filter(CommunityComment.user_id.in_(user_ids or [-1])).group_by(CommunityComment.user_id).all())
+    hidden = dict(db.query(CommunityComment.user_id, func.count(CommentReview.comment_id))
+                    .join(CommentReview, CommentReview.comment_id == CommunityComment.comment_id)
+                    .filter(CommunityComment.user_id.in_(user_ids or [-1]), CommentReview.decision == "HIDDEN")
+                    .group_by(CommunityComment.user_id).all())
+    now = _now()
+    return [{"membership_id": m.membership_id, "nickname": m.nickname or name, "name": name,
+             "email": _mask_email(email), "children": kids.get(m.user_id, []), "status": m.status,
+             "muted_until": m.muted_until.isoformat(timespec="minutes") if m.muted_until and m.muted_until > now else None,
+             "warnings": m.warnings or 0, "sanction_note": m.sanction_note,
+             "post_count": int(posts.get(m.user_id, 0)), "comment_count": int(comments.get(m.user_id, 0)),
+             "hidden_count": int(hidden.get(m.user_id, 0)),
+             "joined_at": m.joined_at.isoformat(timespec="minutes") if m.joined_at else None,
+             "last_seen_at": m.last_seen_at.isoformat(timespec="minutes") if m.last_seen_at else None}
+            for m, name, email in rows]
+
+
+@app.post("/api/community/members/{membership_id}/sanction")
+def sanction_member(membership_id: int, payload: SanctionRequest, request: Request, db: Session = Depends(get_db),
+                    account: AdminAccount = Depends(owner_account)):
+    m = db.query(FacilityMember).filter(FacilityMember.membership_id == membership_id).first()
+    if not m:
+        raise HTTPException(404, "멤버를 찾을 수 없습니다.")
+    reason = payload.reason.strip()
+    if payload.action == "warn":
+        m.warnings = (m.warnings or 0) + 1
+        title, body = "커뮤니티 이용 경고", reason or "커뮤니티 이용 규칙을 지켜 주세요."
+    elif payload.action == "mute":
+        m.muted_until = _now() + timedelta(days=payload.days)
+        title = f"커뮤니티 글·댓글 작성이 {payload.days}일간 제한되었습니다"
+        body = reason or "커뮤니티 이용 규칙 위반"
+    elif payload.action == "unmute":
+        m.muted_until = None
+        title, body = "커뮤니티 글·댓글 제한이 해제되었습니다", ""
+    elif payload.action == "ban":
+        m.status = "BANNED"
+        title, body = "시설 이용이 제한되었습니다", reason
+    elif payload.action == "unban":
+        m.status = "ACTIVE"
+        title, body = "시설 이용 제한이 해제되었습니다", ""
+    else:
+        raise HTTPException(400, "action 은 warn / mute / unmute / ban / unban 중 하나여야 합니다.")
+    if reason:
+        m.sanction_note = reason[:200]
+    db.add(Notification(user_id=m.user_id, audience="parent", kind="SANCTION", title=title[:200], body=body[:1000], link="feed"))
+    _log(db, "admin", account.account_id, f"member.{payload.action}", "membership", m.membership_id, reason[:100])
+    db.commit()
+    return {"membership_id": m.membership_id, "status": m.status, "warnings": m.warnings,
+            "muted_until": m.muted_until.isoformat(timespec="minutes") if m.muted_until else None}
 
 
 # =====================================================================
@@ -3782,16 +5261,10 @@ class InvoiceBulkCreate(BaseModel):
     due_date: Optional[date] = None
 
 
-def _tuition_for(member_id: int, class_ids: List[int], payment: dict) -> int:
-    """반별 수강료가 설정된 반들의 합계, 없으면 기본 수강료"""
-    fees = {}
-    for item in payment.get("classFees") or []:
-        try:
-            fees[int(item.get("classId"))] = int(item.get("fee") or 0)
-        except (TypeError, ValueError, AttributeError):
-            continue
-    total = sum(fees.get(cid, 0) for cid in class_ids)
-    return total if total > 0 else int(payment.get("baseTuitionFee") or 0)
+def _tuition_for(class_ids: List[int], classes: dict, payment: dict) -> int:
+    """수강료 = 수강 중인 수업별 수강료 합계 (수업 수강료 → 반별 설정 → 기본 수강료). 수강 수업이 없으면 기본 수강료"""
+    fees = [_class_fee(classes[cid], payment) for cid in class_ids if cid in classes]
+    return sum(fees) if fees else int(payment.get("baseTuitionFee") or 0)
 
 
 @app.post("/api/invoices/bulk", status_code=201)
@@ -3812,12 +5285,13 @@ def bulk_create_invoices(payload: InvoiceBulkCreate, request: Request, db: Sessi
     for member_id, class_id in db.query(Enrollment.member_id, Enrollment.class_id).filter(Enrollment.member_id.in_(ids)):
         class_map.setdefault(member_id, []).append(class_id)
     payment = _read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS)
+    classes = {c.class_id: c for c in db.query(Class).all()}
     created, skipped, total, no_fee = 0, 0, 0, 0
     for m in members:
         if m.member_id in already:
             skipped += 1
             continue
-        amount = payload.amount or _tuition_for(m.member_id, class_map.get(m.member_id, []), payment)
+        amount = payload.amount or _tuition_for(class_map.get(m.member_id, []), classes, payment)
         if amount <= 0:
             no_fee += 1
             continue
@@ -3940,9 +5414,9 @@ def unpaid_members(days: int = 60, db: Session = Depends(get_db)):
 #   기존 대시보드의 증감률·수납률·미납 금액은 고정값/가짜 계산이었음 → 실제 데이터로 계산하고 지표 정의를 함께 내려 줌
 # =====================================================================
 INSIGHT_DEFINITIONS = {
-    "attendance_rate_today": "오늘 출석률 = (출석 + 지각) ÷ 오늘 수업이 있는 재원생 수. 오늘 수업이 없으면 ÷ 오늘 출결 기록 수",
-    "attendance_rate_30d": "30일 출석률 = 최근 30일 출결 기록 중 (출석 + 지각) 비율 (기록 없는 날 제외)",
-    "collection_rate": "이달 수납률 = 이번 달 발행된 청구서 중 납부 완료 금액 ÷ 발행 금액",
+    "attendance_rate_today": "오늘 출석률 = (출석 + 지각) ÷ 오늘 열리는 수업의 수강 인원(학생×수업). 오늘 수업이 없으면 ÷ 오늘 출결 기록 수",
+    "attendance_rate_30d": "30일 출석률 = 최근 30일 수업별 출결 기록 중 (출석 + 지각) 비율 (기록 없는 날 제외)",
+    "collection_rate": "이달 수납률 = 이번 달 청구분(납부 기한이 이번 달, 기한이 없으면 이번 달 발행) 중 납부 완료 금액 ÷ 청구 금액",
     "unpaid": "미납 = 상태가 '미납'인 청구서 (연체 = 납부 기한이 지난 미납)",
     "member_change": "재원생 증감 = 이번 달 신규 등록 − 이번 달 퇴원",
     "risk": "이탈 위험 = 최근 30일 출석률 70% 미만(기록 4건 이상), 최근 3회 연속 결석, 연체 청구서 중 해당 항목 점수 합",
@@ -3976,17 +5450,17 @@ def dashboard_insights(db: Session = Depends(get_db)):
     left_this_month = (db.query(func.count(Member.member_id))
                          .filter(Member.status == "WITHDRAWN", Member.withdrawal_date >= month_start).scalar() or 0)
 
-    # --- 출결: 최근 60일을 한 번에 읽어 일자별·학생별로 집계 ---
+    # --- 출결: 최근 60일을 한 번에 읽어 일자별·학생별로 집계 (v9: 기록 1건 = 학생 × 수업 × 날짜) ---
     since60 = today - timedelta(days=59)
-    att_rows = (db.query(Attendance.member_id, Attendance.attendance_date, Attendance.status)
+    att_rows = (db.query(Attendance.member_id, Attendance.attendance_date, Attendance.status, Attendance.class_id)
                   .filter(Attendance.attendance_date >= since60).all())
     by_day: dict = {}
     by_member: dict = {}
-    for member_id, day, status in att_rows:
+    for member_id, day, status, class_id in att_rows:
         by_day.setdefault(day, {"PRESENT": 0, "LATE": 0, "ABSENT": 0})
         if status in by_day[day]:
             by_day[day][status] += 1
-        by_member.setdefault(member_id, []).append((day, status))
+        by_member.setdefault(member_id, []).append((day, status, class_id))
 
     def window_rate(start: date, end: date):
         present = total = 0
@@ -4008,39 +5482,65 @@ def dashboard_insights(db: Session = Depends(get_db)):
                         "present": c["PRESENT"], "late": c["LATE"], "absent": c["ABSENT"], "total": c["PRESENT"] + c["LATE"]})
         return out
 
+    # 학생·수업·날짜 → 상태 (수업 무관 기록은 그날 그 학생의 모든 수업에 적용)
+    class_status: dict = {}
+    day_status: dict = {}
+    for member_id, records in by_member.items():
+        for day, st, class_id in records:
+            if class_id:
+                class_status[(member_id, class_id, day)] = st
+            else:
+                day_status[(member_id, day)] = st
+
+    def status_for(member_id, class_id, day):
+        return class_status.get((member_id, class_id, day)) or day_status.get((member_id, day))
+
     # --- 반별: 오늘 수업 여부·오늘 출석률·30일 출석률 ---
     classes = (db.query(Class).options(selectinload(Class.enrollments).selectinload(Enrollment.member)
                                        .load_only(Member.member_id, Member.status)).all())
-    today_status = {mid: st for mid, day, st in att_rows if day == today}
-    expected_today: set = set()
+    expected_today = []          # (학생, 수업) — 오늘 수업이 있는 수강 쌍
     class_rows = []
     for c in classes:
         members = [e.member_id for e in c.enrollments if e.member and e.member.status == "ACTIVE"]
         sessions = _sessions_on(c, today)
         if sessions:
-            expected_today.update(members)
-        present_today = sum(1 for mid in members if today_status.get(mid) in ("PRESENT", "LATE"))
+            expected_today.extend((mid, c.class_id) for mid in members)
+        present_today = sum(1 for mid in members if sessions and status_for(mid, c.class_id, today) in ("PRESENT", "LATE"))
         p30 = t30 = 0
         for mid in members:
-            for day, st in by_member.get(mid, []):
-                if day >= today - timedelta(days=29):
+            days = {d for d, _, cid in by_member.get(mid, []) if (cid in (None, c.class_id)) and d >= today - timedelta(days=29)}
+            for d in days:
+                st = status_for(mid, c.class_id, d)
+                if st:
                     t30 += 1
                     p30 += st in ("PRESENT", "LATE")
         if c.end_date and c.end_date < today:
             continue
-        class_rows.append({"class_id": c.class_id, "name": c.name, "enrolled": len(members),
+        class_rows.append({"class_id": c.class_id, "name": c.name, "color": _class_color(c), "enrolled": len(members),
                            "scheduled_today": bool(sessions),
                            "time_today": f"{sessions[0]['start']}~{sessions[0]['end']}" if sessions and sessions[0]["start"] else None,
                            "present_today": present_today,
+                           "checked_today": sum(1 for mid in members if sessions and status_for(mid, c.class_id, today)),
                            "rate_today": _pct(present_today, len(members)) if sessions else None,
                            "rate_30d": _pct(p30, t30)})
-    today_counts = by_day.get(today, {"PRESENT": 0, "LATE": 0, "ABSENT": 0})
+    if expected_today:
+        today_states = [status_for(mid, cid, today) for mid, cid in expected_today]
+        today_counts = {k: sum(1 for st in today_states if st == k) for k in ATTENDANCE_STATUSES}
+        recorded_today = sum(1 for st in today_states if st)
+        denominator_today = len(expected_today)
+    else:
+        today_counts = by_day.get(today, {"PRESENT": 0, "LATE": 0, "ABSENT": 0})
+        recorded_today = sum(today_counts.values())
+        denominator_today = recorded_today
     attended_today = today_counts["PRESENT"] + today_counts["LATE"]
-    recorded_today = sum(today_counts.values())
-    denominator_today = len(expected_today) or recorded_today
+    expected_members = len({mid for mid, _ in expected_today})
 
-    # --- 청구·수납 ---
-    month_invoices = db.query(Invoice.amount, Invoice.status).filter(Invoice.created_at >= datetime.combine(month_start, time())).all()
+    # --- 청구·수납 --- 이달 청구분 = 납부 기한이 이번 달인 청구서 (기한이 없으면 발행일 기준)
+    next_month_start = _month_start(today, 1)
+    month_invoices = (db.query(Invoice.amount, Invoice.status)
+                        .filter(or_(and_(Invoice.due_date >= month_start, Invoice.due_date < next_month_start),
+                                    and_(Invoice.due_date.is_(None), Invoice.created_at >= datetime.combine(month_start, time()),
+                                         Invoice.created_at < datetime.combine(next_month_start, time())))).all())
     billed = sum(a for a, _ in month_invoices)
     collected = sum(a for a, st in month_invoices if st == "PAID")
     unpaid_rows = (db.query(Invoice.member_id, Invoice.amount, Invoice.due_date)
@@ -4081,7 +5581,7 @@ def dashboard_insights(db: Session = Depends(get_db)):
     risks = []
     for member_id in active_ids:
         records = sorted(by_member.get(member_id, []), key=lambda x: x[0])
-        recent = [st for day, st in records if day >= today - timedelta(days=29)]
+        recent = [st for day, st, _ in records if day >= today - timedelta(days=29)]
         score, reasons = 0, []
         if len(recent) >= 4:
             rate = sum(st in ("PRESENT", "LATE") for st in recent) / len(recent)
@@ -4089,7 +5589,7 @@ def dashboard_insights(db: Session = Depends(get_db)):
                 score += 40 if rate < 0.5 else 25
                 reasons.append(f"30일 출석률 {round(rate * 100)}%")
         streak = 0
-        for _, st in reversed(records):
+        for _, st, _cid in reversed(records):
             if st != "ABSENT":
                 break
             streak += 1
@@ -4120,7 +5620,7 @@ def dashboard_insights(db: Session = Depends(get_db)):
                     "change": int(new_this_month) - int(left_this_month)},
         "attendance": {
             "today": {"present": today_counts["PRESENT"], "late": today_counts["LATE"], "absent": today_counts["ABSENT"],
-                      "recorded": recorded_today, "expected": len(expected_today),
+                      "recorded": recorded_today, "expected": len(expected_today), "expected_members": expected_members,
                       "unchecked": max(0, len(expected_today) - recorded_today) if expected_today else None,
                       "rate": _pct(attended_today, denominator_today)},
             "rate_30d": rate_30, "rate_prev_30d": rate_prev_30,
@@ -4129,6 +5629,7 @@ def dashboard_insights(db: Session = Depends(get_db)):
         },
         "classes": sorted(class_rows, key=lambda x: (not x["scheduled_today"], x["name"])),
         "billing": {"month_billed": billed, "month_collected": collected, "collection_rate": _pct(collected, billed),
+                    "month_invoices": len(month_invoices), "month_paid_invoices": sum(1 for _, st in month_invoices if st == "PAID"),
                     "unpaid_total": unpaid_total, "unpaid_count": len(unpaid_rows), "unpaid_members": len(unpaid_members),
                     "overdue_members": len(overdue_ids)},
         "revenue": {"months": months, "this_month": this_rev, "last_month": last_rev,
@@ -4147,8 +5648,8 @@ def dashboard_insights(db: Session = Depends(get_db)):
 # =====================================================================
 # 수업 (classes) API
 # =====================================================================
-def _class_to_out(c: Class, with_students: bool = False) -> dict:
-    student_count = len(c.enrollments) if c.enrollments is not None else 0
+def _class_to_out(c: Class, with_students: bool = False, payment: Optional[dict] = None) -> dict:
+    student_count = len([e for e in c.enrollments if e.member and e.member.status == "ACTIVE"]) if c.enrollments is not None else 0
     out = {
         "class_id":     c.class_id,
         "name":         c.name,
@@ -4160,6 +5661,9 @@ def _class_to_out(c: Class, with_students: bool = False) -> dict:
         "end_time":     c.end_time.strftime("%H:%M")   if c.end_time   else None,
         "description":  c.description,
         "color_index":  c.color_index or 0,
+        "color":        _class_color(c),
+        "monthly_fee":  c.monthly_fee,
+        "fee":          _class_fee(c, payment) if payment is not None else (c.monthly_fee or 0),
         "student_count": student_count,
         "students": [],
         "schedules": _class_schedule(c),
@@ -4177,46 +5681,52 @@ def _class_to_out(c: Class, with_students: bool = False) -> dict:
     return out
 
 
+def _classes_with_students(db: Session):
+    # [PERF] 수업 → 수강 → 학생을 2번의 IN 쿼리로 미리 로딩 (기존: 수업·수강마다 지연 로딩)
+    return (db.query(Class)
+              .options(selectinload(Class.enrollments).selectinload(Enrollment.member)
+                       .load_only(Member.member_id, Member.name, Member.gender, Member.age, Member.status)))
+
+
 @app.get("/api/classes", response_model=List[ClassOut])
 def list_classes(db: Session = Depends(get_db)):
-    """모든 수업 목록 (수강 인원수 포함)"""
-    # [PERF] 수업 → 수강 → 학생을 2번의 IN 쿼리로 미리 로딩 (기존: 수업·수강마다 지연 로딩)
-    rows = (db.query(Class)
-              .options(selectinload(Class.enrollments).selectinload(Enrollment.member)
-                       .load_only(Member.member_id, Member.name, Member.gender, Member.age, Member.status))
-              .order_by(Class.class_id).all())
-    return [_class_to_out(c, with_students=True) for c in rows]
+    """모든 수업 목록 (수강 인원수·적용 수강료 포함)"""
+    payment = _read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS)
+    return [_class_to_out(c, with_students=True, payment=payment) for c in _classes_with_students(db).order_by(Class.class_id).all()]
 
 
 @app.get("/api/classes/{class_id}", response_model=ClassOut)
 def get_class(class_id: int, db: Session = Depends(get_db)):
     """수업 1개 상세 (수강 학생 목록 포함)"""
-    c = (db.query(Class)
-           .options(selectinload(Class.enrollments).selectinload(Enrollment.member)
-                    .load_only(Member.member_id, Member.name, Member.gender, Member.age, Member.status))
-           .filter(Class.class_id == class_id).first())
+    c = _classes_with_students(db).filter(Class.class_id == class_id).first()
     if not c:
         raise HTTPException(404, "수업을 찾을 수 없습니다.")
-    return _class_to_out(c, with_students=True)
+    return _class_to_out(c, with_students=True, payment=_read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS))
 
 
 def _class_data(payload: ClassCreate) -> dict:
     """요청 → 컬럼 값. schedules 가 오면 요일별 시간을 JSON 으로 저장하고, 이전 컬럼(days/start/end)도 함께 채움"""
-    data = payload.model_dump(exclude={"schedules"})
-    if payload.end_date < payload.start_date:
+    data = payload.model_dump(exclude={"schedules", "student_ids"})
+    if payload.start_date and payload.end_date and payload.end_date < payload.start_date:
         raise HTTPException(400, "운영 종료일이 시작일보다 빠릅니다.")
     if payload.schedules is not None:
-        items = []
-        for item in payload.schedules[:14]:
+        items, seen = [], set()
+        for item in payload.schedules[:28]:
             day = _normalize_day(item.day)
             if day not in WEEKDAY_CODES and day != "DAILY":
                 raise HTTPException(400, f"요일 값이 올바르지 않습니다: {item.day}")
             start, end = _parse_time(item.start), _parse_time(item.end)
             if start and end and end <= start:
-                raise HTTPException(400, f"{item.day} 수업의 종료 시간이 시작 시간보다 빠릅니다.")
+                raise HTTPException(400, f"{item.day} 수업의 종료 시간이 시작 시간보다 빨라야 합니다.")
+            key = (day, start, end)
+            if key in seen:
+                continue
+            seen.add(key)
             items.append({"day": day, "start": start.strftime("%H:%M") if start else "", "end": end.strftime("%H:%M") if end else ""})
+        order = {d: i for i, d in enumerate(["DAILY"] + WEEKDAY_CODES)}
+        items.sort(key=lambda i: (order.get(i["day"], 9), i["start"]))
         data["schedule_detail"] = json.dumps(items, ensure_ascii=False) if items else None
-        data["days_of_week"] = ",".join(i["day"] for i in items)
+        data["days_of_week"] = ",".join(dict.fromkeys(i["day"] for i in items))
         data["start_time"] = _parse_time(items[0]["start"]) if items else None
         data["end_time"] = _parse_time(items[0]["end"]) if items else None
     else:
@@ -4226,11 +5736,33 @@ def _class_data(payload: ClassCreate) -> dict:
     return data
 
 
+def _sync_roster(db: Session, cls: Class, student_ids: Optional[List[int]]) -> None:
+    """수업 저장 시 받은 명단으로 수강생을 맞춤 (보내지 않으면 그대로)"""
+    if student_ids is None:
+        return
+    wanted = set(student_ids)
+    valid = {mid for (mid,) in db.query(Member.member_id).filter(Member.member_id.in_(wanted or {-1}))}
+    if wanted - valid:
+        raise HTTPException(400, "존재하지 않는 학생이 명단에 있습니다.")
+    current = {e.member_id: e for e in db.query(Enrollment).filter(Enrollment.class_id == cls.class_id)}
+    for member_id in valid - set(current):
+        db.add(Enrollment(member_id=member_id, class_id=cls.class_id))
+    # 화면의 명단은 재원생만 보여 주므로, 퇴원생의 수강 기록은 명단에 없어도 지우지 않음
+    active = {mid for (mid,) in db.query(Member.member_id).filter(Member.member_id.in_(list(current) or [-1]),
+                                                                  Member.status == "ACTIVE")}
+    for member_id, e in current.items():
+        if member_id not in wanted and member_id in active:
+            db.delete(e)
+
+
 @app.post("/api/classes", response_model=ClassOut, status_code=201)
 def create_class(payload: ClassCreate, db: Session = Depends(get_db)):
     c = Class(**_class_data(payload))
-    db.add(c); db.commit(); db.refresh(c)
-    return _class_to_out(c, with_students=True)
+    db.add(c); db.flush()
+    _sync_roster(db, c, payload.student_ids)
+    db.commit()
+    db.expire_all()
+    return get_class(c.class_id, db)
 
 
 @app.put("/api/classes/{class_id}", response_model=ClassOut)
@@ -4240,8 +5772,10 @@ def update_class(class_id: int, payload: ClassUpdate, db: Session = Depends(get_
         raise HTTPException(404, "수업을 찾을 수 없습니다.")
     for k, v in _class_data(payload).items():
         setattr(c, k, v)
-    db.commit(); db.refresh(c)
-    return _class_to_out(c, with_students=True)
+    _sync_roster(db, c, payload.student_ids)
+    db.commit()
+    db.expire_all()
+    return get_class(class_id, db)
 
 
 @app.delete("/api/classes/{class_id}", status_code=204)
@@ -4249,8 +5783,13 @@ def delete_class(class_id: int, db: Session = Depends(get_db)):
     c = db.query(Class).filter(Class.class_id == class_id).first()
     if not c:
         raise HTTPException(404, "수업을 찾을 수 없습니다.")
-    # PostgreSQL 외래키: 과제를 먼저 지움 (수강 기록은 relationship cascade 로 함께 삭제)
+    # PostgreSQL 외래키: 과제(첨부·제출 포함)를 먼저 지움 (수강 기록은 relationship cascade 로 함께 삭제)
+    assignment_ids = [aid for (aid,) in db.query(Assignment.assignment_id).filter(Assignment.class_id == class_id)]
+    if assignment_ids:
+        db.query(AssignmentFile).filter(AssignmentFile.assignment_id.in_(assignment_ids)).delete(synchronize_session=False)
+        db.query(AssignmentSubmission).filter(AssignmentSubmission.assignment_id.in_(assignment_ids)).delete(synchronize_session=False)
     db.query(Assignment).filter(Assignment.class_id == class_id).delete(synchronize_session=False)
+    # 그 수업의 출결 기록은 학생 출결 이력으로 남겨 둡니다(class_id 는 외래키가 아니라 그대로 보존)
     db.delete(c); db.commit()
 
 
@@ -4296,7 +5835,8 @@ def list_member_classes(member_id: int, db: Session = Depends(get_db)):
               .filter(Enrollment.member_id == member_id)
               .order_by(Class.class_id)
               .all())
-    return [_class_to_out(c, with_students=False) for c in rows]
+    payment = _read_settings(db, "payment_settings", DEFAULT_PAYMENT_SETTINGS)
+    return [_class_to_out(c, with_students=False, payment=payment) for c in rows]
 
 
 # ---------- 과제 (수업관리 상세 대시보드) ----------
@@ -4780,30 +6320,40 @@ def parent_children(db: Session = Depends(get_db), user: AppUser = Depends(curre
     ids = [m.member_id for m in members]
     class_map: dict = {}
     if ids:
-        for member_id, class_name in (db.query(Enrollment.member_id, Class.name)
-                                        .join(Class, Class.class_id == Enrollment.class_id)
-                                        .filter(Enrollment.member_id.in_(ids)).all()):
-            class_map.setdefault(member_id, []).append(class_name)
-    today_rows = {a.member_id: a for a in db.query(Attendance).filter(
-        Attendance.attendance_date == _today(), Attendance.member_id.in_(ids or [-1]))}
+        for member_id, class_id, class_name, color in (db.query(Enrollment.member_id, Class.class_id, Class.name, Class.color)
+                                                         .join(Class, Class.class_id == Enrollment.class_id)
+                                                         .filter(Enrollment.member_id.in_(ids)).all()):
+            class_map.setdefault(member_id, []).append({"class_id": class_id, "name": class_name,
+                                                        "color": color or CLASS_PALETTE[class_id % len(CLASS_PALETTE)]})
+    class_names = dict(db.query(Class.class_id, Class.name).all())
+    today_rows: dict = {}
+    for a in db.query(Attendance).filter(Attendance.attendance_date == _today(), Attendance.member_id.in_(ids or [-1])):
+        today_rows.setdefault(a.member_id, []).append(a)
     unpaid = _unpaid_by_member(db, ids)
 
-    def today_out(a):
-        if not a:
-            return None
-        return {"status": a.status, "check_in_time": a.check_in_time.strftime("%H:%M") if a.check_in_time else None,
+    def row_out(a):
+        return {"status": a.status, "class_id": a.class_id, "class_name": class_names.get(a.class_id),
+                "check_in_time": a.check_in_time.strftime("%H:%M") if a.check_in_time else None,
                 "check_out_time": a.check_out_time.strftime("%H:%M") if a.check_out_time else None}
+
+    def today_out(rows):
+        if not rows:
+            return None
+        best = max(rows, key=lambda r: _STATUS_RANK.get(r.status, 0))
+        return row_out(best)
 
     return [{"member_id": m.member_id, "name": m.name, "status": m.status,
              "enrollment_date": m.enrollment_date.isoformat() if m.enrollment_date else None,
-             "classes": class_map.get(m.member_id, []),
+             "classes": [c["name"] for c in class_map.get(m.member_id, [])],
+             "class_items": class_map.get(m.member_id, []),
              "today": today_out(today_rows.get(m.member_id)),
+             "today_classes": [row_out(a) for a in today_rows.get(m.member_id, [])],
              "unpaid_amount": unpaid.get(m.member_id, (0, 0))[0]} for m in members]
 
 
 @app.post("/api/parent/children", status_code=201)
 def parent_link_child(payload: ParentChildLink, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
-    """자녀 연결: 자녀 이름 + 학원에 등록된 보호자 연락처가 일치해야 함.
+    """(이미 시설에 등록된 학생) 자녀 연결: 자녀 이름 + 시설에 등록된 보호자 연락처가 일치해야 함.
     로그인한 Google 계정에만 연결되고, 실패 5회 시 30분 잠금(무차별 대입 방지)."""
     row = db.query(AppUser).filter(AppUser.user_id == user.user_id).first()
     _ensure_not_locked(row)
@@ -4818,7 +6368,7 @@ def parent_link_child(payload: ParentChildLink, db: Session = Depends(get_db), u
                     .first())
     if not member:
         _record_failed_attempt(db, row)
-        raise HTTPException(404, "일치하는 학생을 찾지 못했습니다. 이름과 학원에 등록한 보호자 연락처를 확인하세요.")
+        raise HTTPException(404, "일치하는 학생을 찾지 못했습니다. 이름과 시설에 등록한 보호자 연락처를 확인하세요.")
     _clear_failed_attempts(row)
     if not db.query(ParentLink).filter(ParentLink.user_id == user.user_id, ParentLink.member_id == member.member_id).first():
         db.add(ParentLink(user_id=user.user_id, member_id=member.member_id))
@@ -4852,19 +6402,20 @@ def parent_attendances(member_id: int, days: int = Query(30, ge=1, le=365),
                        db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
     _require_linked(db, user, member_id)
     since = _today() - timedelta(days=days)
-    rows = (db.query(Attendance).filter(Attendance.member_id == member_id, Attendance.attendance_date >= since)
-              .order_by(Attendance.attendance_date.desc()).all())
-    present = sum(1 for a in rows if a.status == "PRESENT")
-    late = sum(1 for a in rows if a.status == "LATE")
+    rows = (db.query(Attendance, Class.name).outerjoin(Class, Class.class_id == Attendance.class_id)
+              .filter(Attendance.member_id == member_id, Attendance.attendance_date >= since)
+              .order_by(Attendance.attendance_date.desc(), Attendance.check_in_time.desc()).limit(1000).all())
+    present = sum(1 for a, _ in rows if a.status == "PRESENT")
+    late = sum(1 for a, _ in rows if a.status == "LATE")
     return {
         "member_id": member_id, "days": days,
-        # 출석률 정의(대시보드와 동일): 기간 내 출결 기록 중 (출석 + 지각) 비율 (기록 없는 날은 제외)
+        # 출석률 정의(대시보드와 동일): 기간 내 (수업별) 출결 기록 중 (출석 + 지각) 비율 (기록 없는 수업은 제외)
         "summary": {"records": len(rows), "present": present, "late": late,
-                    "absent": sum(1 for a in rows if a.status == "ABSENT"),
+                    "absent": sum(1 for a, _ in rows if a.status == "ABSENT"),
                     "rate": _pct(present + late, len(rows))},
-        "items": [{"date": a.attendance_date.isoformat(), "status": a.status,
+        "items": [{"date": a.attendance_date.isoformat(), "status": a.status, "class_name": class_name,
                    "check_in_time": a.check_in_time.strftime("%H:%M") if a.check_in_time else None}
-                  for a in rows],
+                  for a, class_name in rows],
     }
 
 
@@ -4923,7 +6474,10 @@ def parent_notices_read(payload: NoticeReadRequest, db: Session = Depends(get_db
     ids = set(payload.notice_ids)
     already = {nid for (nid,) in db.query(NoticeRead.notice_id).filter(NoticeRead.user_id == user.user_id,
                                                                        NoticeRead.notice_id.in_(ids or {-1}))}
-    valid = {nid for (nid,) in db.query(Notice.notice_id).filter(Notice.notice_id.in_(ids - already or {-1}))}
+    my_classes = _parent_class_children(db, user)
+    valid = {nid for (nid,) in db.query(Notice.notice_id).filter(
+        Notice.notice_id.in_(ids - already or {-1}),
+        or_(Notice.class_id.is_(None), Notice.class_id.in_(list(my_classes) or [-1])))}
     for notice_id in valid:
         db.add(NoticeRead(notice_id=notice_id, user_id=user.user_id))
     if valid:
@@ -4932,17 +6486,57 @@ def parent_notices_read(payload: NoticeReadRequest, db: Session = Depends(get_db
     return {"marked": len(valid)}
 
 
-# ---------- v8.1 학부모 요약·알림함 (10초마다 폴링) ----------
+# ---------- 학부모 요약·알림함 (폴링) ----------
+def _membership_out(m: Optional[FacilityMember]) -> Optional[dict]:
+    if not m:
+        return None
+    muted = m.muted_until if m.muted_until and m.muted_until > _now() else None
+    return {"membership_id": m.membership_id, "nickname": m.nickname, "status": m.status,
+            "muted_until": muted.isoformat(timespec="minutes") if muted else None, "warnings": m.warnings or 0}
+
+
 @app.get("/api/parent/summary")
-def parent_summary(db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
-    brand = _brand(db)
+def parent_summary(request: Request, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    facility = current_facility(request)
+    membership = getattr(request.state, "membership", None)
     academy = _read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS)
     unread = (db.query(func.count(Notification.notification_id))
                 .filter(Notification.user_id == user.user_id, Notification.audience == "parent",
                         Notification.is_read.is_(False)).scalar() or 0)
-    return {"facility": {"name": brand.get("name"), "branch": brand.get("branch"), "logo": brand.get("logo"),
-                         "phone": academy.get("phone") or ""},
+    if membership and (not membership.last_seen_at or _now() - membership.last_seen_at > timedelta(minutes=10)):
+        db.info["no_sync"] = True                  # 접속 시각 갱신은 데이터 변경 신호로 치지 않음
+        membership.last_seen_at = _now()
+        db.commit()
+    return {"facility": {"facility_id": facility.facility_id, "name": facility.name, "branch": facility.branch,
+                         "logo": facility.logo, "facility_type": facility.facility_type, "region": facility.region,
+                         "phone": facility.phone or academy.get("phone") or "", "address": facility.address or ""},
+            "membership": _membership_out(membership),
+            "data_version": int(facility.data_version or 0),
+            "linked_children": len(_linked_member_ids(db, user)),
             "unread_notifications": int(unread), "server_time": _now().isoformat(timespec="seconds")}
+
+
+class MembershipUpdate(BaseModel):
+    nickname: str = Field(min_length=2, max_length=20)
+
+
+@app.put("/api/parent/membership")
+def parent_update_membership(payload: MembershipUpdate, request: Request, db: Session = Depends(get_db),
+                             user: AppUser = Depends(current_parent)):
+    """커뮤니티 닉네임 변경 (시설마다 따로). 이후 새 글·댓글에 적용"""
+    membership = getattr(request.state, "membership", None)
+    if not membership:
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+    nickname = re.sub(r"\s+", " ", payload.nickname).strip()
+    if len(nickname) < 2 or re.search(r"(관리자|원장|admin|운영자)", nickname, re.I):
+        raise HTTPException(400, "사용할 수 없는 닉네임입니다. (2~20자, 관리자로 오해할 수 있는 이름 제외)")
+    taken = (db.query(FacilityMember.membership_id)
+               .filter(FacilityMember.nickname == nickname, FacilityMember.membership_id != membership.membership_id).first())
+    if taken:
+        raise HTTPException(409, "이 시설에서 이미 사용 중인 닉네임입니다.")
+    membership.nickname = nickname
+    db.commit()
+    return _membership_out(membership)
 
 
 @app.get("/api/parent/notifications")
@@ -4993,14 +6587,121 @@ def parent_assignment_file(assignment_id: int, db: Session = Depends(get_db), us
     return _assignment_file_response(db, assignment_id)
 
 
+# ---------- 학부모 커뮤니티 (게시판: 공지 + 게시글, 글·댓글 작성) ----------
+def _require_can_write(request: Request) -> FacilityMember:
+    membership = getattr(request.state, "membership", None)
+    if not membership:
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+    if membership.muted_until and membership.muted_until > _now():
+        until = membership.muted_until.strftime("%m월 %d일 %H:%M")
+        raise HTTPException(403, f"관리자에 의해 {until}까지 글·댓글 작성이 제한되었습니다.")
+    return membership
+
+
+def _parent_author(membership: FacilityMember, user: AppUser) -> str:
+    return (membership.nickname or _parent_display_name(user))[:50]
+
+
+def _moderate_text(text_value: str):
+    return _moderation.moderate_text(text_value, _gemini_judge if MODERATION_AI else None)
+
+
+@app.get("/api/parent/community/board")
+def parent_board(category: str = Query("ALL", max_length=20), q: str = Query("", max_length=100),
+                 field: str = Query("title_content", max_length=20), page: int = Query(1, ge=1, le=1000),
+                 size: int = Query(15, ge=5, le=50), db: Session = Depends(get_db),
+                 user: AppUser = Depends(current_parent)):
+    return _board(db, parent_user=user, category=category, q=q, field=field, page=page, size=size)
+
+
 @app.get("/api/parent/community/posts")
 def parent_posts(db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
     return _list_posts(db, parent=True, limit=50, user_id=user.user_id)
 
 
+def _parent_post_or_404(db: Session, post_id: int, user: AppUser) -> CommunityPost:
+    p = (db.query(CommunityPost).options(defer(CommunityPost.photos))
+           .filter(CommunityPost.post_id == post_id, _parent_post_visibility(user.user_id)).first())
+    if not p:
+        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+    return p
+
+
+@app.get("/api/parent/community/posts/{post_id}")
+def parent_get_post(post_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    p = _parent_post_or_404(db, post_id, user)
+    db.info["no_sync"] = True                       # 조회수는 다른 화면을 새로고침할 변경이 아님
+    db.query(CommunityPost).filter(CommunityPost.post_id == post_id).update(
+        {CommunityPost.view_count: func.coalesce(CommunityPost.view_count, 0) + 1}, synchronize_session=False)
+    db.commit()
+    db.refresh(p)
+    return _single_post_out(db, p, parent=True, user_id=user.user_id)
+
+
+@app.post("/api/parent/community/posts", status_code=201)
+def parent_create_post(payload: CommunityPostCreate, request: Request, db: Session = Depends(get_db),
+                       user: AppUser = Depends(current_parent)):
+    """학부모 글쓰기 — 자동 모니터링에서 의심되면 '검토 대기'(작성자 본인에게만 보임)"""
+    membership = _require_can_write(request)
+    photos = _parse_photo_items(payload.photos or [])
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(400, "제목을 입력하세요.")
+    if not payload.content.strip() and not photos:
+        raise HTTPException(400, "내용 또는 사진을 입력하세요.")
+    result = _moderate_text(f"{title}\n{payload.content}")
+    p = CommunityPost(author=_parent_author(membership, user), title=title, content=payload.content,
+                      category=_post_category(payload.category), user_id=user.user_id, author_role="parent",
+                      is_pinned=False, status="PENDING" if result.flagged else "VISIBLE", photos=None)
+    db.add(p); db.flush()
+    _save_new_photos(db, p.post_id, photos)
+    if result.flagged:
+        _notify_admins(db, "MODERATION", "검토가 필요한 게시글", f"자동 탐지: {', '.join(result.reasons)[:200]}",
+                       "community?tab=moderation")
+    else:
+        _notify_admins(db, "POST", f"새 글: {title[:40]}", f"{p.author} · {POST_CATEGORIES[p.category]}", "community")
+    _log(db, "parent", user.user_id, "community.post", "post", p.post_id, "검토 대기" if result.flagged else "글 작성")
+    db.commit(); db.refresh(p)
+    return _single_post_out(db, p, parent=True, user_id=user.user_id)
+
+
+@app.put("/api/parent/community/posts/{post_id}")
+def parent_update_post(post_id: int, payload: CommunityPostUpdate, request: Request, db: Session = Depends(get_db),
+                       user: AppUser = Depends(current_parent)):
+    _require_can_write(request)
+    p = _parent_post_or_404(db, post_id, user)
+    if p.user_id != user.user_id or p.author_role != "parent":
+        raise HTTPException(403, "본인이 쓴 글만 수정할 수 있습니다.")
+    if payload.title is not None and not payload.title.strip():
+        raise HTTPException(400, "제목을 입력하세요.")
+    _update_post(db, p, payload)
+    result = _moderate_text(f"{p.title or ''}\n{p.content}")
+    if result.flagged and p.status != "PENDING":
+        p.status = "PENDING"
+        _notify_admins(db, "MODERATION", "검토가 필요한 게시글(수정됨)", f"자동 탐지: {', '.join(result.reasons)[:200]}",
+                       "community?tab=moderation")
+    db.commit(); db.refresh(p)
+    return _single_post_out(db, p, parent=True, user_id=user.user_id)
+
+
+@app.delete("/api/parent/community/posts/{post_id}", status_code=204)
+def parent_delete_post(post_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    p = db.query(CommunityPost).filter(CommunityPost.post_id == post_id, CommunityPost.user_id == user.user_id,
+                                       CommunityPost.author_role == "parent").first()
+    if not p:
+        raise HTTPException(404, "본인이 쓴 글만 삭제할 수 있습니다.")
+    _delete_post(db, p)
+    db.commit()
+
+
 @app.get("/api/parent/community/photos/{photo_id}")
 def parent_community_photo(photo_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
-    return get_community_photo(photo_id, db)
+    row = (db.query(CommunityPhoto.mime_type, CommunityPhoto.data)
+             .join(CommunityPost, CommunityPost.post_id == CommunityPhoto.post_id)
+             .filter(CommunityPhoto.photo_id == photo_id, _parent_post_visibility(user.user_id)).first())
+    if not row:
+        raise HTTPException(404, "사진을 찾을 수 없습니다.")
+    return _image_response(row.mime_type, row.data)
 
 
 @app.post("/api/parent/community/posts/{post_id}/like")
@@ -5010,28 +6711,45 @@ def parent_like_post(post_id: int, db: Session = Depends(get_db), user: AppUser 
 
 @app.get("/api/parent/community/posts/{post_id}/comments")
 def parent_comments(post_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    _parent_post_or_404(db, post_id, user)
     return _parent_visible_comments(db, post_id, user.user_id)
 
 
 @app.post("/api/parent/community/posts/{post_id}/comments", status_code=201)
-def parent_create_comment(post_id: int, payload: ParentCommentCreate, db: Session = Depends(get_db),
+def parent_create_comment(post_id: int, payload: ParentCommentCreate, request: Request, db: Session = Depends(get_db),
                           user: AppUser = Depends(current_parent)):
+    membership = _require_can_write(request)
     content = payload.content.strip()
     if not content:
         raise HTTPException(400, "댓글은 1~1000자로 입력하세요.")
-    if not db.query(CommunityPost.post_id).filter(CommunityPost.post_id == post_id).first():
-        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
-    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지, 이름 일부 마스킹)
-    comment = CommunityComment(post_id=post_id, author=_parent_display_name(user), content=content, user_id=user.user_id)
+    post = _parent_post_or_404(db, post_id, user)
+    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지 — 시설 닉네임)
+    comment = CommunityComment(post_id=post_id, author=_parent_author(membership, user), content=content,
+                               user_id=user.user_id, author_role="parent")
     db.add(comment); db.flush()
-    review = _review_comment(db, comment)          # v8.1: 자동 모니터링
+    review = _review_comment(db, comment)          # 자동 모니터링
     if review.flagged:
-        _notify_admins(db, "MODERATION", "검토가 필요한 댓글", f"자동 탐지: {review.reasons}", "community")
+        _notify_admins(db, "MODERATION", "검토가 필요한 댓글", f"자동 탐지: {review.reasons}", "community?tab=moderation")
     else:
         _notify_admins(db, "COMMENT", f"{comment.author} 님의 새 댓글", content[:80], "community")
+        if post.user_id and post.author_role == "parent" and post.user_id != user.user_id:
+            db.add(Notification(user_id=post.user_id, audience="parent", kind="COMMENT", link="feed",
+                                title=f"내 글에 새 댓글: {_post_title(post)[:40]}", body=content[:120]))
     _log(db, "parent", user.user_id, "community.comment", "post", post_id, "검토 대기" if review.flagged else "댓글 작성")
     db.commit(); db.refresh(comment)
     return _comment_out(comment, review, viewer_user_id=user.user_id)
+
+
+@app.delete("/api/parent/community/comments/{comment_id}", status_code=204)
+def parent_delete_comment(comment_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    c = db.query(CommunityComment).filter(CommunityComment.comment_id == comment_id,
+                                          CommunityComment.user_id == user.user_id).first()
+    if not c:
+        raise HTTPException(404, "본인이 쓴 댓글만 삭제할 수 있습니다.")
+    db.query(CommentReview).filter(CommentReview.comment_id == comment_id).delete(synchronize_session=False)
+    db.delete(c)
+    db.commit()
+
 
 
 # =====================================================================
@@ -5164,7 +6882,8 @@ def _shop_context(db: Session) -> dict:
     texts = [(f"공지 '{title}'", f"{title} {content}") for title, content in
              db.query(Notice.title, Notice.content).filter(Notice.created_at >= since_notice).limit(100).all()]
     texts += [(f"수업 '{name}'", f"{name} {desc or ''}") for name, desc in
-              db.query(Class.name, Class.description).filter(Class.end_date >= _today()).limit(100).all()]
+              db.query(Class.name, Class.description)
+                .filter(or_(Class.end_date.is_(None), Class.end_date >= _today())).limit(100).all()]
     events = []
     for keywords, tags, label in SHOP_EVENT_RULES:
         for source, text in texts:
@@ -5216,7 +6935,7 @@ def list_shop_products(q: str = "", category: str = "", include_inactive: bool =
                        db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
     _ensure_shop_products(db)
     query = db.query(ShopProduct)
-    if not (include_inactive and account.role == "owner"):
+    if not (include_inactive and _facility_role(account) == "owner"):
         query = query.filter(ShopProduct.active.is_(True))
     if category and category != "전체":
         query = query.filter(ShopProduct.category == category)
@@ -5404,7 +7123,7 @@ def health():
             conn.execute(text("SELECT 1"))
             result["db_connected"] = True
             insp = inspect(conn)
-            result["tables_ready"] = all(insp.has_table(t) for t in ("app_users", "community_photos", "notifications"))
+            result["tables_ready"] = all(insp.has_table(t) for t in ("app_users", "community_photos", "notifications", "facilities"))
     except Exception as exc:   # 원인 안내만 하고 예외 내용(호스트·사용자명)은 노출하지 않음
         logger.error("헬스 체크 DB 연결 실패: %s", exc)
         result["problem"] = _db_connection_hint(exc)
@@ -5441,55 +7160,175 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------
-# 테이블 생성은 모든 모델이 정의된 "맨 마지막"에 호출.
-#   기존 테이블·데이터는 건드리지 않고, 없는 테이블만 새로 만듭니다(비파괴).
+# 테이블 생성·마이그레이션은 모든 모델이 정의된 "맨 마지막"에 호출.
+#   - 기존 테이블·데이터는 지우지 않습니다(비파괴). 없는 테이블 생성 + NULL 허용 컬럼 추가 + 인덱스 추가.
+#   - app_meta.schema_version 이 SCHEMA_VERSION 과 같으면 콜드 스타트 때 SELECT 1번으로 끝냅니다.
+#     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
-#   (setup.sql 을 깜빡해도 첫 요청 때 자동 생성되도록 AUTO_CREATE_TABLES 기본값은 true)
 # ---------------------------------------------------------------------
+SCHEMA_VERSION = "9"
+
+
+def _tenant_tables() -> List[str]:
+    return sorted({m.class_.__tablename__ for m in Base.registry.mappers if issubclass(m.class_, TenantMixin)})
+
+
 # 이미 있는 테이블에 나중에 추가된 컬럼 (create_all 은 기존 테이블에 컬럼을 추가하지 않으므로 ALTER 로 보완)
 #   (테이블, 컬럼, 타입, 인덱스 이름) — 모두 NULL 허용 컬럼이라 기존 데이터에 영향 없음
 COLUMN_PATCHES = [
     ("notices", "class_id", "INTEGER", "ix_notices_class_id"),
     ("classes", "schedule_detail", "TEXT", None),
     ("community_comments", "user_id", "INTEGER", "ix_community_comments_user_id"),
+    # v9
+    ("attendances", "class_id", "INTEGER", "ix_attendances_class_id"),
+    ("classes", "color", "VARCHAR(9)", None),
+    ("classes", "monthly_fee", "INTEGER", None),
+    ("community_posts", "title", "VARCHAR(200)", None),
+    ("community_posts", "category", "VARCHAR(20)", None),
+    ("community_posts", "user_id", "INTEGER", "ix_community_posts_user_id"),
+    ("community_posts", "author_role", "VARCHAR(10)", None),
+    ("community_posts", "is_pinned", "BOOLEAN", None),
+    ("community_posts", "view_count", "INTEGER", None),
+    ("community_posts", "status", "VARCHAR(10)", None),
+    ("community_posts", "updated_at", "TIMESTAMP", None),
+    ("community_comments", "author_role", "VARCHAR(10)", None),
+    ("community_comments", "admin_user_id", "INTEGER", None),
+    ("user_sessions", "facility_id", "INTEGER", None),
+]
+# 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼)
+INDEX_PATCHES = [
+    ("ix_attendances_member_id", "attendances", "member_id"),
+    ("ix_enrollments_member_id", "enrollments", "member_id"),
+    ("ix_enrollments_class_id", "enrollments", "class_id"),
 ]
 
 
-def _apply_column_patches(existing: set) -> List[str]:
-    targets = [p for p in COLUMN_PATCHES if p[0] in existing]
-    if not targets:
-        return []
+def _all_column_patches() -> list:
+    tenant = [(t, "facility_id", "INTEGER", f"ix_{t}_facility_id") for t in _tenant_tables()]
+    return COLUMN_PATCHES + tenant
+
+
+def _apply_column_patches(conn, existing: set) -> List[str]:
+    targets = [p for p in _all_column_patches() if p[0] in existing]
     added = []
-    with engine.begin() as conn:
-        insp = inspect(conn)
-        columns = {table: {c["name"] for c in insp.get_columns(table)} for table in {p[0] for p in targets}}
-        for table, column, ddl, index in targets:
-            if column in columns[table]:
-                continue
+    insp = inspect(conn)
+    columns = {table: {c["name"] for c in insp.get_columns(table)} for table in {p[0] for p in targets}}
+    for table, column, ddl, index in targets:
+        if column not in columns[table]:
             conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
-            if index:
-                conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ("{column}")'))
             added.append(f"{table}.{column}")
+        if index:
+            conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ("{column}")'))
+    for index, table, column in INDEX_PATCHES:
+        if table in existing:
+            conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ("{column}")'))
+    if DB_DIALECT == "postgresql" and "classes" in existing:
+        nullable = {c["name"]: c["nullable"] for c in insp.get_columns("classes")}
+        for column in ("start_date", "end_date"):
+            if nullable.get(column) is False:
+                conn.execute(text(f'ALTER TABLE "classes" ALTER COLUMN "{column}" DROP NOT NULL'))
     if added:
         logger.info("컬럼 추가: %s", ", ".join(added))
     return added
 
 
-def init_db() -> List[str]:
-    """없는 테이블만 만들고, 새로 만든 테이블 이름을 돌려줌. 모두 있으면 조회 몇 번으로 끝남(콜드스타트 부담 최소)."""
-    existing = set(inspect(engine).get_table_names())
-    _apply_column_patches(existing)
-    missing = [t for t in Base.metadata.sorted_tables if t.name not in existing]
-    if not missing:
-        return []
-    Base.metadata.create_all(bind=engine, tables=missing)
+def _migrate_attendance_unique(conn, existing: set) -> None:
+    """v9: 출결 고유 조건을 (학생, 날짜) → (학생, 날짜, 수업) 으로 변경 — 하루에 여러 수업 출결 가능.
+    기존 조건이 더 엄격하므로 기존 데이터는 새 조건을 항상 만족합니다(데이터 손실 없음)."""
+    if "attendances" not in existing:
+        return
     if DB_DIALECT == "postgresql":
-        # Supabase 는 public 스키마를 Data API(anon 키)로 노출하므로 RLS 를 켜서 직접 접근을 막음.
-        # (이 앱은 DB 비밀번호로 접속하는 백엔드만 쓰므로 RLS 정책이 없어도 정상 동작)
-        with engine.begin() as conn:
-            for table in missing:
-                conn.execute(text(f'ALTER TABLE "{table.name}" ENABLE ROW LEVEL SECURITY'))
-    logger.info("테이블 생성: %s", ", ".join(t.name for t in missing))
+        conn.execute(text('ALTER TABLE "attendances" DROP CONSTRAINT IF EXISTS uq_attendance_member_date'))
+    elif DB_DIALECT == "sqlite":
+        # SQLite 는 테이블 정의 안의 UNIQUE 를 지울 수 없어 (로컬 개발 DB 한정) 새 테이블로 옮겨 담습니다.
+        has_old = any(row[3] == "u" for row in conn.execute(text("PRAGMA index_list('attendances')")))
+        if has_old:
+            old_cols = [row[1] for row in conn.execute(text("PRAGMA table_info('attendances')"))]
+            conn.execute(text('ALTER TABLE "attendances" RENAME TO "attendances_v8_backup"'))
+            for (name,) in conn.execute(text("SELECT name FROM sqlite_master WHERE type='index' AND "
+                                             "tbl_name='attendances_v8_backup' AND sql IS NOT NULL")).fetchall():
+                conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+            Attendance.__table__.create(conn)
+            cols = ", ".join(f'"{c}"' for c in old_cols if c in Attendance.__table__.c)
+            conn.execute(text(f'INSERT INTO "attendances" ({cols}) SELECT {cols} FROM "attendances_v8_backup"'))
+            conn.execute(text('DROP TABLE "attendances_v8_backup"'))
+            return
+    conn.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS uq_attendance_member_date_class '
+                      'ON "attendances" ("member_id", "attendance_date", (COALESCE("class_id", 0)))'))
+
+
+def _migrate_to_facilities(conn) -> Optional[int]:
+    """v8(단일 시설) → v9(여러 시설): 시설이 하나도 없고 기존 데이터가 있으면
+    academy_settings 로 첫 시설을 만들고, 모든 기존 행·관리자·연결된 학부모를 그 시설에 배정합니다."""
+    if conn.execute(text("SELECT COUNT(*) FROM facilities")).scalar():
+        return None
+    legacy = sum(conn.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0
+                 for t in ("members", "admin_accounts", "academy_settings"))
+    if not legacy:
+        return None
+    settings = {k: _json_dict(v) for k, v in conn.execute(text("SELECT setting_key, setting_value FROM academy_settings"))}
+    academy = {**DEFAULT_ACADEMY_SETTINGS, **settings.get("academy_info", {})}
+    payment = {**DEFAULT_PAYMENT_SETTINGS, **settings.get("payment_settings", {})}
+    values = {column: str(academy.get(akey) or "")[:Facility.__table__.c[column].type.length or 100000]
+              for akey, column in _ACADEMY_COLUMN_MAP.items()}
+    values["name"] = values.get("name") or "우리 시설"
+    values["facility_type"] = values.get("facility_type") if values.get("facility_type") in FACILITY_TYPES else "학원"
+    values["logo"] = values.get("logo") or None
+    extra = {k: v for k, v in academy.items() if k not in _ACADEMY_COLUMN_MAP and k != "isPublic"}
+    result = conn.execute(Facility.__table__.insert().values(
+        **values, is_public=True, settings_json=json.dumps(extra, ensure_ascii=False),
+        payment_json=json.dumps(payment, ensure_ascii=False), data_version=0))
+    facility_id = result.inserted_primary_key[0]
+    for table in _tenant_tables():
+        conn.execute(text(f'UPDATE "{table}" SET facility_id = :f WHERE facility_id IS NULL'), {"f": facility_id})
+    for account_id, role in conn.execute(text("SELECT account_id, role FROM admin_accounts")).fetchall():
+        conn.execute(FacilityStaff.__table__.insert().values(facility_id=facility_id, account_id=account_id,
+                                                             role="owner" if role == "owner" else "staff"))
+    parents = conn.execute(text("SELECT DISTINCT u.user_id, u.name FROM parent_links pl "
+                                "JOIN app_users u ON u.user_id = pl.user_id")).fetchall()
+    for user_id, name in parents:
+        nickname = f"{(name or '').strip()[:1]}** 학부모" if (name or "").strip() else "학부모"
+        conn.execute(FacilityMember.__table__.insert().values(facility_id=facility_id, user_id=user_id,
+                                                              nickname=nickname, status="ACTIVE"))
+    logger.info("v9 마이그레이션: 기존 데이터를 시설 #%s 로 배정 (관리자 %s명, 학부모 %s명)",
+                facility_id, conn.execute(text("SELECT COUNT(*) FROM facility_staff")).scalar(), len(parents))
+    return facility_id
+
+
+def _schema_is_current() -> bool:
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(text("SELECT meta_value FROM app_meta WHERE meta_key = 'schema_version'")).scalar()
+        return value == SCHEMA_VERSION
+    except Exception:       # app_meta 테이블이 없으면(최초 실행·v8 이하) 마이그레이션 진행
+        return False
+
+
+def init_db() -> List[str]:
+    """스키마가 최신이면 바로 종료. 아니면 없는 테이블 생성 → 컬럼·인덱스 추가 → v9 데이터 이전 → 버전 기록."""
+    if _schema_is_current():
+        return []
+    existing = set(inspect(engine).get_table_names())
+    missing = [t for t in Base.metadata.sorted_tables if t.name not in existing]
+    with engine.begin() as conn:
+        _apply_column_patches(conn, existing)
+        _migrate_attendance_unique(conn, existing)
+    if missing:
+        Base.metadata.create_all(bind=engine, tables=missing)
+        if DB_DIALECT == "postgresql":
+            # Supabase 는 public 스키마를 Data API(anon 키)로 노출하므로 RLS 를 켜서 직접 접근을 막음.
+            # (이 앱은 DB 비밀번호로 접속하는 백엔드만 쓰므로 RLS 정책이 없어도 정상 동작)
+            with engine.begin() as conn:
+                for table in missing:
+                    conn.execute(text(f'ALTER TABLE "{table.name}" ENABLE ROW LEVEL SECURITY'))
+        logger.info("테이블 생성: %s", ", ".join(t.name for t in missing))
+    with engine.begin() as conn:
+        _migrate_to_facilities(conn)
+        updated = conn.execute(text("UPDATE app_meta SET meta_value = :v WHERE meta_key = 'schema_version'"),
+                               {"v": SCHEMA_VERSION}).rowcount
+        if not updated:
+            conn.execute(text("INSERT INTO app_meta (meta_key, meta_value) VALUES ('schema_version', :v)"),
+                         {"v": SCHEMA_VERSION})
     return [t.name for t in missing]
 
 

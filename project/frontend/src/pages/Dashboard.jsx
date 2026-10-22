@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useDataRefresh } from "../utils/sync";
+import { useNavigate } from "react-router-dom";
 import {
   clearTodos, createTodo, deleteTodo, errorText, fetchAdminSummary, fetchDashboardInsights, fetchNotices,
   fetchTodos, notifyMemberParents, updateTodo,
@@ -75,6 +77,7 @@ function useWeather(city) {
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [data, setData] = useState(null);
   const [brand, setBrand] = useState(null);
   const [notices, setNotices] = useState([]);
@@ -100,6 +103,7 @@ export default function Dashboard() {
     }
   }, []);
   useEffect(() => { load(); }, [load]);
+  useDataRefresh(load);                 // 다른 기기·화면에서 데이터가 바뀌면 자동 갱신
 
   const weather = useWeather(brand?.weatherCity || "용인");
   const dateLabel = useMemo(() => {
@@ -184,7 +188,7 @@ export default function Dashboard() {
             <span className="stat-label">오늘 출석률<Info text={def.attendance_rate_today} /></span>
             <Trend value={attendance.rate_change} unit="%p" />
           </div>
-          <div className="stat-value num primary">{pctText(today.rate)}</div>
+          <div className="stat-value num primary">{today.present + today.late + today.absent === 0 ? "체크 전" : pctText(today.rate)}</div>
           <div className="stat-sub">
             출석 {today.present} · 지각 {today.late} · 결석 {today.absent}
             {today.unchecked ? ` · 미체크 ${today.unchecked}` : ""} {today.expected ? `/ 오늘 수업 ${today.expected}명` : ""}
@@ -206,7 +210,11 @@ export default function Dashboard() {
           <div className={`stat-value num ${billing.collection_rate == null ? "" : billing.collection_rate >= 80 ? "success" : "warning"}`}>
             {pctText(billing.collection_rate)}
           </div>
-          <div className="stat-sub">청구 {manwon(billing.month_billed)} 중 {manwon(billing.month_collected)} 수납 · 매출 {manwon(revenue.this_month)}</div>
+          <div className="stat-sub">
+            {billing.month_invoices
+              ? `청구서 ${billing.month_paid_invoices}/${billing.month_invoices}건 · ${manwon(billing.month_collected)} / ${manwon(billing.month_billed)}`
+              : "이번 달 청구서가 없습니다"}
+          </div>
         </div>
       </div>
 
@@ -341,11 +349,15 @@ export default function Dashboard() {
               <h3 className="card-title">최근 공지사항</h3>
               <div className="card-sub">학부모 읽음 현황 포함</div>
             </div>
+            <button className="btn ghost sm" onClick={() => navigate("/community?category=NOTICE")}>공지사항으로 →</button>
           </div>
           {notices.length === 0 ? <div className="empty" style={{ padding: 24 }}>등록된 공지사항이 없습니다.</div> : (
             <div style={{ display: "grid", gap: 12 }}>
               {notices.slice(0, 3).map((n) => (
-                <div key={n.notice_id} className="notice-item" style={{ padding: 14, borderRadius: 14, border: "1px solid var(--border)" }}>
+                <div key={n.notice_id} className="notice-item row-click" role="button" tabIndex={0}
+                  onClick={() => navigate(`/community?category=NOTICE&open=n${n.notice_id}`)}
+                  onKeyDown={(e) => e.key === "Enter" && navigate(`/community?category=NOTICE&open=n${n.notice_id}`)}
+                  style={{ padding: 14, borderRadius: 14, border: "1px solid var(--border)" }}>
                   <div className="notice-meta">
                     {n.is_pinned && <span className="badge primary no-dot">고정</span>}
                     {n.class_name && <span className="badge gray no-dot">{n.class_name}</span>}

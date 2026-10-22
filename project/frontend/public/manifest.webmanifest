@@ -1,6 +1,6 @@
 {
-  "name": "시설 통합 관리 시스템",
-  "short_name": "시설관리",
+  "name": "facilink",
+  "short_name": "facilink",
   "description": "학원·체육관·도장 통합 관리 — 출석 키오스크, 학부모 포털",
   "start_url": "/",
   "display": "standalone",

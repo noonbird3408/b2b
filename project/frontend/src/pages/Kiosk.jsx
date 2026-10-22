@@ -144,6 +144,7 @@ export default function Kiosk() {
     <div style={styles.page}>
       <header style={styles.header}>
         <div>
+          <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: "-.02em", opacity: 0.6 }}>facilink</div>
           <div style={{ fontSize: 22, fontWeight: 800 }}>{brandName}</div>
           <div style={{ opacity: 0.7, fontSize: 14 }}>
             {clock.toLocaleDateString("ko-KR", { month: "long", day: "numeric", weekday: "long" })} · {clock.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}

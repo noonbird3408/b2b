@@ -29,6 +29,8 @@ HEADER = """-- =================================================================
 """
 
 FOOTER = """
+-- v9(여러 시설): 기존(단일 시설) 데이터의 facility_id 채우기·첫 시설 생성은 백엔드가 처음 시작될 때
+-- 자동으로 한 번 실행합니다(app_meta.schema_version 기록). 이 스크립트는 테이블·컬럼·인덱스만 준비합니다.
 -- Supabase 는 public 스키마의 테이블을 Data API(anon 키)로 노출합니다.
 -- RLS(행 수준 보안)를 켜 두면 브라우저에서 테이블에 직접 접근할 수 없습니다.
 -- 이 앱은 백엔드(Vercel)가 DB 비밀번호로 접속하므로 RLS 정책 없이도 정상 동작합니다.
@@ -39,16 +41,26 @@ def render() -> str:
     dialect = postgresql.dialect()
     tables = main.Base.metadata.sorted_tables
     lines = [HEADER]
+    patches: dict = {}
+    for table_name, column, ddl, _index in main._all_column_patches():
+        patches.setdefault(table_name, []).append((column, ddl))
     for table in tables:
         lines.append(str(CreateTable(table, if_not_exists=True).compile(dialect=dialect)).strip() + ";")
+        # 이전 버전으로 이미 만든 테이블은 CREATE TABLE 이 건너뛰어지므로, 새 컬럼을 먼저 보완한 뒤
+        # 인덱스를 만듭니다. (순서가 반대면 'column ... does not exist' 오류)
+        for column, ddl in patches.get(table.name, []):
+            lines.append(f"ALTER TABLE {table.name} ADD COLUMN IF NOT EXISTS {column} {ddl};  -- 이전 버전 보완")
+        if table.name == "attendances":
+            # v9: 하루에 수업별 출결 — (학생, 날짜) 고유 조건을 (학생, 날짜, 수업) 고유 인덱스로 교체 (기존 데이터 영향 없음)
+            lines.append("ALTER TABLE attendances DROP CONSTRAINT IF EXISTS uq_attendance_member_date;")
+        if table.name == "classes":
+            lines.append("ALTER TABLE classes ALTER COLUMN start_date DROP NOT NULL;")
+            lines.append("ALTER TABLE classes ALTER COLUMN end_date DROP NOT NULL;")
         for index in sorted(table.indexes, key=lambda i: i.name or ""):
             lines.append(str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect)).strip() + ";")
         lines.append("")
-    lines.append("-- 이전 버전으로 이미 테이블을 만든 경우를 위한 컬럼 보완 (있으면 건너뜀)")
-    for table, column, ddl, index in main.COLUMN_PATCHES:
-        lines.append(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl};")
-        if index:
-            lines.append(f"CREATE INDEX IF NOT EXISTS {index} ON {table} ({column});")
+    for index, table_name, column in main.INDEX_PATCHES:
+        lines.append(f"CREATE INDEX IF NOT EXISTS {index} ON {table_name} ({column});")
     lines.append("")
     lines.append(FOOTER.strip())
     lines += [f"ALTER TABLE {t.name} ENABLE ROW LEVEL SECURITY;" for t in tables]

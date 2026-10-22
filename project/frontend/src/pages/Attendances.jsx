@@ -1,13 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   bulkAttendance, checkoutAttendance, deleteAttendance, errorText, fetchAttendances, fetchClasses, fetchMembers,
   localToday, markAttendance,
 } from "../api";
+import { STATUS_LABEL, useDataRefresh } from "../utils/sync";
 
-const STATUS_LABEL = { PRESENT: "출석", ABSENT: "결석", LATE: "지각" };
 const WEEKDAY_CODES = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-const DAY_KO = { MON: "월", TUE: "화", WED: "수", THU: "목", FRI: "금", SAT: "토", SUN: "일", DAILY: "매일" };
+const DAY_KO = ["일", "월", "화", "수", "목", "금", "토"];
+
+const STYLES = `
+.period-bar{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin;}
+.period{flex:0 0 auto;min-width:150px;text-align:left;border:1px solid var(--border);background:var(--surface);border-radius:12px;padding:10px 12px;color:var(--text);position:relative;overflow:hidden;}
+.period .p{font-size:11px;color:var(--text-3);font-weight:700;}
+.period .n{font-weight:700;font-size:14px;margin:2px 0;}
+.period .t{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums;}
+.period .bar{position:absolute;left:0;top:0;bottom:0;width:4px;}
+.period.on{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-soft);}
+.period .now{position:absolute;top:8px;right:8px;font-size:10px;font-weight:700;color:var(--success-text);background:var(--success-soft);padding:1px 6px;border-radius:99px;}
+.att-card.clickable{cursor:pointer;}
+.att-card.clickable:hover{border-color:var(--border-strong);box-shadow:var(--shadow-sm);}
+.att-date{display:flex;gap:6px;align-items:center;}
+`;
 
 const ageToGrade = (age) => {
   if (age == null) return "";
@@ -24,39 +38,61 @@ const sessionsOn = (cls, dateStr) => {
   return (cls.schedules || []).filter((s) => s.day === code || s.day === "DAILY");
 };
 
+const shiftDate = (dateStr, days) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 export default function Attendances() {
-  // [FIX] 기존 new Date().toISOString() 은 UTC 라 한국 시간 오전 9시 전에는 '어제'로 표시됨
+  const navigate = useNavigate();
   const [targetDate, setTargetDate] = useState(localToday());
   const [classes, setClasses] = useState([]);
-  const [selectedClassId, setSelectedClassId] = useState("ALL");
+  const [selectedClassId, setSelectedClassId] = useState(null);
   const [members, setMembers] = useState([]);
   const [rows, setRows] = useState([]);
   const [error, setError] = useState(null);
   const [pendingId, setPendingId] = useState(null);
   const [query, setQuery] = useState("");
+  const [makeup, setMakeup] = useState(false);     // 보강: 이날 시간표에 없는 수업을 직접 고른 경우
 
+  const loadClasses = useCallback(() => fetchClasses()
+    .then((data) => setClasses(Array.isArray(data) ? data : []))
+    .catch((e) => setError(errorText(e, "수업 목록을 불러오지 못했습니다."))), []);
+  useEffect(() => { loadClasses(); }, [loadClasses]);
+
+  const isToday = targetDate === localToday();
+  // 이날 열리는 수업을 시작 시간 순으로 '교시'로 표시
+  const periods = useMemo(() => classes
+    .flatMap((c) => sessionsOn(c, targetDate).map((s) => ({ cls: c, start: s.start || "", end: s.end || "" })))
+    .sort((a, b) => a.start.localeCompare(b.start) || a.cls.name.localeCompare(b.cls.name)), [classes, targetDate]);
+
+  const nowHHMM = (() => { const d = new Date(); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; })();
+
+  // 날짜·수업이 바뀌면: 지금 진행 중(또는 다음) 교시 → 첫 교시 순으로 자동 선택
+  useEffect(() => { setMakeup(false); }, [targetDate]);
   useEffect(() => {
-    fetchClasses()
-      .then((data) => setClasses(Array.isArray(data) ? data : []))
-      .catch((e) => setError(errorText(e, "수업 목록을 불러오지 못했습니다.")));
-  }, []);
+    if (makeup) return;
+    if (selectedClassId && periods.some((p) => p.cls.class_id === selectedClassId)) return;
+    if (!periods.length) { setSelectedClassId(null); return; }
+    const current = isToday ? periods.find((p) => p.end >= nowHHMM) : null;
+    setSelectedClassId((current || periods[0]).cls.class_id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periods, isToday, makeup]);
 
   const load = useCallback(() => {
-    const memParams = { status: "ACTIVE" };
-    if (selectedClassId !== "ALL") memParams.class_id = selectedClassId;
-    return Promise.all([fetchMembers(memParams), fetchAttendances({ target_date: targetDate })])
+    if (!selectedClassId) { setMembers([]); setRows([]); return Promise.resolve(); }
+    return Promise.all([
+      fetchMembers({ status: "ACTIVE", class_id: selectedClassId }),
+      fetchAttendances({ target_date: targetDate, class_id: selectedClassId }),
+    ])
       .then(([m, a]) => { setMembers(m); setRows(a); setError(null); })
       .catch((e) => setError(errorText(e, "출결 정보를 불러오지 못했습니다.")));
   }, [selectedClassId, targetDate]);
-
   useEffect(() => { load(); }, [load]);
+  useDataRefresh(() => { loadClasses(); load(); });
 
-  const attMap = useMemo(() => {
-    const map = {};
-    rows.forEach((a) => { map[a.member_id] = a; });
-    return map;
-  }, [rows]);
-
+  const attMap = useMemo(() => Object.fromEntries(rows.map((a) => [a.member_id, a])), [rows]);
   const visibleMembers = useMemo(() => {
     const q = query.trim();
     return q ? members.filter((m) => m.name.includes(q)) : members;
@@ -66,36 +102,23 @@ export default function Attendances() {
     const c = { PRESENT: 0, ABSENT: 0, LATE: 0, NONE: 0, OUT: 0 };
     members.forEach((m) => {
       const a = attMap[m.member_id];
-      if (a) c[a.status] = (c[a.status] || 0) + 1; else c.NONE++;
-      if (a?.check_out_time) c.OUT++;
+      if (a) c[a.status] = (c[a.status] || 0) + 1; else c.NONE += 1;
+      if (a?.check_out_time) c.OUT += 1;
     });
     return c;
   }, [members, attMap]);
-
-  const totalChecked = members.length - counts.NONE;
-  const progress = members.length === 0 ? 0 : (totalChecked / members.length) * 100;
-  const isToday = targetDate === localToday();
-
+  const checked = members.length - counts.NONE;
   const selectedClass = classes.find((c) => c.class_id === selectedClassId);
-  const selectedClassName = selectedClassId === "ALL" ? "전체 회원" : selectedClass?.name || "소속 반";
-
-  // 그날 열리는 수업 (선택한 반 또는 전체)
-  const todaysSessions = useMemo(() => {
-    const list = selectedClassId === "ALL" ? classes : classes.filter((c) => c.class_id === selectedClassId);
-    return list.flatMap((c) => sessionsOn(c, targetDate).map((s) => ({ name: c.name, ...s })))
-      .sort((a, b) => (a.start || "").localeCompare(b.start || ""));
-  }, [classes, selectedClassId, targetDate]);
+  const selectedPeriod = periods.find((p) => p.cls.class_id === selectedClassId);
+  const weekday = DAY_KO[new Date(`${targetDate}T00:00:00`).getDay()];
 
   const setStatus = async (member, status) => {
     if (pendingId) return;
     setPendingId(member.member_id);
     try {
       const existing = attMap[member.member_id];
-      if (existing && existing.status === status) {
-        await deleteAttendance(existing.attendance_id);   // 같은 버튼을 다시 누르면 취소
-      } else {
-        await markAttendance({ member_id: member.member_id, attendance_date: targetDate, status });
-      }
+      if (existing && existing.status === status) await deleteAttendance(existing.attendance_id);   // 같은 버튼 = 취소
+      else await markAttendance({ member_id: member.member_id, attendance_date: targetDate, status, class_id: selectedClassId });
       await load();
     } catch (e) {
       alert(errorText(e));
@@ -118,154 +141,154 @@ export default function Attendances() {
     }
   };
 
-  // 미체크 전원 출석 / 출석 마감(결석) — 서버에 한 번에 요청
   const handleBulk = async (status) => {
     const unchecked = members.filter((m) => !attMap[m.member_id]);
-    if (unchecked.length === 0) return alert("미체크 학생이 없습니다.");
-    const label = status === "PRESENT" ? "출석" : "결석(마감)";
-    if (!window.confirm(`${selectedClassName} 미체크 ${unchecked.length}명을 ${label} 처리할까요?${status === "ABSENT" && isToday ? "\n학부모 포털에 결석 알림이 갑니다." : ""}`)) return;
+    if (!unchecked.length) return alert("미체크 학생이 없습니다.");
+    const label = status === "PRESENT" ? "출석" : "결석";
+    if (!window.confirm(`${selectedClass?.name} 미체크 ${unchecked.length}명을 ${label} 처리할까요?`)) return;
     setPendingId("ALL");
     try {
-      const result = await bulkAttendance({
-        attendance_date: targetDate, member_ids: unchecked.map((m) => m.member_id), status, only_unchecked: true,
-      });
+      await bulkAttendance({ attendance_date: targetDate, member_ids: unchecked.map((m) => m.member_id), status,
+        only_unchecked: true, class_id: selectedClassId });
       await load();
-      if (result.skipped) alert(`${result.changed}명 처리, ${result.skipped}명은 이미 체크되어 건너뛰었습니다.`);
     } catch (e) {
-      alert(errorText(e, "일괄 처리 중 오류가 발생했습니다."));
+      alert(errorText(e, "일괄 처리하지 못했습니다."));
     } finally {
       setPendingId(null);
     }
   };
 
+  // 학생 카드 클릭 → 학생 관리(상세). 출석·지각·결석·하원 버튼은 제외
+  const openMember = (m) => navigate(`/members?member_id=${m.member_id}`);
+
   return (
     <>
+      <style>{STYLES}</style>
       <h2 className="page-title">출석 체크</h2>
-      <p className="page-subtitle">
-        {selectedClassName} · {targetDate}{isToday ? " (오늘)" : ""} · 출석·지각·결석·하원 처리 시 학부모 포털로 알림이 갑니다
-      </p>
+      <p className="page-subtitle">{targetDate} ({weekday}){isToday ? " · 오늘" : ""}</p>
+      {error && <div className="fl-banner danger">{error}</div>}
 
-      {error && <div className="error-banner">{error}</div>}
-
-      <div className="card" style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 24, alignItems: "flex-end", flexWrap: "wrap" }}>
-          <div>
-            <label style={{ fontSize: 12, color: "var(--text-3)", display: "block", marginBottom: 4 }}>날짜</label>
-            <input type="date" className="input" value={targetDate} max={localToday()}
-                   onChange={(e) => setTargetDate(e.target.value || localToday())} />
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div className="toolbar" style={{ marginBottom: 12 }}>
+          <div className="att-date">
+            <button className="btn ghost sm" onClick={() => setTargetDate((d) => shiftDate(d, -1))} aria-label="전날">‹</button>
+            <input type="date" className="input" style={{ minWidth: 0 }} value={targetDate} max={localToday()}
+              onChange={(e) => setTargetDate(e.target.value || localToday())} />
+            <button className="btn ghost sm" onClick={() => setTargetDate((d) => shiftDate(d, 1))} disabled={isToday} aria-label="다음날">›</button>
+            {!isToday && <button className="btn ghost sm" onClick={() => setTargetDate(localToday())}>오늘</button>}
           </div>
+          {classes.length > 0 && (
+            <select className="select ml-auto" value={periods.some((p) => p.cls.class_id === selectedClassId) ? "" : selectedClassId || ""}
+              onChange={(e) => { if (e.target.value) { setMakeup(true); setSelectedClassId(Number(e.target.value)); } }} aria-label="다른 수업(보강)">
+              <option value="">다른 수업(보강) 선택</option>
+              {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name}</option>)}
+            </select>
+          )}
+        </div>
 
-          <div style={{ minWidth: 0 }}>
-            <label style={{ fontSize: 12, color: "var(--text-3)", display: "block", marginBottom: 4 }}>반 필터</label>
-            <div className="segmented" style={{ flexWrap: "wrap" }}>
-              <button className={selectedClassId === "ALL" ? "active" : ""} onClick={() => setSelectedClassId("ALL")}>전체</button>
-              {classes.map((c) => (
-                <button key={c.class_id} className={selectedClassId === c.class_id ? "active" : ""} onClick={() => setSelectedClassId(c.class_id)}>
-                  {c.name}
+        {periods.length === 0 ? (
+          <div className="muted" style={{ padding: "6px 0" }}>{weekday}요일에 예정된 수업이 없습니다. 보강은 오른쪽에서 수업을 고르세요.</div>
+        ) : (
+          <div className="period-bar" role="tablist" aria-label="교시">
+            {periods.map((p, i) => {
+              const live = isToday && p.start <= nowHHMM && nowHHMM <= p.end;
+              return (
+                <button key={`${p.cls.class_id}-${p.start}`} role="tab" aria-selected={selectedClassId === p.cls.class_id}
+                  className={`period${selectedClassId === p.cls.class_id ? " on" : ""}`} onClick={() => { setMakeup(false); setSelectedClassId(p.cls.class_id); }}>
+                  <span className="bar" style={{ background: p.cls.color }} />
+                  {live && <span className="now">진행 중</span>}
+                  <div className="p">{i + 1}교시</div>
+                  <div className="n">{p.cls.name}</div>
+                  <div className="t">{p.start}~{p.end}</div>
                 </button>
-              ))}
+              );
+            })}
+          </div>
+        )}
+
+        {selectedClass && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+              <strong style={{ marginRight: 6 }}>{selectedClass.name}</strong>
+              {selectedPeriod ? <span className="muted">{selectedPeriod.start}~{selectedPeriod.end}</span> : <span className="badge warning no-dot">보강</span>}
+              <span style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <span className="badge success no-dot">출석 {counts.PRESENT}</span>
+                <span className="badge warning no-dot">지각 {counts.LATE}</span>
+                <span className="badge danger no-dot">결석 {counts.ABSENT}</span>
+                <span className="badge gray no-dot">미체크 {counts.NONE}</span>
+                {isToday && <span className="badge primary no-dot">하원 {counts.OUT}</span>}
+              </span>
             </div>
+            <div className="progress"><div className="progress-fill" style={{ width: `${members.length ? (checked / members.length) * 100 : 0}%` }} /></div>
           </div>
-
-          <div>
-            <label style={{ fontSize: 12, color: "var(--text-3)", display: "block", marginBottom: 4 }}>이날 수업</label>
-            <div style={{ fontSize: 13, fontWeight: 600, maxWidth: 360 }}>
-              {todaysSessions.length === 0 ? <span style={{ color: "var(--text-3)" }}>예정된 수업 없음</span>
-                : todaysSessions.map((s, i) => (
-                  <span key={i} style={{ marginRight: 10, whiteSpace: "nowrap" }}>
-                    {selectedClassId === "ALL" ? `${s.name} ` : ""}{s.start}~{s.end}{s.day === "DAILY" ? ` (${DAY_KO.DAILY})` : ""}
-                  </span>
-                ))}
-            </div>
-          </div>
-
-          <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <span className="badge success no-dot">출석 {counts.PRESENT}</span>
-            <span className="badge warning no-dot">지각 {counts.LATE}</span>
-            <span className="badge danger no-dot">결석 {counts.ABSENT}</span>
-            <span className="badge gray no-dot">미체크 {counts.NONE}</span>
-            <span className="badge primary no-dot">하원 {counts.OUT}</span>
-          </div>
-        </div>
-
-        <div style={{ marginTop: 16 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, fontSize: 12, color: "var(--text-2)" }}>
-            <span>진행률</span>
-            <span className="num">{totalChecked} / {members.length}</span>
-          </div>
-          <div className="progress"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
-        </div>
+        )}
       </div>
 
-      <div className="toolbar" style={{ marginBottom: 12 }}>
-        <div className="search-box">
-          <input className="input" placeholder="학생 이름으로 찾기" value={query} onChange={(e) => setQuery(e.target.value)} />
-        </div>
-        <Link to="/kiosk" className="btn ghost ml-auto" title="태블릿을 입구에 두고 학생이 직접 등원/하원">📲 키오스크 모드 열기</Link>
-      </div>
+      {selectedClass && (
+        <>
+          <div className="toolbar" style={{ marginBottom: 12 }}>
+            <div className="search-box" style={{ flex: "1 1 200px" }}>
+              <input className="input" style={{ width: "100%" }} placeholder="이름으로 찾기" value={query} onChange={(e) => setQuery(e.target.value)} />
+            </div>
+            <Link to="/kiosk" className="btn ghost ml-auto">📲 키오스크</Link>
+          </div>
 
-      {visibleMembers.length === 0 ? (
-        <div className="empty">{members.length === 0 ? "해당 조건에 일치하는 재원 학생이 없습니다." : "검색 결과가 없습니다."}</div>
-      ) : (
-        <div className="att-grid">
-          {visibleMembers.map((m) => {
-            const cur = attMap[m.member_id];
-            const status = cur?.status;
-            const cls = status === "PRESENT" ? "present" : status === "ABSENT" ? "absent" : status === "LATE" ? "late" : "";
-            const busy = pendingId === m.member_id || pendingId === "ALL";
-            return (
-              <div key={m.member_id} className={`att-card ${cls}`}>
-                <div className="att-card-head">
-                  <div className="avatar">{m.name?.[0]}</div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div className="name">{m.name}</div>
-                    <div className="sub">
-                      {m.gender === "M" ? "남" : "여"}
-                      {ageToGrade(m.age) && ` · ${ageToGrade(m.age)}`}
-                      {cur?.check_in_time && ` · 등원 ${cur.check_in_time.slice(0, 5)}`}
-                      {cur?.check_out_time && ` · 하원 ${cur.check_out_time.slice(0, 5)}`}
+          {visibleMembers.length === 0 ? (
+            <div className="empty">{members.length === 0 ? "이 수업의 재원 학생이 없습니다." : "검색 결과가 없습니다."}</div>
+          ) : (
+            <div className="att-grid">
+              {visibleMembers.map((m) => {
+                const cur = attMap[m.member_id];
+                const status = cur?.status;
+                const tone = status === "PRESENT" ? "present" : status === "ABSENT" ? "absent" : status === "LATE" ? "late" : "";
+                const busy = pendingId === m.member_id || pendingId === "ALL";
+                return (
+                  <div key={m.member_id} className={`att-card clickable ${tone}`} role="button" tabIndex={0}
+                    onClick={() => openMember(m)} onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && openMember(m)}
+                    aria-label={`${m.name} 학생 정보 보기`}>
+                    <div className="att-card-head">
+                      <div className="avatar" style={{ overflow: "hidden" }}>
+                        {m.photo_url ? <img src={m.photo_url} alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : m.name?.[0]}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="name" style={{ fontWeight: 700 }}>{m.name}</div>
+                        <div className="sub">
+                          {m.gender === "M" ? "남" : "여"}{ageToGrade(m.age) && ` · ${ageToGrade(m.age)}`}
+                          {cur?.check_in_time && ` · ${cur.check_in_time.slice(0, 5)}`}
+                          {cur?.check_out_time && ` → ${cur.check_out_time.slice(0, 5)}`}
+                        </div>
+                      </div>
+                      {m.unpaid_amount > 0 && <span className="badge danger no-dot" style={{ fontSize: 10 }}>미납</span>}
+                    </div>
+                    <div className="att-card-actions" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                      {["PRESENT", "LATE", "ABSENT"].map((s) => {
+                        const active = status === s;
+                        const cn = s === "PRESENT" ? "present" : s === "ABSENT" ? "absent" : "late";
+                        return (
+                          <button key={s} className={`att-btn ${active ? `active ${cn}` : ""}`} onClick={() => setStatus(m, s)} disabled={busy}
+                            title={active ? "한 번 더 누르면 취소" : undefined}>{STATUS_LABEL[s]}</button>
+                        );
+                      })}
+                      {isToday && (status === "PRESENT" || status === "LATE") && (
+                        <button className="att-btn" onClick={() => handleCheckout(m)} disabled={busy || Boolean(cur?.check_out_time)}>
+                          {cur?.check_out_time ? "하원✓" : "하원"}
+                        </button>
+                      )}
                     </div>
                   </div>
-                  {m.unpaid_amount > 0 && (
-                    <span className="badge danger no-dot" title={`미납 ${m.unpaid_amount.toLocaleString()}원`} style={{ fontSize: 10, padding: "2px 7px" }}>미납</span>
-                  )}
-                </div>
-                <div className="att-card-actions">
-                  {["PRESENT", "LATE", "ABSENT"].map((s) => {
-                    const active = status === s;
-                    const cn = s === "PRESENT" ? "present" : s === "ABSENT" ? "absent" : "late";
-                    return (
-                      <button key={s} className={`att-btn ${active ? `active ${cn}` : ""}`} onClick={() => setStatus(m, s)} disabled={busy}
-                        title={active ? "한 번 더 누르면 취소" : undefined}>
-                        {STATUS_LABEL[s]}
-                      </button>
-                    );
-                  })}
-                  {isToday && (status === "PRESENT" || status === "LATE") && (
-                    <button className="att-btn" onClick={() => handleCheckout(m)} disabled={busy || Boolean(cur?.check_out_time)}
-                      title="하원 처리 (학부모에게 알림)">
-                      {cur?.check_out_time ? "하원✓" : "하원"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+                );
+              })}
+            </div>
+          )}
 
-      <div style={{
-        marginTop: 20, padding: 14, background: "var(--surface)",
-        border: "1px solid var(--border)", borderRadius: 12,
-        display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
-      }}>
-        <span style={{ fontSize: 12, color: "var(--text-3)" }}>
-          자동 저장됨 · {selectedClassId === "ALL" ? "전체 재원생" : "선택한 반"}의 미체크 학생만 일괄 처리됩니다.
-        </span>
-        <div style={{ flex: 1 }} />
-        <button className="btn ghost" onClick={() => handleBulk("PRESENT")} disabled={pendingId === "ALL"}>미체크 전원 출석</button>
-        <button className="btn" onClick={() => handleBulk("ABSENT")} disabled={pendingId === "ALL"}>출석 마감 (미체크 → 결석)</button>
-      </div>
+          <div className="card" style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: 14 }}>
+            <span className="muted">자동 저장 · 미체크 {counts.NONE}명</span>
+            <div style={{ flex: 1 }} />
+            <button className="btn ghost" onClick={() => handleBulk("PRESENT")} disabled={pendingId === "ALL" || !counts.NONE}>미체크 전원 출석</button>
+            <button className="btn" onClick={() => handleBulk("ABSENT")} disabled={pendingId === "ALL" || !counts.NONE}>마감 (미체크 → 결석)</button>
+          </div>
+        </>
+      )}
     </>
   );
 }

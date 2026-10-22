@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   fetchInvoices, fetchPayments, kakaoReady, fetchMembers, createInvoice, updateInvoice, deleteInvoice,
   markInvoicePaid, bulkCreateInvoices, fetchClasses, errorText, localToday,
 } from "../api";
+import { useDataRefresh } from "../utils/sync";
 
 const METHOD_LABEL = { CASH: "현금", TRANSFER: "계좌이체", CARD: "카드(현장)", KAKAOPAY: "카카오페이" };
 
-const won = (n) => (n != null ? `₩${Number(n).toLocaleString()}` : "₩0");
+const won = (n) => `${Number(n || 0).toLocaleString("ko-KR")}원`;
 const formatDate = (value) => value ? new Date(value).toLocaleDateString("ko-KR") : "-";
 
 export default function AdminCheckout() {
@@ -37,7 +38,7 @@ export default function AdminCheckout() {
     return kakao ? { type: kakao, amount: params.get("amount"), reason: params.get("reason") } : null;
   });
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setError("");
     setLoading(true);
     try {
@@ -51,19 +52,16 @@ export default function AdminCheckout() {
       setPayments(Array.isArray(listPayments) ? listPayments : []);
       setMembers(Array.isArray(membersData) ? membersData : []);
     } catch (err) {
-      console.error("관리자 결제 데이터 로드 실패:", err);
-      setError("결제 데이터 로드에 실패했습니다. 다시 시도해 주세요.");
-      setAllInvoices([]);
-      setPayments([]);
-      setMembers([]);
+      setError(errorText(err, "결제 데이터를 불러오지 못했습니다."));
+      setAllInvoices((prev) => prev || []);
+      setPayments((prev) => prev || []);
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    loadData();
   }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+  useDataRefresh(loadData);   // 학부모가 결제하면 자동으로 최신화
 
   const filteredInvoices = useMemo(() => {
     if (!Array.isArray(allInvoices)) return [];
@@ -209,216 +207,112 @@ export default function AdminCheckout() {
     }
   };
 
-  const recentPayments = useMemo(() => {
-    if (!Array.isArray(payments)) return [];
-    return payments.slice(0, 8);
-  }, [payments]);
+  const memberById = useMemo(() => Object.fromEntries(members.map((m) => [m.member_id, m])), [members]);
+  const feeByClass = useMemo(() => Object.fromEntries(classes.map((c) => [c.class_id, c.fee || 0])), [classes]);
+  const suggestedFee = (memberId) => (memberById[memberId]?.classes || []).reduce((sum, c) => sum + (feeByClass[c.class_id] || 0), 0);
+
+  const thisMonth = localToday().slice(0, 7);
+  const monthCollected = useMemo(() => (payments || [])
+    .filter((p) => String(p.paid_at || "").slice(0, 7) === thisMonth).reduce((sum, p) => sum + (p.amount || 0), 0), [payments, thisMonth]);
+  const unlinkedUnpaid = unpaidInvoices.filter((inv) => memberById[inv.member_id] && !memberById[inv.member_id].parent_linked).length;
+
+  const dueText = (invoice) => {
+    if (invoice.status === "PAID") return { text: "납부 완료", color: "var(--success-text)" };
+    if (!invoice.due_date) return { text: "결제 대기", color: "var(--text-2)" };
+    const diff = Math.round((new Date(`${invoice.due_date}T00:00:00`) - new Date(`${localToday()}T00:00:00`)) / 86400000);
+    if (diff < 0) return { text: `${-diff}일 지남`, color: "var(--danger-text)" };
+    if (diff === 0) return { text: "오늘 마감", color: "var(--warning-text)" };
+    return { text: `D-${diff}`, color: "var(--text-2)" };
+  };
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 16, marginBottom: 20 }}>
+      <style>{`
+.ck-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 12px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--border);}
+.ck-row:last-child{border-bottom:0;}
+.ck-row .who{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;min-width:0;}
+.ck-row .right{text-align:right;}
+.ck-list{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;}
+.ck-actions{grid-column:1/-1;display:flex;gap:4px;flex-wrap:wrap;}
+.ck-pay{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--border);}
+.ck-pay:last-child{border-bottom:0;}
+
+`}</style>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
         <div>
-          <h2 className="page-title" style={{ marginBottom: 2 }}>수납·청구 관리</h2>
-          <p className="page-subtitle" style={{ margin: 0 }}>청구서 발행(개별·일괄), 카카오페이 원격결제, 현장 수납을 한 곳에서 처리합니다. 발행·납부 시 학부모 포털로 알림이 갑니다.</p>
+          <h2 className="page-title" style={{ marginBottom: 2 }}>수납·청구</h2>
+          <p className="page-subtitle" style={{ margin: 0 }}>발행한 청구서는 학부모 포털에 바로 표시됩니다.</p>
         </div>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button className="btn sm ghost" onClick={loadData} disabled={loading}>
-            {loading ? "새로고침 중..." : "새로고침"}
-          </button>
-        </div>
+        <button className="btn sm ghost" onClick={loadData} disabled={loading}>{loading ? "불러오는 중…" : "새로고침"}</button>
       </div>
 
       {kakaoResult && (
-        <div className="error-banner" style={kakaoResult.type === "success" ? { background: "var(--success-soft)", color: "var(--success-text)" } : undefined}>
-          {kakaoResult.type === "success" ? `✅ 카카오페이 결제가 완료되었습니다${kakaoResult.amount ? ` (${won(kakaoResult.amount)})` : ""}.`
+        <div className={`fl-banner ${kakaoResult.type === "success" ? "success" : "warning"}`}>
+          {kakaoResult.type === "success" ? `카카오페이 결제가 완료되었습니다${kakaoResult.amount ? ` (${won(kakaoResult.amount)})` : ""}.`
             : kakaoResult.type === "cancel" ? "결제가 취소되었습니다." : `결제에 실패했습니다${kakaoResult.reason ? ` (${kakaoResult.reason})` : ""}.`}
         </div>
       )}
-      {error && <div className="error-banner">{error}</div>}
+      {error && <div className="fl-banner danger">{error}</div>}
 
-      <div className="row cols-2" style={{ gap: 20, marginBottom: 20 }}>
-        {/* 청구서 생성 영역 (기존 유지) */}
-        <div className="card">
-          <div className="card-head" style={{ justifyContent: "space-between" }}>
-            <div>
-              <h3 className="card-title">청구서 생성</h3>
-              <div className="card-sub">학생별로 미납 청구서를 발행하고 결제 링크를 보낼 수 있습니다.</div>
-            </div>
-            <button className="btn sm ghost" onClick={loadData} disabled={loading || isCreating}>
-              {loading ? "새로고침 중..." : "데이터 새로고침"}
-            </button>
-          </div>
-          <div style={{ marginTop: 14, display: "grid", gap: 12 }}>
-            <div className="form-row">
-              <label>학생 선택</label>
-              <select
-                className="input"
-                value={invoiceForm.member_id}
-                onChange={(e) => setInvoiceForm(prev => ({ ...prev, member_id: e.target.value }))}
-              >
-                <option value="">등록 학생 선택</option>
-                {members.map((member) => (
-                  <option key={member.member_id} value={member.member_id}>
-                    {member.name} ({member.father_name || member.mother_name || "보호자"})
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="form-row">
-              <label>청구 항목</label>
-              <input
-                className="input"
-                value={invoiceForm.item_name}
-                onChange={(e) => setInvoiceForm(prev => ({ ...prev, item_name: e.target.value }))}
-                placeholder="예: 6월 수강료"
-              />
-            </div>
-            <div className="form-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-              <div>
-                <label>금액</label>
-                <input
-                  className="input"
-                  type="number"
-                  min="1"
-                  value={invoiceForm.amount}
-                  onChange={(e) => setInvoiceForm(prev => ({ ...prev, amount: e.target.value }))}
-                  placeholder="금액(원)"
-                />
-              </div>
-              <div>
-                <label>납부 기한</label>
-                <input
-                  className="input"
-                  type="date"
-                  value={invoiceForm.due_date}
-                  onChange={(e) => setInvoiceForm(prev => ({ ...prev, due_date: e.target.value }))}
-                />
-              </div>
-            </div>
-            <button className="btn" onClick={handleCreateInvoice} disabled={isCreating || loading}>
-              {isCreating ? "청구서 생성 중..." : "청구서 생성"}
-            </button>
-          </div>
+      <div className="stat-grid">
+        <div className="stat-card">
+          <div className="stat-card-head"><span className="stat-label">결제 대기</span></div>
+          <div className="stat-value num">{won(unpaidAmount)}</div>
+          <div className="stat-sub">{unpaidInvoices.length}건{overdueCount ? ` · 기한 지남 ${overdueCount}건` : ""}</div>
         </div>
-
-        {/* 결제 현황 요약 + 월 청구 일괄 발행 */}
-        <div className="card">
-          <div className="card-head">
-            <h3 className="card-title">결제 현황 요약</h3>
-            <div className="card-sub">DB 기반 실결제 이력과 미납 현황을 함께 확인하세요.</div>
-          </div>
-          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-            <div className="list-row" style={{ justifyContent: "space-between" }}>
-              <div>
-                <div className="title">미납 청구서</div>
-                <div className="meta">{Array.isArray(unpaidInvoices) ? unpaidInvoices.length : "-"}건</div>
-              </div>
-              <div className="right" style={{ fontWeight: 700 }}>{won(unpaidAmount)}</div>
-            </div>
-            <div className="list-row" style={{ justifyContent: "space-between" }}>
-              <div>
-                <div className="title">연체 건수</div>
-                <div className="meta">{overdueCount}건</div>
-              </div>
-              <div className="badge danger no-dot">연체</div>
-            </div>
-            <div className="list-row" style={{ justifyContent: "space-between" }}>
-              <div>
-                <div className="title">총 결제 내역</div>
-                <div className="meta">{Array.isArray(payments) ? payments.length : "-"}건</div>
-              </div>
-              <div className="right">{Array.isArray(payments) ? won(payments.reduce((sum, p) => sum + (p.amount || 0), 0)) : "-"}</div>
-            </div>
-          </div>
-          <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px dashed var(--border)" }}>
-            <div style={{ fontWeight: 700, marginBottom: 4 }}>🧾 월 청구 일괄 발행</div>
-            <div className="card-sub" style={{ marginBottom: 10 }}>금액을 비우면 설정의 반별 수강료(없으면 기본 수강료)로 학생마다 계산합니다.</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              <input className="input" value={bulkForm.item_name} onChange={(e) => setBulkForm({ ...bulkForm, item_name: e.target.value })} placeholder="청구 항목" />
-              <select className="input" value={bulkForm.class_id} onChange={(e) => setBulkForm({ ...bulkForm, class_id: e.target.value })}>
-                <option value="">재원생 전체</option>
-                {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name}</option>)}
-              </select>
-              <input className="input" type="number" min="1" value={bulkForm.amount} onChange={(e) => setBulkForm({ ...bulkForm, amount: e.target.value })} placeholder="금액(비우면 자동)" />
-              <input className="input" type="date" value={bulkForm.due_date} onChange={(e) => setBulkForm({ ...bulkForm, due_date: e.target.value })} title="납부 기한" />
-            </div>
-            <button className="btn" style={{ marginTop: 10, width: "100%" }} onClick={handleBulkCreate} disabled={bulkBusy || loading}>
-              {bulkBusy ? "발행 중…" : "일괄 발행"}
-            </button>
-          </div>
+        <div className="stat-card">
+          <div className="stat-card-head"><span className="stat-label">이번 달 수납</span></div>
+          <div className="stat-value num success">{won(monthCollected)}</div>
+          <div className="stat-sub">카카오페이·현장 수납 합계</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-card-head"><span className="stat-label">학부모 미연결 청구</span></div>
+          <div className="stat-value num">{unlinkedUnpaid}<span className="unit">건</span></div>
+          <div className="stat-sub">{unlinkedUnpaid ? "학부모 계정이 연결되면 포털에 표시됩니다" : "모든 청구서가 학부모에게 보입니다"}</div>
         </div>
       </div>
 
-      <div className="row cols-2" style={{ gap: 20, marginBottom: 20 }}>
-        {/* 청구서 목록 영역 (수정/삭제 버튼 추가) */}
-        <div className="card">
-          <div className="card-head" style={{ justifyContent: "space-between", alignItems: "flex-end", gap: 12 }}>
-            <div>
-              <h3 className="card-title">청구서 목록</h3>
-              <div className="card-sub">학생 이름, 청구 항목, 금액을 확인하고 결제 링크를 생성하세요.</div>
+      <div className="row cols-2" style={{ gap: 16 }}>
+        <div>
+          <div className="toolbar">
+            <div className="segmented">
+              {[["UNPAID", "결제 대기"], ["PAID", "납부 완료"], ["ALL", "전체"]].map(([k, v]) => (
+                <button key={k} className={statusFilter === k ? "active" : ""} onClick={() => setStatusFilter(k)}>{v}</button>
+              ))}
             </div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <div style={{ display: "flex", gap: 6 }}>
-                {['ALL', 'UNPAID', 'PAID'].map((status) => (
-                  <button
-                    key={status}
-                    className={`btn sm ${statusFilter === status ? '' : 'ghost'}`}
-                    style={{ minWidth: 78 }}
-                    onClick={() => setStatusFilter(status)}
-                  >
-                    {status === 'ALL' ? '전체' : status === 'UNPAID' ? '미납' : '납부'}
-                  </button>
-                ))}
-              </div>
-              <input
-                className="input"
-                type="search"
-                placeholder="학생 이름 또는 청구번호 검색"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                style={{ width: 220, maxWidth: "100%" }}
-              />
-            </div>
+            <input className="input" type="search" placeholder="학생·항목 검색" value={search} onChange={(e) => setSearch(e.target.value)} style={{ flex: "1 1 160px" }} />
           </div>
-          {allInvoices === null ? (
-            <div className="empty">불러오는 중…</div>
-          ) : filteredInvoices.length === 0 ? (
-            <div className="empty">검색 결과가 없습니다.</div>
+          {allInvoices === null ? <div className="fl-skeleton" style={{ height: 200 }} /> : filteredInvoices.length === 0 ? (
+            <div className="empty">{statusFilter === "UNPAID" ? "결제 대기 중인 청구서가 없습니다." : "청구서가 없습니다."}</div>
           ) : (
-            <div style={{ display: "grid", gap: 12 }}>
+            <div className="ck-list">
               {filteredInvoices.map((invoice) => {
-                const due = invoice.due_date ? formatDate(invoice.due_date) : "기한 없음";
-                const isOverdue = invoice.status === "UNPAID" && invoice.due_date ? invoice.due_date < localToday() : false;
+                const due = dueText(invoice);
+                const linked = memberById[invoice.member_id]?.parent_linked;
                 return (
-                  <div key={invoice.invoice_id} className="list-row" style={{ alignItems: "center" }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div className="title">{invoice.member_name || "알 수 없음"}</div>
-                      <div className="meta">{invoice.item_name} · 청구번호 {invoice.invoice_id}</div>
-                      <div className="meta">납부기한: {due}</div>
-                    </div>
-                    <div style={{ textAlign: "right", minWidth: 120 }}>
-                      <div style={{ fontWeight: 700, marginBottom: 6 }}>{won(invoice.amount)}</div>
-
-                      <div style={{ display: "flex", gap: 4, justifyContent: "flex-end", marginBottom: 8 }}>
-                        <div className={`badge ${invoice.status === "PAID" ? "success" : isOverdue ? "danger" : "warning"} no-dot`} style={{ marginRight: "auto" }}>
-                          {isOverdue ? "연체" : invoice.status === "PAID" ? "납부완료" : "미납"}
-                        </div>
-                        {/* ✨ 상태가 미납일 때만 수정/삭제 버튼 표시 */}
-                        {invoice.status !== "PAID" && (
-                          <>
-                            <button className="btn ghost sm" style={{ padding: "0 6px" }} onClick={() => setEditingInvoice(invoice)}>수정</button>
-                            <button className="btn danger sm" style={{ padding: "0 6px" }} onClick={() => handleDeleteInvoice(invoice.invoice_id)}>삭제</button>
-                          </>
-                        )}
+                  <div key={invoice.invoice_id} className="ck-row">
+                    <div style={{ minWidth: 0 }}>
+                      <div className="who">
+                        <b>{invoice.member_name || "알 수 없음"}</b>
+                        <span style={{ fontSize: 13 }}>{invoice.item_name}</span>
                       </div>
-
-                      {invoice.status === "PAID" ? (
-                        <button className="btn outline sm" style={{ width: "100%" }} disabled>결제 완료</button>
-                      ) : (
-                        <div style={{ display: "flex", gap: 4 }}>
-                          <button className="btn sm" style={{ flex: 1 }} onClick={() => setPayingInvoice({ invoice, method: "CASH" })} title="현금·계좌이체·카드 단말기로 받은 경우">현장 수납</button>
-                          <button className="btn outline sm" style={{ flex: 1 }} onClick={() => handlePay(invoice)} title="카카오페이 결제창 열기">카카오페이</button>
-                        </div>
+                      <div className="muted">
+                        {invoice.due_date ? `기한 ${formatDate(invoice.due_date)}` : "기한 없음"}
+                        {invoice.status !== "PAID" && memberById[invoice.member_id] ? (linked ? " · 🔗 학부모 포털에 표시 중" : " · 학부모 계정 미연결") : ""}
+                      </div>
+                    </div>
+                    <div className="right">
+                      <div className="num" style={{ fontWeight: 700 }}>{won(invoice.amount)}</div>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: due.color }}>{due.text}</div>
+                    </div>
+                    <div className="ck-actions">
+                      {invoice.status !== "PAID" && (
+                        <>
+                          <button className="btn sm" onClick={() => setPayingInvoice({ invoice, method: "CASH" })}>현장 수납</button>
+                          <button className="btn ghost sm" onClick={() => handlePay(invoice)}>카카오페이</button>
+                          <button className="btn ghost sm" onClick={() => setEditingInvoice(invoice)}>수정</button>
+                          <button className="btn danger sm" onClick={() => handleDeleteInvoice(invoice.invoice_id)}>삭제</button>
+                        </>
                       )}
                     </div>
                   </div>
@@ -428,56 +322,86 @@ export default function AdminCheckout() {
           )}
         </div>
 
-        {/* 최근 결제 이력 영역 (기존 유지) */}
-        <div className="card">
-          <div className="card-head">
-            <div>
-              <h3 className="card-title">최근 결제 이력</h3>
-              <div className="card-sub">최근 결제 내역을 DB에서 불러옵니다.</div>
+        <div style={{ display: "grid", gap: 16, alignContent: "start" }}>
+          <div className="card">
+            <h3 className="card-title" style={{ marginBottom: 12 }}>청구서 발행</h3>
+            <div className="form-row">
+              <label>학생</label>
+              <select className="select" value={invoiceForm.member_id}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  const fee = id ? suggestedFee(Number(id)) : 0;
+                  setInvoiceForm((prev) => ({ ...prev, member_id: id, amount: prev.amount || (fee ? String(fee) : "") }));
+                }}>
+                <option value="">학생 선택</option>
+                {members.map((m) => <option key={m.member_id} value={m.member_id}>{m.name}{m.parent_linked ? "" : " (학부모 미연결)"}</option>)}
+              </select>
             </div>
+            <div className="form-row"><label>항목</label>
+              <input className="input" value={invoiceForm.item_name} onChange={(e) => setInvoiceForm((p) => ({ ...p, item_name: e.target.value }))} /></div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div className="form-row"><label>금액 (원)</label>
+                <input className="input" type="number" min="1" value={invoiceForm.amount} onChange={(e) => setInvoiceForm((p) => ({ ...p, amount: e.target.value }))} /></div>
+              <div className="form-row"><label>납부 기한</label>
+                <input className="input" type="date" value={invoiceForm.due_date} onChange={(e) => setInvoiceForm((p) => ({ ...p, due_date: e.target.value }))} /></div>
+            </div>
+            <button className="btn" style={{ width: "100%", justifyContent: "center" }} onClick={handleCreateInvoice} disabled={isCreating || loading}>
+              {isCreating ? "발행 중…" : "발행"}
+            </button>
           </div>
-          {payments === null ? (
-            <div className="empty">불러오는 중…</div>
-          ) : payments.length === 0 ? (
-            <div className="empty">결제 기록이 없습니다.</div>
-          ) : (
-            <div style={{ display: "grid", gap: 12 }}>
-              {recentPayments.map((payment) => (
-                <div key={payment.payment_id} className="list-row" style={{ flexWrap: "wrap", gap: 10 }}>
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div className="title">{payment.member_name || "알 수 없음"}</div>
-                    <div className="meta">{METHOD_LABEL[payment.method] || payment.method || "-"} · {payment.note || payment.payment_type}</div>
+
+          <div className="card">
+            <h3 className="card-title" style={{ marginBottom: 12 }}>월 수강료 일괄 발행</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <input className="input" value={bulkForm.item_name} onChange={(e) => setBulkForm({ ...bulkForm, item_name: e.target.value })} placeholder="항목" />
+              <select className="select" value={bulkForm.class_id} onChange={(e) => setBulkForm({ ...bulkForm, class_id: e.target.value })}>
+                <option value="">재원생 전체</option>
+                {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name}</option>)}
+              </select>
+              <input className="input" type="number" min="1" value={bulkForm.amount} onChange={(e) => setBulkForm({ ...bulkForm, amount: e.target.value })} placeholder="금액(비우면 수업별 수강료)" />
+              <input className="input" type="date" value={bulkForm.due_date} onChange={(e) => setBulkForm({ ...bulkForm, due_date: e.target.value })} aria-label="납부 기한" />
+            </div>
+            <button className="btn ghost" style={{ marginTop: 10, width: "100%", justifyContent: "center" }} onClick={handleBulkCreate} disabled={bulkBusy || loading}>
+              {bulkBusy ? "발행 중…" : "일괄 발행"}
+            </button>
+          </div>
+
+          <div className="card">
+            <h3 className="card-title" style={{ marginBottom: 6 }}>최근 결제</h3>
+            {payments === null ? <div className="fl-skeleton" style={{ height: 120 }} /> : payments.length === 0 ? <div className="muted">결제 기록이 없습니다.</div> : (
+              payments.slice(0, 8).map((p) => (
+                <div key={p.payment_id} className="ck-pay">
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 600 }}>{p.member_name || "알 수 없음"}</div>
+                    <div className="muted">{METHOD_LABEL[p.method] || p.method || "-"} · {p.note || p.payment_type}</div>
                   </div>
                   <div style={{ textAlign: "right" }}>
-                    <div style={{ fontWeight: 700 }}>{won(payment.amount)}</div>
-                    <div className="meta">{formatDate(payment.paid_at)}</div>
+                    <div style={{ fontWeight: 700 }}>{won(p.amount)}</div>
+                    <div className="muted">{formatDate(p.paid_at)}</div>
                   </div>
                 </div>
-              ))}
-            </div>
-          )}
+              ))
+            )}
+          </div>
         </div>
       </div>
 
-      {/* ✨ 청구서 수정용 모달(Modal) */}
       {payingInvoice && (
         <div className="modal-backdrop" onClick={() => setPayingInvoice(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 420 }}>
-            <h3>현장 수납 처리</h3>
-            <p className="meta" style={{ marginBottom: 12 }}>
+            <h3>현장 수납</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
               {payingInvoice.invoice.member_name} · {payingInvoice.invoice.item_name} · <b>{won(payingInvoice.invoice.amount)}</b><br />
-              실제로 돈을 받은 뒤에 눌러 주세요. 결제 이력에 기록되고 학부모에게 납부 확인 알림이 갑니다.
+              실제로 받은 뒤 처리하세요. 학부모에게 납부 확인 알림이 갑니다.
             </p>
             <div className="segmented" style={{ marginBottom: 12 }}>
               {["CASH", "TRANSFER", "CARD"].map((m) => (
-                <button key={m} type="button" className={payingInvoice.method === m ? "active" : ""} onClick={() => setPayingInvoice({ ...payingInvoice, method: m })}>
-                  {METHOD_LABEL[m]}
-                </button>
+                <button key={m} type="button" className={payingInvoice.method === m ? "active" : ""} onClick={() => setPayingInvoice({ ...payingInvoice, method: m })}>{METHOD_LABEL[m]}</button>
               ))}
             </div>
             <div className="modal-actions">
               <button className="btn ghost" onClick={() => setPayingInvoice(null)}>취소</button>
-              <button className="btn" onClick={handleMarkPaid}>{METHOD_LABEL[payingInvoice.method]} 수납 완료</button>
+              <button className="btn" onClick={handleMarkPaid}>수납 완료</button>
             </div>
           </div>
         </div>
@@ -486,50 +410,22 @@ export default function AdminCheckout() {
       {editingInvoice && (
         <div className="modal-backdrop" onClick={() => setEditingInvoice(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>청구서 수정</h3>
-            <div className="card-sub" style={{ marginBottom: 16 }}>{editingInvoice.member_name} 학생의 청구 내역을 수정합니다.</div>
-
-            <div className="form-row">
-              <label>청구 항목</label>
-              <input
-                className="input"
-                value={editingInvoice.item_name}
-                onChange={(e) => setEditingInvoice({ ...editingInvoice, item_name: e.target.value })}
-              />
+            <h3>청구서 수정 · {editingInvoice.member_name}</h3>
+            <div className="form-row"><label>항목</label>
+              <input className="input" value={editingInvoice.item_name} onChange={(e) => setEditingInvoice({ ...editingInvoice, item_name: e.target.value })} /></div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div className="form-row"><label>금액</label>
+                <input className="input" type="number" min="1" value={editingInvoice.amount} onChange={(e) => setEditingInvoice({ ...editingInvoice, amount: e.target.value })} /></div>
+              <div className="form-row"><label>납부 기한</label>
+                <input className="input" type="date" value={editingInvoice.due_date || ""} onChange={(e) => setEditingInvoice({ ...editingInvoice, due_date: e.target.value })} /></div>
             </div>
-
-            <div className="form-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-              <div>
-                <label>금액</label>
-                <input
-                  className="input"
-                  type="number"
-                  min="1"
-                  value={editingInvoice.amount}
-                  onChange={(e) => setEditingInvoice({ ...editingInvoice, amount: e.target.value })}
-                />
-              </div>
-              <div>
-                <label>납부 기한</label>
-                <input
-                  className="input"
-                  type="date"
-                  value={editingInvoice.due_date || ""}
-                  onChange={(e) => setEditingInvoice({ ...editingInvoice, due_date: e.target.value })}
-                />
-              </div>
-            </div>
-
-            <div className="modal-actions" style={{ marginTop: 20 }}>
+            <div className="modal-actions">
               <button className="btn ghost" onClick={() => setEditingInvoice(null)} disabled={isUpdating}>취소</button>
-              <button className="btn" onClick={handleUpdateInvoice} disabled={isUpdating}>
-                {isUpdating ? "저장 중..." : "변경사항 저장"}
-              </button>
+              <button className="btn" onClick={handleUpdateInvoice} disabled={isUpdating}>{isUpdating ? "저장 중…" : "저장"}</button>
             </div>
           </div>
         </div>
       )}
-
     </div>
   );
 }

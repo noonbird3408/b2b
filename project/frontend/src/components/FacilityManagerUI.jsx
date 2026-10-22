@@ -1,111 +1,100 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { devSignIn, fetchGoogleAuthConfig, fetchMe, selectRole, signInWithGoogle, signOut } from "../api";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import {
+  createFacility, deleteFacility, devSignIn, enterFacility, errorText, fetchFacilities, fetchGoogleAuthConfig, fetchMe,
+  selectRole, signInWithGoogle, signOut, updateFacility,
+} from "../api";
+import Brand from "./Brand.jsx";
 
 // =====================================================================
-// 디자인 시스템
+// 메인(/) : 로그인 → 역할 선택(학부모/관리자) → 관리자는 시설 선택·생성·수정·삭제
+//   학부모는 /parentportal (시설 검색·입장) 으로 이동
 // =====================================================================
 const STYLES = `
-.fm-root *{box-sizing:border-box;}
-.fm-root{font-family:var(--font-sans);color:var(--text);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1;}
-.fm-root button{font-family:inherit;cursor:pointer;}
-.public-wrap{min-height:100vh;background:linear-gradient(160deg, rgba(59,130,246,0.12) 0%, var(--bg) 40%);display:flex;flex-direction:column;}
-.public-header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 28px;display:flex;align-items:center;gap:12px;}
-.public-header .logo{width:34px;height:34px;background:var(--primary);border-radius:8px;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;}
-.public-body{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 20px;}
-.landing-hero{text-align:center;max-width:760px;width:100%;}
-.landing-hero h1{font-size:30px;font-weight:800;letter-spacing:-.025em;margin:0 0 8px;}
-.landing-hero p{font-size:15px;color:var(--text-2);margin:0 0 32px;}
-.choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
-@media (max-width:680px){.choice-grid{grid-template-columns:1fr;}}
-.choice-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:30px 26px;text-align:left;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s;}
-.choice-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--primary);}
-.choice-card .ico{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:26px;margin-bottom:16px;}
-.choice-card h2{font-size:19px;font-weight:700;margin:0 0 6px;}
-.choice-card p{font-size:13px;color:var(--text-2);margin:0 0 16px;line-height:1.55;}
-.choice-card .go{font-size:13px;font-weight:700;color:var(--primary);}
-.admin-tools{max-width:820px;width:100%;}
-.admin-tools-heading{text-align:center;margin-bottom:24px;}
-.admin-tools-heading h1{font-size:25px;margin:0 0 6px;}
-.admin-tools-heading p{font-size:13px;color:var(--text-2);margin:0;}
-.admin-tools-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;}
-.admin-tool-card{display:flex;flex-direction:column;align-items:flex-start;width:100%;padding:24px;background:var(--surface);border:1px solid var(--border);border-radius:12px;text-align:left;transition:border-color .15s,transform .15s,box-shadow .15s;}
-.admin-tool-card:hover{transform:translateY(-2px);border-color:var(--primary);box-shadow:var(--shadow);}
-.admin-tool-card .ico{width:46px;height:46px;display:grid;place-items:center;margin-bottom:14px;border-radius:8px;font-size:23px;}
-.admin-tool-card h2{font-size:17px;margin:0 0 5px;}
-.admin-tool-card p{font-size:12px;color:var(--text-2);margin:0 0 17px;line-height:1.6;}
-.admin-tool-card .go{margin-top:auto;color:var(--primary-text);font-size:12px;font-weight:700;}
-.admin-tools-actions{display:flex;justify-content:center;gap:10px;margin-top:18px;}
-.auth-divider{display:flex;align-items:center;gap:10px;margin:18px 0 12px;color:var(--text-3);font-size:11px;}
-.auth-divider:before,.auth-divider:after{content:"";height:1px;flex:1;background:var(--border);}
+.fm-root{min-height:100vh;background:linear-gradient(160deg, rgba(59,130,246,0.10) 0%, var(--bg) 42%);display:flex;flex-direction:column;color:var(--text);}
+.fm-header{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:5;}
+.fm-user{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--text-2);min-width:0;}
+.fm-user img{width:28px;height:28px;border-radius:50%;}
+.fm-user .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;}
+.fm-body{flex:1;display:flex;justify-content:center;padding:36px 20px 48px;}
+.fm-center{align-items:center;}
+.fm-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;width:min(420px,100%);box-shadow:var(--shadow-lg);text-align:center;}
+.fm-card h1{font-size:22px;margin:0 0 6px;}
+.fm-card p{font-size:13px;color:var(--text-2);margin:0 0 20px;}
+.fm-hero{width:min(760px,100%);text-align:center;}
+.fm-hero h1{font-size:28px;font-weight:800;letter-spacing:-.025em;margin:0 0 8px;}
+.fm-hero>p{font-size:14px;color:var(--text-2);margin:0 0 28px;}
+.choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.choice-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:26px 24px;text-align:left;cursor:pointer;transition:transform .12s,box-shadow .12s,border-color .12s;}
+.choice-card:hover,.choice-card:focus-visible{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--primary);outline:none;}
+.choice-card[aria-disabled="true"]{opacity:.6;cursor:wait;}
+.choice-card .ico{width:50px;height:50px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:25px;margin-bottom:14px;}
+.choice-card h2{font-size:19px;margin:0 0 6px;}
+.choice-card p{font-size:13px;color:var(--text-2);margin:0 0 14px;line-height:1.55;}
+.choice-card .go{font-size:13px;font-weight:700;color:var(--primary-text);}
+.choice-card .invite{margin-top:12px;display:grid;gap:6px;}
+.choice-card .invite .input{width:100%;min-width:0;}
+.fm-link{width:100%;margin-top:10px;padding:6px;border:0;background:transparent;color:var(--primary-text);font-size:12px;font-weight:700;}
 .google-button-wrap{display:flex;justify-content:center;min-height:42px;}
-.google-disabled{padding:10px;border:1px solid var(--border);background:var(--surface-2);color:var(--text-3);font-size:11px;line-height:1.5;}
-.auth-mode-toggle{width:100%;margin-top:12px;padding:8px;border:0;background:transparent;color:var(--primary-text);font:inherit;font-size:12px;font-weight:700;}
-@media (max-width:680px){.admin-tools-grid{grid-template-columns:1fr;gap:10px;}.admin-tool-card{padding:17px;}.admin-tools-heading h1{font-size:21px;}.admin-tools-actions{flex-direction:column;}.admin-tools-actions .btn{justify-content:center;}}
-.public-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;width:min(520px,94vw);box-shadow:var(--shadow-lg);}
-.public-card h2{font-size:20px;font-weight:700;margin:0 0 4px;}
-.public-card .sub{font-size:13px;color:var(--text-2);margin:0 0 20px;}
-.hint-box{background:var(--primary-soft);color:var(--primary-text);border-radius:8px;padding:9px 12px;font-size:12px;margin-bottom:16px;line-height:1.6;}
-.form-row{margin-bottom:14px;}
-.form-row label{display:block;font-size:12px;color:var(--text-2);margin-bottom:5px;font-weight:500;}
-.form-row .input,.form-row .select{width:100%;}
-.form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px;}
-.input,.select{font-family:inherit;font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);transition:border-color .12s;min-height:36px;}
-.input:focus,.select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.1);}
-.btn{font-size:13px;font-weight:600;padding:8px 14px;border-radius:8px;border:1px solid transparent;background:var(--primary);color:#fff;transition:background .12s;min-height:36px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;}
-.btn:hover{background:var(--primary-hover);}
-.btn.ghost{background:var(--surface);color:var(--text);border-color:var(--border);font-weight:500;}
-.btn.ghost:hover{background:var(--surface-hover);}
-.btn.danger{background:transparent;color:var(--danger);border-color:var(--border);font-weight:500;}
-.btn.danger:hover{background:var(--danger-soft);}
-.btn.sm{padding:5px 10px;font-size:12px;min-height:28px;}
-.linkbtn{background:none;border:none;color:var(--text-2);font-size:13px;cursor:pointer;padding:6px 8px;border-radius:6px;}
-.linkbtn:hover{background:var(--surface-hover);color:var(--text);}
-.empty{padding:56px 20px;text-align:center;color:var(--text-3);font-size:13px;background:var(--surface);border:1px dashed var(--border-strong);border-radius:var(--radius-lg);}
-.role-card{position:relative;}
-.role-card .invite{margin-top:12px;display:grid;gap:6px;}
-.role-card .invite .input{width:100%;}
-.role-card[aria-disabled="true"]{opacity:.6;cursor:wait;}
-.user-chip{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:12px;color:var(--text-2);}
-.user-chip img{width:28px;height:28px;border-radius:50%;}
+.google-disabled{padding:10px;border:1px solid var(--border);background:var(--surface-2);color:var(--text-3);font-size:12px;border-radius:8px;}
 .dev-login{margin-top:14px;padding-top:12px;border-top:1px dashed var(--border);display:grid;gap:8px;}
+.dev-login .input{min-width:0;}
+.fac-wrap{width:min(1080px,100%);}
+.fac-head{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:18px;}
+.fac-head h1{font-size:24px;margin:0;}
+.fac-head p{margin:4px 0 0;color:var(--text-2);font-size:13px;}
+.fac-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;}
+.fac-card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px;cursor:pointer;transition:border-color .12s,box-shadow .12s,transform .12s;text-align:left;}
+.fac-card:hover,.fac-card:focus-visible{border-color:var(--primary);box-shadow:var(--shadow);transform:translateY(-2px);outline:none;}
+.fac-card.current{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-soft);}
+.fac-card .top{display:flex;gap:12px;align-items:center;}
+.fac-card .logo{width:44px;height:44px;border-radius:10px;background:var(--primary-soft);color:var(--primary-text);display:grid;place-items:center;font-weight:800;font-size:18px;overflow:hidden;flex-shrink:0;}
+.fac-card .logo img{width:100%;height:100%;object-fit:cover;}
+.fac-card h3{margin:0;font-size:16px;line-height:1.3;}
+.fac-card .meta{font-size:12px;color:var(--text-3);}
+.fac-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;}
+.fac-stats div{background:var(--surface-2);border-radius:8px;padding:7px 8px;text-align:center;}
+.fac-stats b{display:block;font-size:16px;}
+.fac-stats span{font-size:11px;color:var(--text-3);}
+.fac-actions{display:flex;gap:6px;margin-top:auto;}
+.fac-new{border:1.5px dashed var(--border-strong);background:transparent;align-items:center;justify-content:center;min-height:180px;color:var(--text-2);font-weight:700;}
+.fac-new .plus{font-size:28px;line-height:1;color:var(--primary);}
+.fac-alert{position:absolute;top:12px;right:12px;}
+.fm-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;}
+.fm-form-grid .full{grid-column:1/-1;}
+.fm-check{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--text-2);}
+@media(max-width:640px){
+  .fm-header{padding:10px 12px;gap:8px;}
+  .fm-user .name{display:none;}
+  .fm-body{padding:22px 12px 32px;}
+  .fm-hero h1{font-size:22px;}
+  .choice-grid,.fm-form-grid{grid-template-columns:1fr;}
+  .fac-head h1{font-size:20px;}
+}
 `;
 
-function Banner({ tone, children }) {
-  const map = {
-    success: ["var(--success-soft)", "var(--success-text)", "var(--success)"],
-    warning: ["var(--warning-soft)", "var(--warning-text)", "var(--warning)"],
-    danger: ["var(--danger-soft)", "var(--danger-text)", "var(--danger)"],
-  };
-  const [bg, color, border] = map[tone] || map.warning;
-  return (
-    <div role="alert" style={{ background: bg, color, border: `1px solid ${border}`, borderRadius: 8,
-      padding: "10px 14px", fontSize: 13, fontWeight: 500, marginBottom: 14 }}>
-      {children}
-    </div>
-  );
+function Banner({ tone = "danger", children }) {
+  return <div className={`fl-banner ${tone}`} role="alert">{children}</div>;
 }
 
-function Header({ title, me, onLogout, onBack }) {
+function Header({ me, onRole, onLogout }) {
   return (
-    <div className="public-header">
-      <div className="logo">학</div>
-      <div className="sidebar-brand-name">{title}</div>
+    <header className="fm-header">
+      <Brand />
       {me ? (
-        <div className="user-chip">
+        <div className="fm-user">
           {me.user.picture && <img src={me.user.picture} alt="" referrerPolicy="no-referrer" />}
-          <span>{me.user.name || me.user.email}</span>
-          {onBack && <button className="linkbtn" onClick={onBack}>역할 선택</button>}
-          <button className="linkbtn" onClick={onLogout}>로그아웃</button>
+          <span className="name">{me.user.name || me.user.email}</span>
+          {onRole && <button className="btn ghost sm" type="button" onClick={onRole}>역할 변경</button>}
+          <button className="btn ghost sm" type="button" onClick={onLogout}>로그아웃</button>
         </div>
       ) : null}
-    </div>
+    </header>
   );
 }
 
 function GoogleSignInButton({ config, disabled, onCredential }) {
   const buttonRef = useRef(null);
-
   useEffect(() => {
     if (!config?.enabled || !buttonRef.current || disabled) return undefined;
     let timer;
@@ -118,81 +107,70 @@ function GoogleSignInButton({ config, disabled, onCredential }) {
       }
       buttonRef.current.replaceChildren();
       identity.initialize({ client_id: config.client_id, callback: (result) => result.credential && onCredential(result.credential) });
-      identity.renderButton(buttonRef.current, { theme: "outline", size: "large", text: "continue_with", width: 300, locale: "ko" });
+      identity.renderButton(buttonRef.current, { theme: "outline", size: "large", text: "continue_with", width: 280, locale: "ko" });
     };
     drawButton();
     return () => window.clearTimeout(timer);
   }, [config, disabled, onCredential]);
 
-  if (!config?.enabled) {
-    return <div className="google-disabled">Google 로그인을 사용하려면 서버에 GOOGLE_CLIENT_ID 설정이 필요합니다. (README 참고)</div>;
-  }
+  if (!config?.enabled) return <div className="google-disabled">Google 로그인 설정(GOOGLE_CLIENT_ID)이 필요합니다.</div>;
   return <div className="google-button-wrap" ref={buttonRef} aria-label="Google 계정으로 계속하기" />;
 }
 
-/* 1단계: Google 로그인 */
 function LoginScreen({ config, error, busy, onCredential, onDevLogin }) {
   const [devEmail, setDevEmail] = useState("");
   return (
-    <div className="public-wrap">
-      <Header title="시설 통합 관리 시스템" />
-      <div className="public-body">
-        <div className="public-card" style={{ width: "min(420px,94vw)", textAlign: "center" }}>
-          <h2>로그인</h2>
-          <div className="sub">Google 계정으로 로그인한 뒤 학부모 또는 관리자 화면을 선택합니다.</div>
-          {error && <Banner tone="danger">{error}</Banner>}
-          <GoogleSignInButton config={config} disabled={busy} onCredential={onCredential} />
-          {config?.dev_login && (
-            <form className="dev-login" onSubmit={(e) => { e.preventDefault(); onDevLogin(devEmail); }}>
-              <span style={{ fontSize: 11, color: "var(--text-3)" }}>개발 모드 로그인 (DEV_LOGIN_ENABLED=true, 로컬 전용)</span>
-              <input className="input" type="email" placeholder="test@example.com" value={devEmail} onChange={(e) => setDevEmail(e.target.value)} required />
-              <button className="btn ghost" type="submit" disabled={busy} style={{ justifyContent: "center" }}>개발용으로 로그인</button>
-            </form>
-          )}
-        </div>
+    <div className="fm-body fm-center">
+      <div className="fm-card">
+        <h1>facilink 시작하기</h1>
+        <p>학원·체육관·도장을 한곳에서 관리하고 소통합니다.</p>
+        {error && <Banner>{error}</Banner>}
+        <GoogleSignInButton config={config} disabled={busy} onCredential={onCredential} />
+        {config?.dev_login && (
+          <form className="dev-login" onSubmit={(e) => { e.preventDefault(); onDevLogin(devEmail); }}>
+            <small style={{ color: "var(--text-3)" }}>개발 모드 로그인 (로컬 전용)</small>
+            <input className="input" type="email" placeholder="test@example.com" value={devEmail}
+              onChange={(e) => setDevEmail(e.target.value)} required />
+            <button className="btn ghost" type="submit" disabled={busy} style={{ justifyContent: "center" }}>개발용으로 로그인</button>
+          </form>
+        )}
       </div>
     </div>
   );
 }
 
-/* 2단계: 역할 선택 (학부모 / 관리자) — 관리자 권한은 서버가 판정 */
-function RoleSelect({ me, error, busy, onParent, onAdmin, onLogout }) {
+function RoleSelect({ me, error, busy, onParent, onAdmin }) {
   const [inviteCode, setInviteCode] = useState("");
   const [showInvite, setShowInvite] = useState(!me.can_admin);
   return (
-    <div className="public-wrap">
-      <Header title="역할 선택" me={me} onLogout={onLogout} />
-      <div className="public-body">
-        <div className="landing-hero">
-          <h1>어떤 화면으로 들어갈까요?</h1>
-          <p>{me.user.name || me.user.email} 님, 이용할 역할을 선택하세요. 언제든 다시 바꿀 수 있습니다.</p>
-          {error && <Banner tone="danger">{error}</Banner>}
-          <div className="choice-grid">
-            <div className="choice-card role-card" role="button" tabIndex={0} aria-disabled={busy}
-              onClick={() => !busy && onParent()} onKeyDown={(e) => e.key === "Enter" && !busy && onParent()}>
-              <div className="ico" style={{ background: "var(--primary-soft)" }}>👪</div>
-              <h2>학부모</h2>
-              <p>자녀 출결 확인, 수강료 결제, 공지사항과 커뮤니티를 이용합니다.</p>
-              <div className="go">학부모 화면으로 →</div>
-            </div>
-            <div className="choice-card role-card" role="button" tabIndex={0} aria-disabled={busy}
-              onClick={() => !busy && onAdmin(inviteCode)} onKeyDown={(e) => e.key === "Enter" && !busy && onAdmin(inviteCode)}>
-              <div className="ico" style={{ background: "var(--warning-soft)" }}>🔐</div>
-              <h2>관리자</h2>
-              <p>시설 관리(학생·수업·출결·결제)와 쇼핑몰 추천을 이용합니다.</p>
-              {me.can_admin
-                ? <div className="go">{me.admin?.role === "staff" ? "직원" : "원장"} 계정으로 들어가기 →</div>
-                : <div className="go">초대 코드로 관리자 등록 →</div>}
-              {showInvite ? (
-                <div className="invite" onClick={(e) => e.stopPropagation()}>
-                  <input className="input" placeholder="관리자/직원 초대 코드" value={inviteCode}
-                    onChange={(e) => setInviteCode(e.target.value)} autoComplete="one-time-code" />
-                  <small style={{ color: "var(--text-3)", fontSize: 11 }}>원장이 이메일을 미리 등록했다면 코드 없이 들어갈 수 있습니다.</small>
-                </div>
-              ) : (
-                <button type="button" className="auth-mode-toggle" onClick={(e) => { e.stopPropagation(); setShowInvite(true); }}>초대 코드 입력</button>
-              )}
-            </div>
+    <div className="fm-body fm-center">
+      <div className="fm-hero">
+        <h1>어떤 화면으로 들어갈까요?</h1>
+        <p>{me.user.name || me.user.email} 님, 이용할 역할을 선택하세요.</p>
+        {error && <Banner>{error}</Banner>}
+        <div className="choice-grid">
+          <div className="choice-card" role="button" tabIndex={0} aria-disabled={busy}
+            onClick={() => !busy && onParent()} onKeyDown={(e) => e.key === "Enter" && !busy && onParent()}>
+            <div className="ico" style={{ background: "var(--primary-soft)" }}>👪</div>
+            <h2>학부모</h2>
+            <p>시설을 찾아 가입 신청하고, 자녀 출결·수강료·커뮤니티를 이용합니다.</p>
+            <div className="go">학부모로 시작 →</div>
+          </div>
+          <div className="choice-card" role="button" tabIndex={0} aria-disabled={busy}
+            onClick={() => !busy && onAdmin(inviteCode)} onKeyDown={(e) => e.key === "Enter" && !busy && onAdmin(inviteCode)}>
+            <div className="ico" style={{ background: "var(--warning-soft)" }}>🔐</div>
+            <h2>관리자</h2>
+            <p>내 시설을 만들거나 선택해 학생·수업·출결·수납·커뮤니티를 관리합니다.</p>
+            <div className="go">{me.can_admin ? "관리자로 시작 →" : "초대 코드로 등록 →"}</div>
+            {showInvite ? (
+              <div className="invite" onClick={(e) => e.stopPropagation()}>
+                <input className="input" placeholder="관리자/직원 초대 코드" value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)} autoComplete="one-time-code"
+                  onKeyDown={(e) => e.key === "Enter" && !busy && onAdmin(inviteCode)} />
+              </div>
+            ) : (
+              <button type="button" className="fm-link" onClick={(e) => { e.stopPropagation(); setShowInvite(true); }}>초대 코드 입력</button>
+            )}
           </div>
         </div>
       </div>
@@ -200,48 +178,192 @@ function RoleSelect({ me, error, busy, onParent, onAdmin, onLogout }) {
   );
 }
 
-/* 3단계(관리자): 시설 관리 / 쇼핑몰 선택 */
-function AdminWorkspace({ me, onFacility, onShop, onB2B, onBack, onLogout }) {
-  const isOwner = me.admin?.role === "owner";
+const EMPTY_FACILITY = { name: "", facility_type: "학원", branch: "", region: "", address: "", phone: "", description: "",
+  principal: "", base_tuition_fee: "", is_public: true };
+
+function FacilityForm({ initial, onClose, onSaved }) {
+  const [form, setForm] = useState(() => ({ ...EMPTY_FACILITY, ...(initial || {}),
+    base_tuition_fee: initial?.base_tuition_fee ?? "" }));
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setError("");
+    const payload = { ...form, base_tuition_fee: form.base_tuition_fee === "" ? null : Number(form.base_tuition_fee) };
+    try {
+      const saved = initial?.facility_id ? await updateFacility(initial.facility_id, payload) : await createFacility(payload);
+      onSaved(saved);
+    } catch (err) {
+      setError(errorText(err, "시설 정보를 저장하지 못했습니다."));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
-    <div className="public-wrap">
-      <Header title="관리자 업무 선택" me={me} onBack={onBack} onLogout={onLogout} />
-      <div className="public-body">
-        <div className="admin-tools">
-          <div className="admin-tools-heading">
-            <h1>어떤 업무를 시작할까요?</h1>
-            <p>{isOwner ? "원장" : "직원"} 계정 · 나머지 기능은 관리자 메뉴에서 계속 이용할 수 있습니다.</p>
+    <div className="modal-backdrop" onClick={onClose}>
+      <form className="modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h3>{initial?.facility_id ? "시설 정보 수정" : "새 시설 만들기"}</h3>
+        {error && <Banner>{error}</Banner>}
+        <div className="fm-form-grid">
+          <div className="form-row full"><label>시설 이름 *</label>
+            <input className="input" required maxLength={100} value={form.name} onChange={set("name")} placeholder="예: 한빛 태권도장" /></div>
+          <div className="form-row"><label>시설 유형</label>
+            <select className="select" value={form.facility_type} onChange={set("facility_type")}>
+              {["학원", "체육관", "도장", "기타"].map((t) => <option key={t}>{t}</option>)}
+            </select></div>
+          <div className="form-row"><label>지점</label>
+            <input className="input" maxLength={100} value={form.branch} onChange={set("branch")} placeholder="예: 용인 본관" /></div>
+          <div className="form-row"><label>지역 (학부모 검색용)</label>
+            <input className="input" maxLength={50} value={form.region} onChange={set("region")} placeholder="예: 경기 용인시" /></div>
+          <div className="form-row"><label>대표 연락처</label>
+            <input className="input" maxLength={30} value={form.phone} onChange={set("phone")} placeholder="031-000-0000" /></div>
+          <div className="form-row full"><label>주소</label>
+            <input className="input" maxLength={200} value={form.address} onChange={set("address")} /></div>
+          <div className="form-row"><label>원장 이름</label>
+            <input className="input" maxLength={50} value={form.principal} onChange={set("principal")} /></div>
+          <div className="form-row"><label>기본 월 수강료 (원)</label>
+            <input className="input" type="number" min="0" value={form.base_tuition_fee} onChange={set("base_tuition_fee")} /></div>
+          <div className="form-row full"><label>소개</label>
+            <textarea maxLength={1000} value={form.description} onChange={set("description")} placeholder="학부모 검색 화면에 보이는 소개" /></div>
+          <label className="fm-check full"><input type="checkbox" checked={form.is_public} onChange={set("is_public")} /> 학부모 검색에 노출</label>
+        </div>
+        <div className="modal-actions" style={{ marginTop: 16 }}>
+          <button type="button" className="btn ghost" onClick={onClose}>취소</button>
+          <button type="submit" className="btn" disabled={saving}>{saving ? "저장 중…" : "저장"}</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function DeleteFacility({ facility, onClose, onDeleted }) {
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const submit = async (e) => {
+    e.preventDefault();
+    try {
+      await deleteFacility(facility.facility_id, name);
+      onDeleted();
+    } catch (err) {
+      setError(errorText(err, "시설을 삭제하지 못했습니다."));
+    }
+  };
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <form className="modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
+        <h3>시설 삭제</h3>
+        <p style={{ fontSize: 13, color: "var(--text-2)", marginTop: 0 }}>
+          <b>{facility.name}</b> 을(를) 목록에서 삭제합니다. 학생·결제 기록은 보관되며 학부모는 더 이상 이 시설에 들어올 수 없습니다.
+          확인을 위해 시설 이름을 입력하세요.
+        </p>
+        {error && <Banner>{error}</Banner>}
+        <input className="input" style={{ width: "100%" }} value={name} onChange={(e) => setName(e.target.value)} placeholder={facility.name} autoFocus />
+        <div className="modal-actions" style={{ marginTop: 16 }}>
+          <button type="button" className="btn ghost" onClick={onClose}>취소</button>
+          <button type="submit" className="btn" style={{ background: "var(--danger)" }} disabled={name.trim() !== facility.name}>삭제</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function FacilityPicker({ me, onEntered }) {
+  const [items, setItems] = useState(null);
+  const [error, setError] = useState("");
+  const [editing, setEditing] = useState(null);     // {} = 새 시설
+  const [deleting, setDeleting] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+
+  const load = useCallback(() => {
+    fetchFacilities().then(setItems).catch((err) => { setItems([]); setError(errorText(err, "시설 목록을 불러오지 못했습니다.")); });
+  }, []);
+  useEffect(load, [load]);
+
+  const enter = async (facility) => {
+    setBusyId(facility.facility_id);
+    setError("");
+    try {
+      const current = await enterFacility(facility.facility_id);
+      onEntered(current);
+    } catch (err) {
+      setError(errorText(err, "시설에 들어가지 못했습니다."));
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="fm-body">
+      <div className="fac-wrap">
+        <div className="fac-head">
+          <div>
+            <h1>내 시설</h1>
+            <p>관리할 시설을 선택하세요.</p>
           </div>
-          <div className="admin-tools-grid">
-            {isOwner && (
-              <button type="button" className="admin-tool-card" onClick={onFacility}>
-                <span className="ico" style={{ background: "var(--primary-soft)" }}>🏫</span>
-                <h2>시설 관리</h2>
-                <p>대시보드, 학생·수업·출결, 커뮤니티, 원격결제, AI 비서를 관리합니다.</p>
-                <span className="go">시설 관리 열기 →</span>
+          {me.can_create_facility && (
+            <button type="button" className="btn" style={{ marginLeft: "auto" }} onClick={() => setEditing({})}>+ 새 시설</button>
+          )}
+        </div>
+        {error && <Banner>{error}</Banner>}
+        {items === null ? <div className="fl-skeleton" style={{ height: 160 }} /> : (
+          <div className="fac-grid">
+            {items.map((f) => (
+              <div key={f.facility_id} className={`fac-card${me.facility?.facility_id === f.facility_id ? " current" : ""}`}
+                role="button" tabIndex={0} aria-busy={busyId === f.facility_id}
+                onClick={() => enter(f)} onKeyDown={(e) => e.key === "Enter" && enter(f)}>
+                {f.pending_applications > 0 && <span className="badge warning fac-alert no-dot">가입 신청 {f.pending_applications}</span>}
+                <div className="top">
+                  <div className="logo">{f.logo ? <img src={f.logo} alt="" /> : f.name.charAt(0)}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <h3>{f.name}</h3>
+                    <div className="meta">{[f.facility_type, f.branch, f.region].filter(Boolean).join(" · ")}</div>
+                  </div>
+                </div>
+                <div className="fac-stats">
+                  <div><b>{f.student_count}</b><span>학생</span></div>
+                  <div><b>{f.class_count}</b><span>수업</span></div>
+                  <div><b>{f.parent_count}</b><span>학부모</span></div>
+                </div>
+                <div className="fac-actions" onClick={(e) => e.stopPropagation()}>
+                  <span className={`badge ${f.my_role === "owner" ? "primary" : "gray"} no-dot`}>{f.my_role === "owner" ? "원장" : "직원"}</span>
+                  {!f.is_public && <span className="badge gray no-dot">비공개</span>}
+                  {f.my_role === "owner" && (
+                    <>
+                      <button type="button" className="btn ghost sm" style={{ marginLeft: "auto" }} onClick={() => setEditing(f)}>수정</button>
+                      <button type="button" className="btn danger sm" onClick={() => setDeleting(f)}>삭제</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+            {me.can_create_facility && (
+              <button type="button" className="fac-card fac-new" onClick={() => setEditing({})}>
+                <span className="plus">＋</span>새 시설 만들기
               </button>
             )}
-            <button type="button" className="admin-tool-card" onClick={onShop}>
-              <span className="ico" style={{ background: "var(--success-soft)" }}>🛍️</span>
-              <h2>쇼핑몰</h2>
-              <p>DDM 쇼핑몰(ddmmall77.com) 단체복·키링·매달을 우리 시설 일정에 맞춰 추천받습니다.</p>
-              <span className="go">쇼핑몰 열기 →</span>
-            </button>
+            {!items.length && !me.can_create_facility && (
+              <div className="empty" style={{ gridColumn: "1/-1" }}>초대받은 시설이 없습니다. 원장에게 이 Google 계정을 직원으로 등록해 달라고 요청하세요.</div>
+            )}
           </div>
-          <div className="admin-tools-actions">
-            <button type="button" className="btn ghost" onClick={onB2B}>B2B 교재·물품 발주</button>
-          </div>
-        </div>
+        )}
       </div>
+      {editing && <FacilityForm initial={editing.facility_id ? editing : null} onClose={() => setEditing(null)}
+        onSaved={() => { setEditing(null); load(); }} />}
+      {deleting && <DeleteFacility facility={deleting} onClose={() => setDeleting(null)}
+        onDeleted={() => { setDeleting(null); load(); }} />}
     </div>
   );
 }
 
 export default function FacilityManagerUI() {
   const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
   const [me, setMe] = useState(null);
   const [checking, setChecking] = useState(true);
-  const [screen, setScreen] = useState("login"); // login → role → admin-tools
+  const [screen, setScreen] = useState("login"); // login → role → facilities
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -251,10 +373,14 @@ export default function FacilityManagerUI() {
     fetchMe()
       .then((current) => {
         setMe(current);
-        setScreen(current.active_role === "admin" && current.can_admin ? "admin-tools" : "role");
+        if (params.get("role") === "1") setScreen("role");
+        else if (current.active_role === "admin" && current.can_admin) setScreen("facilities");
+        else if (current.active_role === "parent") navigate("/parentportal", { replace: true });
+        else setScreen("role");
       })
       .catch(() => setScreen("login"))
       .finally(() => setChecking(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const run = async (task, fallback) => {
@@ -263,7 +389,7 @@ export default function FacilityManagerUI() {
     try {
       await task();
     } catch (err) {
-      setError(err.response?.data?.detail || fallback);
+      setError(errorText(err, fallback));
     } finally {
       setBusy(false);
     }
@@ -272,6 +398,7 @@ export default function FacilityManagerUI() {
   const afterLogin = (current) => { setMe(current); setScreen("role"); };
   const handleCredential = useCallback(
     (credential) => run(async () => afterLogin(await signInWithGoogle(credential)), "Google 계정 인증에 실패했습니다."),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
   const handleDevLogin = (email) => run(async () => afterLogin(await devSignIn(email, email.split("@")[0])), "개발용 로그인에 실패했습니다.");
@@ -279,30 +406,34 @@ export default function FacilityManagerUI() {
   const handleAdmin = (inviteCode) => run(async () => {
     const current = await selectRole("admin", inviteCode.trim());
     setMe(current);
-    setScreen("admin-tools");
+    setParams({}, { replace: true });
+    setScreen("facilities");
   }, "관리자 권한을 확인하지 못했습니다.");
   const handleLogout = () => run(async () => {
-    try { await signOut(); } finally { window.google?.accounts?.id?.disableAutoSelect?.(); setMe(null); setScreen("login"); }
+    try { await signOut(); } finally {
+      window.google?.accounts?.id?.disableAutoSelect?.();
+      ["app_academy_info", "app_payment_settings", "dashboard_notified_keys"].forEach((k) => { try { localStorage.removeItem(k); } catch { /* 무시 */ } });
+      setMe(null);
+      setScreen("login");
+    }
   }, "로그아웃하지 못했습니다.");
+  const handleEntered = (current) => {
+    setMe(current);
+    navigate(current.facility?.my_role === "owner" ? "/dashboard" : "/attendances");
+  };
 
   if (checking) return <div className="auth-loading">로그인 상태를 확인하고 있습니다.</div>;
 
   return (
     <div className="fm-root">
       <style>{STYLES}</style>
+      <Header me={me} onLogout={handleLogout} onRole={screen === "facilities" ? () => { setError(""); setScreen("role"); } : null} />
       {screen === "login" || !me ? (
         <LoginScreen config={config} error={error} busy={busy} onCredential={handleCredential} onDevLogin={handleDevLogin} />
       ) : screen === "role" ? (
-        <RoleSelect me={me} error={error} busy={busy} onParent={handleParent} onAdmin={handleAdmin} onLogout={handleLogout} />
+        <RoleSelect me={me} error={error} busy={busy} onParent={handleParent} onAdmin={handleAdmin} />
       ) : (
-        <AdminWorkspace
-          me={me}
-          onFacility={() => navigate("/dashboard")}
-          onShop={() => navigate("/shop")}
-          onB2B={() => navigate("/b2b-shop")}
-          onBack={() => { setError(""); setScreen("role"); }}
-          onLogout={handleLogout}
-        />
+        <FacilityPicker me={me} onEntered={handleEntered} />
       )}
     </div>
   );

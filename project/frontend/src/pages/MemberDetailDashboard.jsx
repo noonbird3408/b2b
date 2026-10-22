@@ -1,63 +1,135 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { Link } from "react-router-dom";
+import { useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
-  fetchAttendances, updateMember, analyzeDataWithAI, fetchMemberNotes, createMemberNote, deleteMemberNote,
+  fetchMemberAttendanceSummary, updateMember, analyzeDataWithAI, fetchMemberNotes, createMemberNote, deleteMemberNote,
   notifyMemberParents, errorText,
 } from "../api";
 import { resizeImageFile } from "../utils/image";
+import { STATUS_LABEL, STATUS_TONE, useDataRefresh, won } from "../utils/sync";
 
-const STATUS_KO = { PRESENT: "출석", ABSENT: "결석", LATE: "지각" };
+const STYLES = `
+.md-panel{position:fixed;inset:0;background:rgba(15,23,42,.35);z-index:100;display:flex;justify-content:flex-end;}
+.md-body{width:min(640px,100vw);background:var(--surface);height:100%;overflow-y:auto;padding:22px;box-shadow:-4px 0 24px rgba(0,0,0,.15);}
+.md-head{display:flex;gap:16px;align-items:flex-start;padding-bottom:18px;border-bottom:1px solid var(--border);margin-bottom:18px;}
+.md-photo{position:relative;width:72px;height:72px;flex-shrink:0;}
+.md-photo .avatar{width:100%;height:100%;font-size:26px;overflow:hidden;border:1px solid var(--border);}
+.md-photo label{position:absolute;bottom:-4px;right:-4px;width:28px;height:28px;border-radius:50%;background:var(--primary);display:grid;place-items:center;cursor:pointer;border:2px solid var(--surface);font-size:13px;}
+.md-name{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.md-name h2{margin:0;font-size:21px;}
+.md-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
+.md-actions{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;justify-content:flex-end;}
+.md-grid{display:grid;grid-template-columns:150px 1fr;gap:14px;margin-bottom:18px;}
+.md-ring{position:relative;width:132px;height:132px;margin:auto;}
+.md-ring svg{transform:rotate(-90deg);}
+.md-ring .val{position:absolute;inset:0;display:grid;place-items:center;text-align:center;}
+.md-ring .val b{font-size:26px;display:block;line-height:1;}
+.md-ring .val span{font-size:11px;color:var(--text-3);}
+.md-weeks{display:flex;align-items:flex-end;gap:4px;height:70px;margin-top:6px;}
+.md-weeks div{flex:1;background:var(--primary-soft);border-radius:3px 3px 0 0;position:relative;min-height:3px;}
+.md-weeks div.has{background:var(--primary);}
+.md-class-row{display:grid;grid-template-columns:minmax(0,1fr) 120px 48px;gap:8px;align-items:center;font-size:12.5px;margin-bottom:6px;}
+.md-bar{height:7px;background:var(--surface-hover);border-radius:99px;overflow:hidden;}
+.md-bar i{display:block;height:100%;border-radius:99px;}
+.md-info{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px;}
+.md-box{background:var(--surface-2);padding:12px;border-radius:10px;border:1px solid var(--border);font-size:13px;line-height:1.7;}
+.md-box .t{font-size:12px;color:var(--text-3);margin-bottom:2px;}
+.md-section{margin-bottom:22px;}
+.md-section h3{font-size:15px;margin:0 0 10px;display:flex;align-items:center;gap:8px;}
+.md-att-row{display:grid;grid-template-columns:96px minmax(0,1fr) 56px 90px;gap:8px;align-items:center;padding:8px 4px;border-bottom:1px solid var(--border);font-size:13px;}
+@media(max-width:600px){.md-body{padding:16px;}.md-grid,.md-info{grid-template-columns:1fr;}.md-head{flex-wrap:wrap;}.md-actions{margin-left:0;width:100%;justify-content:flex-start;}.md-att-row{grid-template-columns:84px minmax(0,1fr) 50px;}.md-att-row .time{display:none;}}
+`;
 
-export default function MemberDetailDashboard({ member, enrolledClasses, onClose, onUpdate }) {
-  const [attendances, setAttendances] = useState([]);
-  // v8.1: 상담·특이사항은 시간순 기록으로 서버에 저장 (기존: 저장되지 않는 special_notes 필드)
+function Ring({ value }) {
+  const r = 56;
+  const c = 2 * Math.PI * r;
+  const pct = value == null ? 0 : Math.max(0, Math.min(100, value));
+  const color = value == null ? "var(--border)" : value >= 85 ? "var(--success)" : value >= 70 ? "var(--warning)" : "var(--danger)";
+  return (
+    <div className="md-ring" role="meter" aria-label="출석률" aria-valuemin="0" aria-valuemax="100" aria-valuenow={pct}>
+      <svg width="132" height="132">
+        <circle cx="66" cy="66" r={r} fill="none" stroke="var(--surface-hover)" strokeWidth="12" />
+        <circle cx="66" cy="66" r={r} fill="none" stroke={color} strokeWidth="12" strokeLinecap="round"
+          strokeDasharray={c} strokeDashoffset={c * (1 - pct / 100)} style={{ transition: "stroke-dashoffset .5s" }} />
+      </svg>
+      <div className="val"><div><b>{value == null ? "–" : `${Math.round(value)}%`}</b><span>최근 90일 출석률</span></div></div>
+    </div>
+  );
+}
+
+export default function MemberDetailDashboard({ member, readOnly = false, onClose, onUpdate, onEdit, onDelete }) {
+  const navigate = useNavigate();
+  const [att, setAtt] = useState(null);
   const [notes, setNotes] = useState([]);
   const [noteDraft, setNoteDraft] = useState("");
-  const [isSavingNotes, setIsSavingNotes] = useState(false);
+  const [savingNote, setSavingNote] = useState(false);
   const [notifyOpen, setNotifyOpen] = useState(false);
   const [notifyForm, setNotifyForm] = useState({ title: "안내", message: "" });
   const [aiSummary, setAiSummary] = useState("");
-  const [isSummarizing, setIsSummarizing] = useState(false);
-  
-  // 사진 업로드 상태 및 실시간 렌더링을 위한 로컬 상태
-  const [isUploadingPhoto, setIsUploadingPhoto] = useState(false); 
-  const [localPhotoUrl, setLocalPhotoUrl] = useState(member.photo_url || "");
+  const [summarizing, setSummarizing] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [photo, setPhoto] = useState(member.photo_url || "");
 
-  // 외부에서 member 데이터가 변경되면 로컬 사진 상태도 동기화
+  useEffect(() => { setPhoto(member.photo_url || ""); }, [member.photo_url]);
+
+  const load = useCallback(() => {
+    fetchMemberAttendanceSummary(member.member_id, { days: 90 }).then(setAtt).catch(() => setAtt({ items: [], summary: {}, by_class: [], weekly: [] }));
+    if (!readOnly) fetchMemberNotes(member.member_id).then(setNotes).catch(() => setNotes([]));
+  }, [member.member_id, readOnly]);
+  useEffect(load, [load]);
+  useDataRefresh(load);
+
   useEffect(() => {
-    setLocalPhotoUrl(member.photo_url || "");
-  }, [member.photo_url]);
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
-  useEffect(() => {
-    fetchAttendances({ member_id: member.member_id })
-      .then(data => setAttendances(Array.isArray(data) ? data : []))
-      .catch(() => setAttendances([]));
-    fetchMemberNotes(member.member_id).then(setNotes).catch(() => setNotes([]));
-  }, [member.member_id]);
+  const summary = att?.summary || {};
+  const items = att?.items || [];
+  const classes = member.classes || [];
+  const colorOf = (classId) => classes.find((c) => c.class_id === classId)?.color || "var(--primary)";
 
-  // 최근 30일 출결 통계 (출석률 정의: (출석+지각) ÷ 출결 기록 수)
-  const stats30 = useMemo(() => {
-    const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-    const recent = attendances.filter(a => a.attendance_date >= since);
-    const c = { PRESENT: 0, LATE: 0, ABSENT: 0 };
-    recent.forEach(a => { c[a.status] = (c[a.status] || 0) + 1; });
-    const rate = recent.length ? Math.round(((c.PRESENT + c.LATE) / recent.length) * 100) : null;
-    let streak = 0;
-    for (const a of attendances) { if (a.status === "ABSENT") streak += 1; else break; }
-    return { ...c, total: recent.length, rate, absentStreak: streak };
-  }, [attendances]);
+  const basicSummary = () => {
+    const parts = [];
+    parts.push(summary.records ? `최근 90일 출결 ${summary.records}건: 출석 ${summary.present} · 지각 ${summary.late} · 결석 ${summary.absent} (출석률 ${summary.rate}%).`
+      : "최근 90일 출결 기록이 없습니다.");
+    const weak = (att?.by_class || []).filter((c) => c.rate != null && c.rate < 70);
+    if (weak.length) parts.push(`출석률이 낮은 수업: ${weak.map((c) => `${c.class_name} ${c.rate}%`).join(", ")}.`);
+    if (summary.absent_streak >= 2) parts.push(`최근 ${summary.absent_streak}회 연속 결석 — 보호자 연락 권장.`);
+    if (member.unpaid_count > 0) parts.push(`미납 ${member.unpaid_count}건 (${won(member.unpaid_amount)}).`);
+    return parts.join(" ");
+  };
+
+  const handleSummarize = async () => {
+    setSummarizing(true);
+    try {
+      // 서버가 이름을 가명(S0001)으로 바꾸고 연락처·주소는 보내지 않음 — 여기서도 필요한 필드만 전달
+      const context = {
+        student: { name: member.name, gender: member.gender, age: member.age, status: member.status, classes: classes.map((c) => c.name).join(", ") },
+        attendance_90d: summary, by_class: att?.by_class, weekly: att?.weekly,
+        unpaid: { count: member.unpaid_count || 0, amount: member.unpaid_amount || 0 },
+        counseling_notes: notes.slice(0, 10).map((n) => ({ date: (n.created_at || "").slice(0, 10), content: n.content })),
+      };
+      setAiSummary(await analyzeDataWithAI("이 학생의 수업별 출결 흐름, 미납, 상담 기록을 3~5문장으로 요약하고 관리자가 할 일을 1~2개 제안해 줘.", context));
+    } catch (e) {
+      setAiSummary(`${basicSummary()}\n\n(AI 요약을 사용할 수 없어 기본 통계로 요약했습니다)`);
+    } finally {
+      setSummarizing(false);
+    }
+  };
 
   const handleAddNote = async () => {
     if (!noteDraft.trim()) return;
-    setIsSavingNotes(true);
+    setSavingNote(true);
     try {
       const note = await createMemberNote(member.member_id, noteDraft.trim());
-      setNotes(prev => [note, ...prev]);
+      setNotes((prev) => [note, ...prev]);
       setNoteDraft("");
     } catch (e) {
       alert(errorText(e, "기록을 저장하지 못했습니다."));
     } finally {
-      setIsSavingNotes(false);
+      setSavingNote(false);
     }
   };
 
@@ -65,7 +137,7 @@ export default function MemberDetailDashboard({ member, enrolledClasses, onClose
     if (!window.confirm("이 기록을 삭제할까요?")) return;
     try {
       await deleteMemberNote(noteId);
-      setNotes(prev => prev.filter(n => n.note_id !== noteId));
+      setNotes((prev) => prev.filter((n) => n.note_id !== noteId));
     } catch (e) {
       alert(errorText(e, "기록을 삭제하지 못했습니다."));
     }
@@ -82,193 +154,124 @@ export default function MemberDetailDashboard({ member, enrolledClasses, onClose
     }
   };
 
-  // 기본 요약 (AI 없이 계산) — AI 가 꺼져 있거나 실패해도 시연이 끊기지 않도록
-  const basicSummary = () => {
-    const parts = [];
-    parts.push(stats30.total ? `최근 30일 출결 ${stats30.total}건 중 출석 ${stats30.PRESENT}·지각 ${stats30.LATE}·결석 ${stats30.ABSENT} (출석률 ${stats30.rate}%).`
-      : "최근 30일 출결 기록이 없습니다.");
-    if (stats30.absentStreak >= 2) parts.push(`최근 ${stats30.absentStreak}회 연속 결석 — 보호자 연락을 권장합니다.`);
-    if (member.unpaid_count > 0) parts.push(`미납 청구서 ${member.unpaid_count}건(${Number(member.unpaid_amount).toLocaleString()}원).`);
-    if (notes[0]) parts.push(`최근 상담: “${notes[0].content.slice(0, 60)}${notes[0].content.length > 60 ? "…" : ""}”`);
-    return parts.join(" ");
-  };
-
-  const handleSummarize = async () => {
-    setIsSummarizing(true);
-    try {
-      // 서버가 이름을 가명(S0001)으로 바꾸고 연락처·주소는 아예 보내지 않음 — 여기서도 필요한 필드만 전달
-      const context = {
-        student: { name: member.name, gender: member.gender, age: member.age, status: member.status, classes: enrolledClasses || "" },
-        attendance_30d: stats30,
-        recent_attendances: attendances.slice(0, 30).map(a => ({ date: a.attendance_date, status: a.status })),
-        unpaid: { count: member.unpaid_count || 0, amount: member.unpaid_amount || 0 },
-        counseling_notes: notes.slice(0, 10).map(n => ({ date: (n.created_at || "").slice(0, 10), content: n.content })),
-      };
-      const summary = await analyzeDataWithAI(
-        "이 학생의 출결 흐름, 미납, 상담 기록을 3~5문장으로 요약하고 관리자가 할 일을 1~2개 제안해 줘.", context);
-      setAiSummary(summary);
-    } catch (e) {
-      setAiSummary(`${basicSummary()}\n\n(AI 요약을 사용할 수 없어 기본 통계로 요약했습니다: ${e.message})`);
-    } finally {
-      setIsSummarizing(false);
-    }
-  };
-
-  // 사진 업로드 핸들러
   const handlePhotoUpload = async (e) => {
     const file = e.target.files[0];
+    e.target.value = "";
     if (!file) return;
-    
-    setIsUploadingPhoto(true);
+    setUploading(true);
     try {
-      const dataUrl = await resizeImageFile(file, "profile");   // 512px 로 줄여 업로드(Vercel 4.5MB 한도)
-      setLocalPhotoUrl(dataUrl);
-
-      // DB에 변경된 사진 URL 업데이트
-      const { unpaid_amount: _ua, unpaid_count: _uc, ...memberFields } = member;   // 서버 계산 필드는 보내지 않음
-      const updated = await updateMember(member.member_id, { ...memberFields, photo_url: dataUrl });
-      const newPhotoUrl = updated.photo_url || dataUrl;
-      setLocalPhotoUrl(newPhotoUrl);
-      if (onUpdate) onUpdate();
+      const dataUrl = await resizeImageFile(file, "profile");
+      setPhoto(dataUrl);
+      // 서버 계산 필드(미납·수업 목록 등)는 보내지 않음
+      const { unpaid_amount: _a, unpaid_count: _b, classes: _c, parent_linked: _d, ...fields } = member;
+      const updated = await updateMember(member.member_id, { ...fields, photo_url: dataUrl });
+      setPhoto(updated.photo_url || dataUrl);
+      onUpdate?.();
     } catch (err) {
-      console.error("사진 업로드 에러:", err);
-      alert(err?.response?.data?.detail || err?.message || "사진 업로드 중 오류가 발생했습니다.");
+      alert(errorText(err, err?.message || "사진을 올리지 못했습니다."));
+      setPhoto(member.photo_url || "");
     } finally {
-      setIsUploadingPhoto(false);
+      setUploading(false);
     }
   };
 
+  const shown = showAll ? items : items.slice(0, 5);
+  const maxWeekly = 100;
+
   return (
-    <div className="dashboard-modal-backdrop" style={{ position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.3)", zIndex: 100, display: "flex", justifyContent: "flex-end" }} onClick={onClose}>
-      <div className="dashboard-panel" style={{ width: "600px", background: "var(--surface)", height: "100%", padding: "24px", overflowY: "auto", boxShadow: "-4px 0 24px rgba(0,0,0,0.15)" }} onClick={(e) => e.stopPropagation()}>
-        
-        {/* 상단 프로필 영역 */}
-        <div style={{ display: "flex", alignItems: "center", gap: "20px", marginBottom: "24px", borderBottom: "1px solid var(--border)", paddingBottom: "20px" }}>
-          
-          {/* 프로필 사진 (원형 영역) */}
-          <div style={{ position: "relative", width: "72px", height: "72px", flexShrink: 0 }}>
-            <div 
-              className="avatar" 
-              style={{ 
-                width: "100%", 
-                height: "100%", 
-                borderRadius: "50%", 
-                overflow: "hidden", 
-                backgroundColor: "var(--surface-hover)", 
-                display: "flex", 
-                alignItems: "center", 
-                justifyContent: "center", 
-                fontSize: "28px", 
-                fontWeight: "bold", 
-                color: "var(--text)", 
-                border: "1px solid var(--border)" 
-              }}
-            >
-              {isUploadingPhoto ? (
-                <span style={{ fontSize: "14px", color: "var(--text-2)" }}>⏳</span>
-              ) : localPhotoUrl ? (
-                <img 
-                  src={localPhotoUrl.startsWith("http") || localPhotoUrl.startsWith("data:") ? localPhotoUrl : `${import.meta.env.VITE_API_BASE_URL || ""}${localPhotoUrl}`} 
-                  alt={member.name} 
-                  style={{ width: "100%", height: "100%", objectFit: "cover" }} 
-                />
-              ) : (
-                member.name?.[0]
-              )}
+    <div className="md-panel" onClick={onClose}>
+      <style>{STYLES}</style>
+      <div className="md-body" onClick={(e) => e.stopPropagation()} role="dialog" aria-label={`${member.name} 학생 상세`}>
+        <div className="md-head">
+          <div className="md-photo">
+            <div className="avatar">
+              {uploading ? "⏳" : photo ? <img src={photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : member.name?.[0]}
             </div>
-            
-            {/* 📷 업로드 버튼 */}
-            <label 
-              htmlFor="dashboard-photo-upload" 
-              style={{ 
-                position: "absolute", 
-                bottom: "-4px", 
-                right: "-4px", 
-                cursor: "pointer", 
-                backgroundColor: "var(--primary)", 
-                color: "var(--surface)", 
-                borderRadius: "50%", 
-                width: "28px", 
-                height: "28px", 
-                display: "flex", 
-                alignItems: "center", 
-                justifyContent: "center", 
-                fontSize: "14px", 
-                boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
-                border: "2px solid var(--surface)",
-                transition: "background-color 0.15s"
-              }}
-            >
-              📷
-            </label>
-            <input 
-              id="dashboard-photo-upload" 
-              type="file" 
-              accept="image/*" 
-              style={{ display: "none" }} 
-              onChange={handlePhotoUpload} 
-              disabled={isUploadingPhoto} 
-            />
+            {!readOnly && (
+              <>
+                <label htmlFor="md-photo-upload" title="사진 변경">📷</label>
+                <input id="md-photo-upload" type="file" accept="image/*" style={{ display: "none" }} onChange={handlePhotoUpload} disabled={uploading} />
+              </>
+            )}
           </div>
-
-          {/* 학생 이름 및 정보 */}
-          <div style={{ flex: 1 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <h2 style={{ margin: 0, fontSize: "22px", fontWeight: "700", color: "var(--text)" }}>{member.name}</h2>
-              <span className={`badge ${member.status === "ACTIVE" ? "success" : "gray"}`} style={{ fontSize: "12px" }}>
-                {member.status === "ACTIVE" ? "재원" : "퇴원"}
-              </span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="md-name">
+              <h2>{member.name}</h2>
+              <span className={`badge ${member.status === "ACTIVE" ? "success" : "gray"}`}>{member.status === "ACTIVE" ? "재원" : "퇴원"}</span>
+              {member.parent_linked && <span className="badge primary no-dot" title="학부모 계정 연결됨">학부모 연결</span>}
             </div>
-            <p style={{ margin: "4px 0 0 0", color: "var(--text-2)", fontSize: "14px" }}>
-              {enrolledClasses || "수강 중인 과목이 없습니다."}
-            </p>
+            <div className="md-chips">
+              {classes.length ? classes.map((c) => (
+                <button key={c.class_id} type="button" className="chip" onClick={() => navigate(`/classes?class_id=${c.class_id}`)}
+                  title="수업 관리에서 보기">
+                  <span className="dot" style={{ background: c.color }} />{c.name}
+                </button>
+              )) : <span className="muted">수강 중인 수업이 없습니다.</span>}
+            </div>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignSelf: "flex-start" }}>
-            <button className="btn ghost" onClick={onClose} style={{ color: "var(--text-3)" }} aria-label="닫기">✕</button>
+          <div className="md-actions">
+            {!readOnly && <button className="btn ghost sm" onClick={onEdit}>수정</button>}
+            {!readOnly && <button className="btn danger sm" onClick={onDelete}>삭제</button>}
+            <button className="btn ghost sm" onClick={onClose} aria-label="닫기">✕</button>
           </div>
         </div>
 
-        {/* 기본 정보 카드 섹션 */}
-        <div style={{ marginBottom: "24px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
-            <div style={{ background: "var(--surface-2)", padding: "12px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
-                <div style={{ fontSize: "12px", color: "var(--text-3)", marginBottom: "4px" }}>기본 정보</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>성별: {member.gender === 'M' ? '남' : '여'} / 나이: {member.age}</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>등록일: {member.enrollment_date}</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>결제일: {member.payment_date ? `매월 ${new Date(member.payment_date).getDate()}일` : "-"}</div>
+        {/* 출석률 시각화: 전체 링 + 12주 추이 + 수업별 막대 */}
+        <div className="md-grid">
+          <div className="md-box" style={{ display: "grid", placeItems: "center" }}>
+            <Ring value={summary.rate} />
+            <div className="muted" style={{ textAlign: "center" }}>
+              출석 {summary.present ?? 0} · 지각 {summary.late ?? 0} · 결석 {summary.absent ?? 0}
+              {summary.absent_streak >= 2 && <div style={{ color: "var(--danger)" }}>⚠ {summary.absent_streak}회 연속 결석</div>}
             </div>
-            <div style={{ background: "var(--surface-2)", padding: "12px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
-                <div style={{ fontSize: "12px", color: "var(--text-3)", marginBottom: "4px" }}>연락처 정보</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>부: {member.father_phone || '-'} ({member.father_name || '-'})</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>모: {member.mother_phone || '-'} ({member.mother_name || '-'})</div>
-                <div style={{ fontSize: "14px", color: "var(--text)" }}>주소: {member.address || '-'}</div>
+          </div>
+          <div className="md-box">
+            <div className="t">주별 출석률 (12주)</div>
+            <div className="md-weeks">
+              {(att?.weekly || []).map((w) => (
+                <div key={w.week_start} className={w.records ? "has" : ""} title={`${w.week_start} 주 · ${w.rate ?? "-"}% (${w.records}건)`}
+                  style={{ height: `${w.records ? Math.max(6, ((w.rate || 0) / maxWeekly) * 100) : 4}%` }} />
+              ))}
             </div>
+            <div className="t" style={{ marginTop: 12 }}>수업별 출석률</div>
+            {(att?.by_class || []).length === 0 ? <div className="muted">기록 없음</div> : att.by_class.map((c) => (
+              <div className="md-class-row" key={`${c.class_id}-${c.class_name}`}>
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.class_name}</span>
+                <div className="md-bar"><i style={{ width: `${c.rate || 0}%`, background: colorOf(c.class_id) }} /></div>
+                <b style={{ textAlign: "right" }}>{c.rate == null ? "–" : `${Math.round(c.rate)}%`}</b>
+              </div>
+            ))}
+          </div>
         </div>
 
-        {/* v8.1 요약 카드: 30일 출석률 · 미납 · 학부모 알림 */}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 20 }}>
-          <div style={{ padding: 12, borderRadius: "var(--radius)", border: "1px solid var(--border)" }} title="(출석+지각) ÷ 최근 30일 출결 기록 수">
-            <div style={{ fontSize: 12, color: "var(--text-3)" }}>30일 출석률</div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: stats30.rate != null && stats30.rate < 70 ? "var(--danger)" : "var(--text)" }}>{stats30.rate ?? "–"}{stats30.rate != null && "%"}</div>
-            <div style={{ fontSize: 11, color: "var(--text-3)" }}>{stats30.absentStreak >= 2 ? `⚠ ${stats30.absentStreak}회 연속 결석` : `기록 ${stats30.total}건`}</div>
+        <div className="md-info">
+          <div className="md-box">
+            <div className="t">기본 정보</div>
+            {member.gender === "M" ? "남" : "여"} · {member.age}세<br />
+            등록 {member.enrollment_date}{member.withdrawal_date ? ` · 퇴원 ${member.withdrawal_date}` : ""}<br />
+            결제일 {member.payment_date ? `매월 ${new Date(member.payment_date).getDate()}일` : "-"}
           </div>
-          <div style={{ padding: 12, borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
-            <div style={{ fontSize: 12, color: "var(--text-3)" }}>미납</div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: member.unpaid_count ? "var(--danger)" : "var(--success)" }}>
-              {member.unpaid_count ? `${Number(member.unpaid_amount).toLocaleString()}원` : "없음"}
-            </div>
-            {member.unpaid_count > 0 && <Link to="/admin-checkout" style={{ fontSize: 11 }}>청구서 {member.unpaid_count}건 보기 →</Link>}
+          <div className="md-box">
+            <div className="t">보호자</div>
+            모 {member.mother_name || "-"} {member.mother_phone || ""}<br />
+            부 {member.father_name || "-"} {member.father_phone || ""}<br />
+            {member.address || "주소 미등록"}
           </div>
-          <div style={{ padding: 12, borderRadius: "var(--radius)", border: "1px solid var(--border)", display: "flex", flexDirection: "column", justifyContent: "center", gap: 6 }}>
-            <button className="btn sm" onClick={() => setNotifyOpen(v => !v)}>🔔 학부모 알림</button>
-            <span style={{ fontSize: 11, color: "var(--text-3)" }}>학부모 포털 앱 알림</span>
-          </div>
+        </div>
+
+        <div className="md-section" style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <span className={`badge ${member.unpaid_count ? "danger" : "success"} no-dot`}>
+            {member.unpaid_count ? `미납 ${member.unpaid_count}건 · ${won(member.unpaid_amount)}` : "미납 없음"}
+          </span>
+          {member.unpaid_count > 0 && !readOnly && <button className="btn ghost sm" onClick={() => navigate("/admin-checkout")}>수납 화면 →</button>}
+          {!readOnly && <button className="btn sm" style={{ marginLeft: "auto" }} onClick={() => setNotifyOpen((v) => !v)}>🔔 학부모 알림</button>}
         </div>
         {notifyOpen && (
-          <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 12, marginBottom: 20, background: "var(--surface-2)" }}>
-            <input className="input" maxLength={100} value={notifyForm.title} onChange={(e) => setNotifyForm({ ...notifyForm, title: e.target.value })} style={{ marginBottom: 8 }} />
-            <textarea className="input" maxLength={1000} style={{ height: 80, padding: 10 }} value={notifyForm.message}
-              onChange={(e) => setNotifyForm({ ...notifyForm, message: e.target.value })}
-              placeholder={member.unpaid_count ? `예: ${member.name} 학생의 이번 달 수강료가 아직 납부되지 않았습니다. 학부모 포털에서 결제해 주세요.` : "보낼 내용을 입력하세요."} />
+          <div className="md-box md-section">
+            <input className="input" style={{ width: "100%", marginBottom: 8 }} maxLength={100} value={notifyForm.title}
+              onChange={(e) => setNotifyForm({ ...notifyForm, title: e.target.value })} />
+            <textarea className="input" style={{ width: "100%", height: 80, padding: 10 }} maxLength={1000} value={notifyForm.message}
+              onChange={(e) => setNotifyForm({ ...notifyForm, message: e.target.value })} placeholder="보낼 내용을 입력하세요." />
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginTop: 8 }}>
               <button className="btn sm ghost" onClick={() => setNotifyOpen(false)}>취소</button>
               <button className="btn sm" onClick={handleNotify}>보내기</button>
@@ -276,82 +279,57 @@ export default function MemberDetailDashboard({ member, enrolledClasses, onClose
           </div>
         )}
 
-        {/* 출석 현황 테이블 */}
-        <h3 style={{ fontSize: "16px", marginBottom: "12px", color: "var(--text)" }}>출석 현황 <span style={{ fontSize: 12, color: "var(--text-3)", fontWeight: 400 }}>(최근 30건)</span></h3>
-        <div style={{ overflowX: "auto", marginBottom: "24px", maxHeight: 280, overflowY: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "13px", color: "var(--text)" }}>
-              <thead>
-                <tr style={{ background: "var(--surface-2)" }}>
-                  <th style={{ padding: '10px', borderBottom: '1px solid var(--border)' }}>날짜</th>
-                  <th style={{ padding: '10px', borderBottom: '1px solid var(--border)' }}>상태</th>
-                  <th style={{ padding: '10px', borderBottom: '1px solid var(--border)' }}>등원 시간</th>
-                  <th style={{ padding: '10px', borderBottom: '1px solid var(--border)' }}>하원 시간</th>
-                  <th style={{ padding: '10px', borderBottom: '1px solid var(--border)' }}>비고</th>
-                </tr>
-              </thead>
-              <tbody>
-                {attendances.length > 0 ? (
-                  attendances.slice(0, 30).map(att => (
-                    <tr key={att.attendance_id}>
-                      <td style={{ padding: '8px', borderBottom: '1px solid var(--surface-hover)' }}>{att.attendance_date}</td>
-                      <td style={{ padding: '8px', borderBottom: '1px solid var(--surface-hover)' }}>
-                        {STATUS_KO[att.status] || att.status}
-                      </td>
-                      <td style={{ padding: '8px', borderBottom: '1px solid var(--surface-hover)' }}>{att.check_in_time?.slice(0, 5) || '-'}</td>
-                      <td style={{ padding: '8px', borderBottom: '1px solid var(--surface-hover)' }}>{att.check_out_time?.slice(0, 5) || '-'}</td>
-                      <td style={{ padding: '8px', borderBottom: '1px solid var(--surface-hover)' }}>{att.note || '-'}</td>
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan="5" style={{ textAlign: "center", padding: "16px", color: "var(--text-3)" }}>출석 기록이 없습니다.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-        </div>
-
-        {/* AI 요약 */}
-        <div style={{ marginBottom: "24px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-                <h3 style={{ fontSize: "16px", margin: 0, color: "var(--text)" }}>AI 요약</h3>
-                <button className="btn sm ghost" onClick={handleSummarize} disabled={isSummarizing}>
-                    {isSummarizing ? "요약 중..." : "✨ 요약 생성"}
-                </button>
-            </div>
-            <div style={{ background: "var(--primary-soft)", padding: "16px", borderRadius: "var(--radius)", fontSize: "14px", lineHeight: "1.6", color: "var(--text)", whiteSpace: "pre-wrap" }}>
-                {aiSummary || basicSummary()}
-            </div>
-        </div>
-
-        {/* 상담·특이사항 기록 (시간순) */}
-        <div>
-            <h3 style={{ fontSize: "16px", margin: "0 0 12px", color: "var(--text)" }}>상담·특이사항 기록</h3>
-            <textarea
-                className="input"
-                style={{ height: "90px", resize: "vertical", padding: "12px" }}
-                value={noteDraft}
-                maxLength={2000}
-                onChange={(e) => setNoteDraft(e.target.value)}
-                placeholder="예: 보호자 통화 — 다음 주부터 화·목 반으로 변경 희망"
-            />
-            <div style={{ display: "flex", justifyContent: "flex-end", margin: "8px 0 16px" }}>
-              <button className="btn sm" onClick={handleAddNote} disabled={isSavingNotes || !noteDraft.trim()}>
-                {isSavingNotes ? "저장 중..." : "기록 추가"}
-              </button>
-            </div>
-            {notes.length === 0 ? (
-              <div style={{ color: "var(--text-3)", fontSize: 13, textAlign: "center", padding: 12 }}>아직 기록이 없습니다.</div>
-            ) : notes.map(n => (
-              <div key={n.note_id} style={{ borderLeft: "3px solid var(--primary)", padding: "6px 12px", marginBottom: 10 }}>
-                <div style={{ fontSize: 12, color: "var(--text-3)", display: "flex", justifyContent: "space-between" }}>
-                  <span>{(n.created_at || "").slice(0, 16).replace("T", " ")} · {n.author}</span>
-                  <button className="btn ghost sm" style={{ padding: "0 6px", fontSize: 11 }} onClick={() => handleDeleteNote(n.note_id)}>삭제</button>
+        <div className="md-section">
+          <h3>최근 출결 <span className="muted">{items.length}건</span></h3>
+          {att === null ? <div className="fl-skeleton" style={{ height: 120 }} /> : items.length === 0 ? (
+            <div className="empty" style={{ padding: 20 }}>출결 기록이 없습니다.</div>
+          ) : (
+            <>
+              {shown.map((a) => (
+                <div className="md-att-row" key={a.attendance_id}>
+                  <span className="num">{a.attendance_date.slice(5).replace("-", "/")} ({"일월화수목금토"[new Date(a.attendance_date).getDay()]})</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                    <span className="dot" style={{ width: 8, height: 8, borderRadius: "50%", background: colorOf(a.class_id), flexShrink: 0 }} />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.class_name || "수업 무관"}</span>
+                  </span>
+                  <span className={`badge ${STATUS_TONE[a.status]} no-dot`}>{STATUS_LABEL[a.status] || a.status}</span>
+                  <span className="time muted">{a.check_in_time?.slice(0, 5) || "-"}{a.check_out_time ? ` ~ ${a.check_out_time.slice(0, 5)}` : ""}</span>
                 </div>
-                <div style={{ fontSize: 14, whiteSpace: "pre-wrap", marginTop: 2 }}>{n.content}</div>
-              </div>
-            ))}
+              ))}
+              {items.length > 5 && (
+                <button className="btn ghost sm" style={{ marginTop: 8, width: "100%", justifyContent: "center" }} onClick={() => setShowAll((v) => !v)}>
+                  {showAll ? "접기" : `+ ${items.length - 5}건 더 보기`}
+                </button>
+              )}
+            </>
+          )}
         </div>
+
+        {!readOnly && (
+          <>
+            <div className="md-section">
+              <h3>요약 <button className="btn sm ghost" style={{ marginLeft: "auto" }} onClick={handleSummarize} disabled={summarizing}>{summarizing ? "요약 중…" : "✨ AI 요약"}</button></h3>
+              <div className="md-box" style={{ background: "var(--primary-soft)", whiteSpace: "pre-wrap" }}>{aiSummary || basicSummary()}</div>
+            </div>
+            <div className="md-section">
+              <h3>상담·특이사항</h3>
+              <textarea className="input" style={{ width: "100%", height: 80, padding: 10 }} value={noteDraft} maxLength={2000}
+                onChange={(e) => setNoteDraft(e.target.value)} placeholder="예: 보호자 통화 — 다음 주부터 화·목 반 희망" />
+              <div style={{ display: "flex", justifyContent: "flex-end", margin: "8px 0 12px" }}>
+                <button className="btn sm" onClick={handleAddNote} disabled={savingNote || !noteDraft.trim()}>{savingNote ? "저장 중…" : "기록 추가"}</button>
+              </div>
+              {notes.map((n) => (
+                <div key={n.note_id} style={{ borderLeft: "3px solid var(--primary)", padding: "6px 12px", marginBottom: 10 }}>
+                  <div className="muted" style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{(n.created_at || "").slice(0, 16).replace("T", " ")} · {n.author}</span>
+                    <button className="btn ghost sm" style={{ minHeight: 0, padding: "0 6px" }} onClick={() => handleDeleteNote(n.note_id)}>삭제</button>
+                  </div>
+                  <div style={{ fontSize: 14, whiteSpace: "pre-wrap", marginTop: 2 }}>{n.content}</div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
