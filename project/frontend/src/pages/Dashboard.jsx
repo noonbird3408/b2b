@@ -323,7 +323,7 @@ export default function Dashboard() {
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <div>
               <h3 className="card-title">최근 활동</h3>
-              <div className="card-sub">키오스크·학부모 포털·관리자 동작 로그</div>
+              <div className="card-sub">출석 체크·학부모 포털·관리자 동작 로그</div>
             </div>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
               학부모 앱 활성(7일)<Info text={def.parent_active_7d} />
@@ -483,7 +483,7 @@ function TodoModal({ initial, onClose, onSave }) {
 
 function NotifyModal({ member, brandName, onClose }) {
   const [message, setMessage] = useState(
-    `안녕하세요, ${member.name} 학생 보호자님. ${brandName || "시설"}입니다.\n미납 수강료 ${member.amount.toLocaleString("ko-KR")}원이 확인되어 안내드립니다. 학부모 포털 '결제' 탭에서 바로 결제하실 수 있습니다.`);
+    `안녕하세요, ${member.name} 학생 보호자님. ${brandName || "학원"}입니다.\n미납 수강료 ${member.amount.toLocaleString("ko-KR")}원이 확인되어 안내드립니다. 학부모 포털 '결제' 탭에서 바로 결제하실 수 있습니다.`);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const send = async () => {

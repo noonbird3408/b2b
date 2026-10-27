@@ -42,7 +42,7 @@ def login(email: str, role: str = None, invite_code: str = "") -> TestClient:
 
 
 def create_facility(client: TestClient, name: str, **extra) -> int:
-    """v9: 관리자는 시설을 만들고 '입장'해야 시설 데이터 API 를 쓸 수 있습니다."""
+    """v9: 관리자는 학원을 만들고 '입장'해야 학원 데이터 API 를 쓸 수 있습니다."""
     res = client.post("/api/facilities", json={"name": name, "facility_type": "도장", "region": "경기 용인시", **extra})
     assert res.status_code == 201, res.text
     facility_id = res.json()["facility_id"]
@@ -51,7 +51,7 @@ def create_facility(client: TestClient, name: str, **extra) -> int:
 
 
 def parent_in(email: str, facility_id: int) -> TestClient:
-    """학부모로 로그인 → 시설 입장(커뮤니티 멤버 가입)"""
+    """학부모로 로그인 → 학원 입장(커뮤니티 멤버 가입)"""
     client = login(email, "parent")
     res = client.post(f"/api/parent/facilities/{facility_id}/enter")
     assert res.status_code == 200, res.text

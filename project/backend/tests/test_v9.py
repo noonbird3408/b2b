@@ -1,4 +1,4 @@
-"""v9 기능 테스트 — 여러 시설(테넌트 격리) · 가입 신청 · 수업별 출결 · 게시판형 커뮤니티 · 멤버 제재 · 마이그레이션"""
+"""v9 기능 테스트 — 여러 학원(테넌트 격리) · 가입 신청 · 수업별 출결 · 게시판형 커뮤니티 · 멤버 제재 · 마이그레이션"""
 from datetime import timedelta
 
 import main
@@ -24,14 +24,14 @@ def test_facilities_are_isolated():
     assert all(m["name"] != "격리학생" for m in b.get("/api/members").json())
     assert b.get(f"/api/members/{member['member_id']}").status_code == 404
     assert b.delete(f"/api/classes/{cls['class_id']}").status_code == 404
-    assert b.post(f"/api/facilities/{fa}/enter").status_code == 403           # 남의 시설 입장 불가
+    assert b.post(f"/api/facilities/{fa}/enter").status_code == 403           # 남의 학원 입장 불가
     assert b.put(f"/api/facilities/{fa}", json={"name": "탈취"}).status_code == 403
-    # 시설 데이터가 바뀌면 data_version 이 올라감(화면 동기화 신호)
+    # 학원 데이터가 바뀌면 data_version 이 올라감(화면 동기화 신호)
     before = a.get("/api/sync").json()["data_version"]
     a.post("/api/notices", json={"title": "동기화", "content": "x"})
     assert a.get("/api/sync").json()["data_version"] > before
     assert b.get("/api/sync").json()["data_version"] == 0 or fb
-    # 열(column)만 고르는 조회·집계·게시판도 시설별로 분리되는지
+    # 열(column)만 고르는 조회·집계·게시판도 학원별로 분리되는지
     assert str(member["member_id"]) not in b.get("/api/enrollments/by-member").json()
     assert all(i.get("title") != "동기화" for i in b.get("/api/community/board").json()["items"])
     assert b.get("/api/dashboard/insights").json()["members"]["active"] == 0
@@ -40,10 +40,10 @@ def test_facilities_are_isolated():
 
 def test_facility_delete_requires_name_and_is_soft():
     owner = login("del-owner@example.com", "admin", "owner-invite-code")
-    fid = create_facility(owner, "지울 시설")
+    fid = create_facility(owner, "지울 학원")
     assert owner.delete(f"/api/facilities/{fid}", params={"confirm_name": "다른 이름"}).status_code == 400
-    assert owner.delete(f"/api/facilities/{fid}", params={"confirm_name": "지울 시설"}).status_code == 204
-    assert owner.get("/api/members").status_code == 428                       # 시설 선택 해제됨
+    assert owner.delete(f"/api/facilities/{fid}", params={"confirm_name": "지울 학원"}).status_code == 204
+    assert owner.get("/api/members").status_code == 428                       # 학원 선택 해제됨
     assert all(f["facility_id"] != fid for f in owner.get("/api/facilities").json())
 
 
@@ -52,7 +52,7 @@ def test_parent_search_apply_and_admin_approve(owner):
     owner.put(f"/api/facilities/{owner.facility_id}", json={"name": "테스트 태권도장", "facility_type": "도장",
                                                             "region": "경기 용인시", "is_public": True})
     parent = login("apply-parent@example.com", "parent")
-    assert parent.get("/api/parent/children").status_code == 428             # 시설 선택 전
+    assert parent.get("/api/parent/children").status_code == 428             # 학원 선택 전
     found = parent.get("/api/parent/facilities/search", params={"q": "태권도"}).json()
     assert any(f["facility_id"] == owner.facility_id for f in found)
     detail = parent.get(f"/api/parent/facilities/{owner.facility_id}").json()
@@ -74,7 +74,7 @@ def test_parent_search_apply_and_admin_approve(owner):
     member = owner.get(f"/api/members/{member_id}").json()
     assert member["name"] == "신청아이" and member["mother_phone"] == "010-1212-3434"
     assert [c["class_id"] for c in member["classes"]] == [cls["class_id"]]
-    # 학부모: 시설에 입장하면 자녀·청구서가 바로 보임
+    # 학부모: 학원에 입장하면 자녀·청구서가 바로 보임
     assert parent.post(f"/api/parent/facilities/{owner.facility_id}/enter").status_code == 200
     assert [c["member_id"] for c in parent.get("/api/parent/children").json()] == [member_id]
     assert parent.get("/api/parent/invoices").json()[0]["amount"] == 120000
@@ -178,7 +178,7 @@ def test_classes_color_fee_and_roster(owner):
 
 
 def test_legacy_single_facility_migration(tmp_path):
-    """v8(시설 개념 없음) DB → v9 마이그레이션: 첫 시설 생성 + 기존 행·관리자·학부모 배정 + 출결 고유조건 변경"""
+    """v8(학원 개념 없음) DB → v9 마이그레이션: 첫 학원 생성 + 기존 행·관리자·학부모 배정 + 출결 고유조건 변경"""
     from sqlalchemy import create_engine, text
     path = tmp_path / "legacy.db"
     eng = create_engine(f"sqlite:///{path}")

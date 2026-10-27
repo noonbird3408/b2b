@@ -14,7 +14,7 @@ const API = axios.create({
 
 const AI_TIMEOUT = { timeout: 60000 }; // AI 분석/OCR 은 오래 걸릴 수 있음
 
-// 428 = 시설을 아직 고르지 않음(또는 접근 권한이 사라짐) → 화면이 시설 선택으로 이동하도록 알림
+// 428 = 학원을 아직 고르지 않음(또는 접근 권한이 사라짐) → 화면이 학원 선택으로 이동하도록 알림
 export const FACILITY_REQUIRED_EVENT = "facilink:facility-required";
 // 서버 데이터 버전이 바뀌었을 때(다른 기기·다른 사용자의 변경 포함) 화면들이 다시 불러오도록 알림
 export const DATA_CHANGED_EVENT = "facilink:data-changed";
@@ -52,11 +52,11 @@ export const createAdminAccount = (payload) => API.post("/api/admin/accounts", p
 export const updateAdminAccount = (accountId, payload) => API.patch(`/api/admin/accounts/${accountId}`, payload).then(data);
 export const deleteAdminAccount = (accountId) => API.delete(`/api/admin/accounts/${accountId}`);
 
-// ----- 시설 (관리자: 내 시설 목록·생성·수정·삭제·입장) -----
+// ----- 학원 (관리자: 내 학원 목록·생성·수정·삭제·입장) -----
 export const fetchFacilities = () => API.get("/api/facilities").then(data);
 export const createFacility = (payload) => API.post("/api/facilities", payload).then(data);
 export const updateFacility = (id, payload) => API.put(`/api/facilities/${id}`, payload).then(data);
-/** 삭제(보관) — 실수 방지를 위해 시설 이름을 한 번 더 입력받아 서버가 확인 */
+/** 삭제(보관) — 실수 방지를 위해 학원 이름을 한 번 더 입력받아 서버가 확인 */
 export const deleteFacility = (id, confirmName) => API.delete(`/api/facilities/${id}`, { params: { confirm_name: confirmName } });
 export const enterFacility = (id) => API.post(`/api/facilities/${id}/enter`).then(data);
 export const exitFacility = () => API.post("/api/facilities/exit").then(data);
@@ -87,6 +87,8 @@ export const clearTodos = (doneOnly = true) => API.delete("/api/todos", { params
 // ----- 외부 쇼핑몰 (ddmmall77) 연동 + 추천 -----
 export const fetchShopInfo = () => API.get("/api/shop/info").then(data);
 export const fetchShopProducts = (params) => API.get("/api/shop/products", { params }).then(data);
+/** 검색·맞춤 검색 — {q, category, min_price, max_price, quantity, fit: all|facility, include_quote, personalize, sort} */
+export const searchShopProducts = (params) => API.get("/api/shop/search", { params }).then(data);
 export const fetchShopRecommendations = (params) => API.get("/api/shop/recommendations", { params }).then(data);
 export const logShopClick = (productId, context = "catalog") =>
   API.post(`/api/shop/products/${productId}/click`, { context }).then(data).catch(() => null);
@@ -94,6 +96,17 @@ export const createShopProduct = (payload) => API.post("/api/shop/products", pay
 export const updateShopProduct = (id, payload) => API.put(`/api/shop/products/${id}`, payload).then(data);
 export const deactivateShopProduct = (id) => API.delete(`/api/shop/products/${id}`);
 export const syncShopProducts = () => API.post("/api/shop/sync").then(data);
+// v11 제휴몰 · 장바구니 · 주문 · 모의 결제 (금액은 모두 서버 계산)
+export const fetchShopMalls = () => API.get("/api/shop/malls").then(data);
+export const connectShopMall = (code) => API.post(`/api/shop/malls/${encodeURIComponent(code)}/connect`).then(data);
+export const disconnectShopMall = (code) => API.delete(`/api/shop/malls/${encodeURIComponent(code)}/connect`).then(data);
+export const quoteShopCart = (items) => API.post("/api/shop/cart/quote", { items }).then(data);
+export const createShopOrder = (items, memo = "") => API.post("/api/shop/orders", { items, memo }).then(data);
+export const fetchShopOrders = (params) => API.get("/api/shop/orders", { params }).then(data);
+export const payShopOrder = (id, method, expectedTotal) =>
+  API.post(`/api/shop/orders/${id}/pay`, { method, expected_total: expectedTotal }).then(data);
+export const receiveShopOrder = (id) => API.post(`/api/shop/orders/${id}/receive`).then(data);
+export const cancelShopOrder = (id, reason = "") => API.post(`/api/shop/orders/${id}/cancel`, { reason }).then(data);
 
 // ----- B2B 발주 -----
 export const fetchB2BProducts = (params) => API.get("/api/b2b/products", { params }).then(data);
@@ -144,15 +157,12 @@ export const unenrollStudent = (classId, memberId) => API.delete(`/api/classes/$
 export const fetchAttendances = (params) => API.get("/api/attendances", { params }).then(data);
 export const createAttendance = (payload) => API.post("/api/attendances", payload).then(data);
 export const deleteAttendance = (id) => API.delete(`/api/attendances/${id}`);
-/** 출결 저장(있으면 변경) — {member_id, attendance_date, status} */
+/** 출결 저장(있으면 변경) — {member_id, attendance_date, status}
+ *  응답의 parent_notified = 이번 처리로 알림을 받은 학부모 수, parent_linked = 학부모 계정 연결 여부 (v10) */
 export const markAttendance = (payload) => API.post("/api/attendances/mark", payload).then(data);
 export const bulkAttendance = (payload) => API.post("/api/attendances/bulk", payload).then(data);
 export const checkoutAttendance = (attendanceId) => API.post(`/api/attendances/${attendanceId}/checkout`).then(data);
 
-// ----- 출석 키오스크 -----
-export const kioskLookup = (digits) => API.get("/api/kiosk/lookup", { params: { digits } }).then(data);
-export const kioskCheck = (memberId, action) => API.post("/api/kiosk/check", { member_id: memberId, action }).then(data);
-export const fetchKioskToday = () => API.get("/api/kiosk/today").then(data);
 
 // ----- 결제(이력) -----
 export const fetchPayments = (params) => API.get("/api/payments", { params }).then(data);
@@ -179,6 +189,16 @@ export const fetchNotices = (params) => API.get("/api/notices", { params }).then
 export const createNotice = (payload) => API.post("/api/notices", payload).then(data);
 export const updateNotice = (id, payload) => API.put(`/api/notices/${id}`, payload).then(data);
 export const deleteNotice = (id) => API.delete(`/api/notices/${id}`);
+/** 공지 자동 작성 — {keywords: "에버랜드, 10/25, 선택 참여", class_id?, use_ai?} → {title, content, content_html, category, ...} */
+export const draftNotice = (payload) => API.post("/api/notices/draft", payload, AI_TIMEOUT).then(data);
+
+// ----- 첨부파일 (파일 1개씩 multipart 로 — Vercel 요청 한도 4.5MB) -----
+const fileForm = (file) => { const form = new FormData(); form.append("file", file); return form; };
+export const uploadNoticeAttachment = (noticeId, file) => API.post(`/api/notices/${noticeId}/attachments`, fileForm(file), AI_TIMEOUT).then(data);
+export const uploadPostAttachment = (postId, file) => API.post(`/api/community/posts/${postId}/attachments`, fileForm(file), AI_TIMEOUT).then(data);
+export const deleteAttachment = (attachmentId) => API.delete(`/api/community/attachments/${attachmentId}`);
+export const uploadParentAttachment = (postId, file) => API.post(`/api/parent/community/posts/${postId}/attachments`, fileForm(file), AI_TIMEOUT).then(data);
+export const deleteParentAttachment = (attachmentId) => API.delete(`/api/parent/community/attachments/${attachmentId}`);
 
 // ----- 커뮤니티 게시판 (관리자) -----
 /** params: {category: ALL|NOTICE|FREE|QUESTION|PHOTO|INFO, q, field: title|content|title_content|author, page, size} */
@@ -204,7 +224,7 @@ export const moderateComment = (commentId, decision) => API.post(`/api/community
 export const fetchModerationStats = () => API.get("/api/community/moderation/stats").then(data);
 export const downloadModerationDataset = () => API.get("/api/community/moderation/export", { responseType: "blob" }).then(data);
 
-// ----- 학부모: 시설 찾기·입장 / 자녀 프로필 / 가입 신청 (시설 선택 전에도 사용) -----
+// ----- 학부모: 학원 찾기·입장 / 자녀 프로필 / 가입 신청 (학원 선택 전에도 사용) -----
 export const searchFacilities = (params) => API.get("/api/parent/facilities/search", { params }).then(data);
 export const fetchMyFacilities = () => API.get("/api/parent/facilities/mine").then(data);
 export const fetchFacilityDetail = (id) => API.get(`/api/parent/facilities/${id}`).then(data);
@@ -246,6 +266,22 @@ export const fetchParentSummary = () => API.get("/api/parent/summary").then(data
 export const fetchParentNotifications = (params) => API.get("/api/parent/notifications", { params }).then(data);
 export const markParentNotificationsRead = (payload) => API.post("/api/parent/notifications/read", payload).then(data);
 export const fetchParentAssignments = () => API.get("/api/parent/assignments").then(data);
+
+// ----- 재고 관리 · 구매 확인 (직원도 사용, 승인·삭제는 원장) -----
+export const fetchInventory = (params) => API.get("/api/inventory", { params }).then(data);
+export const createInventoryItem = (payload) => API.post("/api/inventory", payload).then(data);
+export const updateInventoryItem = (id, payload) => API.put(`/api/inventory/${id}`, payload).then(data);
+export const deleteInventoryItem = (id) => API.delete(`/api/inventory/${id}`);
+/** {change: +입고 / −사용, reason: IN|OUT|ADJUST, note} */
+export const adjustInventory = (id, payload) => API.post(`/api/inventory/${id}/adjust`, payload).then(data);
+export const fetchInventoryLogs = (id) => API.get(`/api/inventory/${id}/logs`).then(data);
+export const fetchPurchaseCheck = () => API.get("/api/inventory/purchase-check").then(data);
+export const fetchPurchaseRequests = (params) => API.get("/api/inventory/requests", { params }).then(data);
+export const createPurchaseRequest = (payload) => API.post("/api/inventory/requests", payload).then(data);
+/** decision: APPROVED(구매) / REJECTED(반려) */
+export const decidePurchaseRequest = (id, decision, note = "") => API.post(`/api/inventory/requests/${id}/decide`, { decision, note }).then(data);
+export const receivePurchaseRequest = (id, payload = {}) => API.post(`/api/inventory/requests/${id}/receive`, payload).then(data);
+export const cancelPurchaseRequest = (id) => API.post(`/api/inventory/requests/${id}/cancel`).then(data);
 
 // ----- 대시보드 -----
 export const fetchDashboardStats = () => API.get("/api/dashboard/stats").then(data);

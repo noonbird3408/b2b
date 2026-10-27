@@ -9,6 +9,7 @@ export const IMAGE_PRESETS = {
   post: { maxSize: 1600, quality: 0.82, mime: "image/jpeg" },       // 커뮤니티 사진 (~300KB)
   document: { maxSize: 1600, quality: 0.85, mime: "image/jpeg" },   // OCR 서류 사진 (글자 판독 가능 크기)
   logo: { maxSize: 256, quality: 0.92, mime: "image/png" },         // 기관 로고 (투명 배경 유지)
+  thumb: { maxSize: 480, quality: 0.72, mime: "image/jpeg" },       // v10: 바둑판 보기용 작은 사진 (~40KB)
 };
 
 function loadImage(file) {
@@ -52,4 +53,10 @@ export async function resizeImageFiles(files, preset = "post") {
   const results = [];
   for (const file of files) results.push(await resizeImageFile(file, preset));
   return results;
+}
+
+/** v10: 게시글·공지 사진 1장 → {src: 원본(1600px), thumb: 작은 사진(480px)} — 목록(바둑판)에서는 작은 사진만 내려받음 */
+export async function resizePhotoWithThumb(file) {
+  const [src, thumb] = await Promise.all([resizeImageFile(file, "post"), resizeImageFile(file, "thumb")]);
+  return { src, thumb };
 }

@@ -1,5 +1,5 @@
 -- =====================================================================
--- 시설 통합 관리 시스템 — Supabase 테이블 생성 스크립트 (setup.sql)
+-- 학원 통합 관리 시스템 — Supabase 테이블 생성 스크립트 (setup.sql)
 --
 -- 사용법: Supabase 대시보드 → 왼쪽 메뉴 SQL Editor → New query
 --         → 이 파일 내용을 전부 복사해 붙여넣기 → Run (Ctrl+Enter)
@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS community_posts (
 	view_count INTEGER, 
 	status VARCHAR(10), 
 	updated_at TIMESTAMP WITHOUT TIME ZONE, 
+	content_html TEXT, 
 	facility_id INTEGER, 
 	PRIMARY KEY (post_id)
 );
@@ -144,7 +145,9 @@ ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN;  -- 이�
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS view_count INTEGER;  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS status VARCHAR(10);  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;  -- 이전 버전 보완
+ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_html TEXT;  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_community_posts_created_at ON community_posts (created_at);
 CREATE INDEX IF NOT EXISTS ix_community_posts_facility_id ON community_posts (facility_id);
 CREATE INDEX IF NOT EXISTS ix_community_posts_user_id ON community_posts (user_id);
 
@@ -204,13 +207,57 @@ CREATE TABLE IF NOT EXISTS notices (
 	class_id INTEGER, 
 	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
 	updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	content_html TEXT, 
 	facility_id INTEGER, 
 	PRIMARY KEY (notice_id)
 );
 ALTER TABLE notices ADD COLUMN IF NOT EXISTS class_id INTEGER;  -- 이전 버전 보완
+ALTER TABLE notices ADD COLUMN IF NOT EXISTS content_html TEXT;  -- 이전 버전 보완
 ALTER TABLE notices ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
 CREATE INDEX IF NOT EXISTS ix_notices_class_id ON notices (class_id);
+CREATE INDEX IF NOT EXISTS ix_notices_created_at ON notices (created_at);
 CREATE INDEX IF NOT EXISTS ix_notices_facility_id ON notices (facility_id);
+
+CREATE TABLE IF NOT EXISTS shop_mall_links (
+	link_id SERIAL NOT NULL, 
+	mall_code VARCHAR(30) NOT NULL, 
+	connected_by INTEGER, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (link_id), 
+	CONSTRAINT uq_shop_mall_link UNIQUE (facility_id, mall_code)
+);
+ALTER TABLE shop_mall_links ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_shop_mall_links_facility_id ON shop_mall_links (facility_id);
+
+CREATE TABLE IF NOT EXISTS shop_orders (
+	order_id SERIAL NOT NULL, 
+	order_number VARCHAR(40) NOT NULL, 
+	account_id INTEGER NOT NULL, 
+	status VARCHAR(20) NOT NULL, 
+	list_total INTEGER NOT NULL, 
+	product_discount INTEGER NOT NULL, 
+	member_discount INTEGER NOT NULL, 
+	shipping_fee INTEGER NOT NULL, 
+	total INTEGER NOT NULL, 
+	payment_method VARCHAR(20), 
+	payment_tid VARCHAR(40), 
+	memo VARCHAR(300) NOT NULL, 
+	paid_by INTEGER, 
+	cancel_reason VARCHAR(200), 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	paid_at TIMESTAMP WITHOUT TIME ZONE, 
+	received_at TIMESTAMP WITHOUT TIME ZONE, 
+	canceled_at TIMESTAMP WITHOUT TIME ZONE, 
+	facility_id INTEGER, 
+	PRIMARY KEY (order_id)
+);
+ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_shop_orders_account_id ON shop_orders (account_id);
+CREATE INDEX IF NOT EXISTS ix_shop_orders_created_at ON shop_orders (created_at);
+CREATE INDEX IF NOT EXISTS ix_shop_orders_facility_id ON shop_orders (facility_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_shop_orders_order_number ON shop_orders (order_number);
+CREATE INDEX IF NOT EXISTS ix_shop_orders_status ON shop_orders (status);
 
 CREATE TABLE IF NOT EXISTS shop_products (
 	product_id SERIAL NOT NULL, 
@@ -227,10 +274,17 @@ CREATE TABLE IF NOT EXISTS shop_products (
 	source VARCHAR(10) NOT NULL, 
 	active BOOLEAN NOT NULL, 
 	updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	mall_code VARCHAR(30), 
+	list_price INTEGER, 
+	unit VARCHAR(20), 
 	PRIMARY KEY (product_id)
 );
+ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS mall_code VARCHAR(30);  -- 이전 버전 보완
+ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS list_price INTEGER;  -- 이전 버전 보완
+ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS unit VARCHAR(20);  -- 이전 버전 보완
 CREATE INDEX IF NOT EXISTS ix_shop_products_category ON shop_products (category);
 CREATE UNIQUE INDEX IF NOT EXISTS ix_shop_products_external_id ON shop_products (external_id);
+CREATE INDEX IF NOT EXISTS ix_shop_products_mall_code ON shop_products (mall_code);
 
 CREATE TABLE IF NOT EXISTS admin_todos (
 	todo_id SERIAL NOT NULL, 
@@ -325,6 +379,26 @@ ALTER TABLE b2b_sample_requests ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -
 CREATE INDEX IF NOT EXISTS ix_b2b_sample_requests_account_id ON b2b_sample_requests (account_id);
 CREATE INDEX IF NOT EXISTS ix_b2b_sample_requests_facility_id ON b2b_sample_requests (facility_id);
 
+CREATE TABLE IF NOT EXISTS board_attachments (
+	attachment_id SERIAL NOT NULL, 
+	post_id INTEGER, 
+	notice_id INTEGER, 
+	file_name VARCHAR(255) NOT NULL, 
+	mime_type VARCHAR(100) NOT NULL, 
+	size_bytes INTEGER NOT NULL, 
+	data TEXT NOT NULL, 
+	user_id INTEGER, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (attachment_id), 
+	FOREIGN KEY(post_id) REFERENCES community_posts (post_id) ON DELETE CASCADE, 
+	FOREIGN KEY(notice_id) REFERENCES notices (notice_id) ON DELETE CASCADE
+);
+ALTER TABLE board_attachments ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_board_attachments_facility_id ON board_attachments (facility_id);
+CREATE INDEX IF NOT EXISTS ix_board_attachments_notice_id ON board_attachments (notice_id);
+CREATE INDEX IF NOT EXISTS ix_board_attachments_post_id ON board_attachments (post_id);
+
 CREATE TABLE IF NOT EXISTS child_profiles (
 	child_id SERIAL NOT NULL, 
 	user_id INTEGER NOT NULL, 
@@ -388,10 +462,12 @@ CREATE TABLE IF NOT EXISTS community_photos (
 	mime_type VARCHAR(30) NOT NULL, 
 	data TEXT NOT NULL, 
 	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	thumb TEXT, 
 	facility_id INTEGER, 
 	PRIMARY KEY (photo_id), 
 	FOREIGN KEY(post_id) REFERENCES community_posts (post_id) ON DELETE CASCADE
 );
+ALTER TABLE community_photos ADD COLUMN IF NOT EXISTS thumb TEXT;  -- 이전 버전 보완
 ALTER TABLE community_photos ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
 CREATE INDEX IF NOT EXISTS ix_community_photos_facility_id ON community_photos (facility_id);
 CREATE INDEX IF NOT EXISTS ix_community_photos_post_id ON community_photos (post_id);
@@ -470,6 +546,28 @@ ALTER TABLE facility_staff ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이
 CREATE INDEX IF NOT EXISTS ix_facility_staff_account_id ON facility_staff (account_id);
 CREATE INDEX IF NOT EXISTS ix_facility_staff_facility_id ON facility_staff (facility_id);
 
+CREATE TABLE IF NOT EXISTS inventory_items (
+	item_id SERIAL NOT NULL, 
+	name VARCHAR(100) NOT NULL, 
+	category VARCHAR(40) NOT NULL, 
+	unit VARCHAR(20) NOT NULL, 
+	quantity INTEGER NOT NULL, 
+	min_quantity INTEGER NOT NULL, 
+	location VARCHAR(100) NOT NULL, 
+	note VARCHAR(300) NOT NULL, 
+	shop_product_id INTEGER, 
+	b2b_sku VARCHAR(40), 
+	keyword VARCHAR(100) NOT NULL, 
+	active BOOLEAN NOT NULL, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (item_id), 
+	FOREIGN KEY(shop_product_id) REFERENCES shop_products (product_id) ON DELETE SET NULL
+);
+ALTER TABLE inventory_items ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_inventory_items_facility_id ON inventory_items (facility_id);
+
 CREATE TABLE IF NOT EXISTS invoices (
 	invoice_id SERIAL NOT NULL, 
 	member_id INTEGER NOT NULL, 
@@ -500,6 +598,22 @@ ALTER TABLE member_notes ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이�
 CREATE INDEX IF NOT EXISTS ix_member_notes_created_at ON member_notes (created_at);
 CREATE INDEX IF NOT EXISTS ix_member_notes_facility_id ON member_notes (facility_id);
 CREATE INDEX IF NOT EXISTS ix_member_notes_member_id ON member_notes (member_id);
+
+CREATE TABLE IF NOT EXISTS notice_photos (
+	photo_id SERIAL NOT NULL, 
+	notice_id INTEGER NOT NULL, 
+	position INTEGER NOT NULL, 
+	mime_type VARCHAR(30) NOT NULL, 
+	data TEXT NOT NULL, 
+	thumb TEXT, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (photo_id), 
+	FOREIGN KEY(notice_id) REFERENCES notices (notice_id) ON DELETE CASCADE
+);
+ALTER TABLE notice_photos ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_notice_photos_facility_id ON notice_photos (facility_id);
+CREATE INDEX IF NOT EXISTS ix_notice_photos_notice_id ON notice_photos (notice_id);
 
 CREATE TABLE IF NOT EXISTS notice_reads (
 	read_id SERIAL NOT NULL, 
@@ -607,6 +721,27 @@ CREATE INDEX IF NOT EXISTS ix_shop_click_events_created_at ON shop_click_events 
 CREATE INDEX IF NOT EXISTS ix_shop_click_events_facility_id ON shop_click_events (facility_id);
 CREATE INDEX IF NOT EXISTS ix_shop_click_events_product_id ON shop_click_events (product_id);
 
+CREATE TABLE IF NOT EXISTS shop_order_items (
+	item_id SERIAL NOT NULL, 
+	order_id INTEGER NOT NULL, 
+	product_id INTEGER NOT NULL, 
+	mall_code VARCHAR(30) NOT NULL, 
+	product_name VARCHAR(200) NOT NULL, 
+	unit VARCHAR(20) NOT NULL, 
+	quantity INTEGER NOT NULL, 
+	list_price INTEGER NOT NULL, 
+	unit_price INTEGER NOT NULL, 
+	line_total INTEGER NOT NULL, 
+	inventory_item_id INTEGER, 
+	facility_id INTEGER, 
+	PRIMARY KEY (item_id), 
+	FOREIGN KEY(order_id) REFERENCES shop_orders (order_id) ON DELETE CASCADE, 
+	FOREIGN KEY(product_id) REFERENCES shop_products (product_id)
+);
+ALTER TABLE shop_order_items ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_shop_order_items_facility_id ON shop_order_items (facility_id);
+CREATE INDEX IF NOT EXISTS ix_shop_order_items_order_id ON shop_order_items (order_id);
+
 CREATE TABLE IF NOT EXISTS user_sessions (
 	token_hash VARCHAR(64) NOT NULL, 
 	user_id INTEGER NOT NULL, 
@@ -706,11 +841,64 @@ ALTER TABLE comment_reviews ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- �
 CREATE INDEX IF NOT EXISTS ix_comment_reviews_created_at ON comment_reviews (created_at);
 CREATE INDEX IF NOT EXISTS ix_comment_reviews_facility_id ON comment_reviews (facility_id);
 
+CREATE TABLE IF NOT EXISTS inventory_logs (
+	log_id SERIAL NOT NULL, 
+	item_id INTEGER NOT NULL, 
+	change INTEGER NOT NULL, 
+	quantity_after INTEGER NOT NULL, 
+	reason VARCHAR(12) NOT NULL, 
+	note VARCHAR(200) NOT NULL, 
+	account_id INTEGER, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (log_id), 
+	FOREIGN KEY(item_id) REFERENCES inventory_items (item_id) ON DELETE CASCADE
+);
+ALTER TABLE inventory_logs ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_inventory_logs_created_at ON inventory_logs (created_at);
+CREATE INDEX IF NOT EXISTS ix_inventory_logs_facility_id ON inventory_logs (facility_id);
+CREATE INDEX IF NOT EXISTS ix_inventory_logs_item_id ON inventory_logs (item_id);
+
+CREATE TABLE IF NOT EXISTS purchase_requests (
+	request_id SERIAL NOT NULL, 
+	item_id INTEGER NOT NULL, 
+	quantity INTEGER NOT NULL, 
+	status VARCHAR(10) NOT NULL, 
+	note VARCHAR(300) NOT NULL, 
+	requested_by INTEGER, 
+	decided_by INTEGER, 
+	decision_note VARCHAR(200), 
+	decided_at TIMESTAMP WITHOUT TIME ZONE, 
+	received_at TIMESTAMP WITHOUT TIME ZONE, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (request_id), 
+	FOREIGN KEY(item_id) REFERENCES inventory_items (item_id) ON DELETE CASCADE
+);
+ALTER TABLE purchase_requests ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
+CREATE INDEX IF NOT EXISTS ix_purchase_requests_created_at ON purchase_requests (created_at);
+CREATE INDEX IF NOT EXISTS ix_purchase_requests_facility_id ON purchase_requests (facility_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_requests_item_id ON purchase_requests (item_id);
+CREATE INDEX IF NOT EXISTS ix_purchase_requests_status ON purchase_requests (status);
+
 CREATE INDEX IF NOT EXISTS ix_attendances_member_id ON attendances (member_id);
 CREATE INDEX IF NOT EXISTS ix_enrollments_member_id ON enrollments (member_id);
 CREATE INDEX IF NOT EXISTS ix_enrollments_class_id ON enrollments (class_id);
+CREATE INDEX IF NOT EXISTS ix_notifications_user_audience_read ON notifications (user_id, audience, is_read);
+CREATE INDEX IF NOT EXISTS ix_attendances_date_class ON attendances (attendance_date, class_id);
+CREATE INDEX IF NOT EXISTS ix_community_posts_created_at ON community_posts (created_at);
+CREATE INDEX IF NOT EXISTS ix_notices_created_at ON notices (created_at);
+CREATE INDEX IF NOT EXISTS ix_invoices_status ON invoices (status);
+CREATE INDEX IF NOT EXISTS ix_payment_pending_invoice_id ON payment_pending (invoice_id);
+CREATE INDEX IF NOT EXISTS ix_payments_member_id ON payments (member_id);
+CREATE INDEX IF NOT EXISTS ix_activity_logs_actor_created ON activity_logs (actor_type, created_at);
+CREATE INDEX IF NOT EXISTS ix_shop_orders_facility_created ON shop_orders (facility_id, created_at);
 
--- v9(여러 시설): 기존(단일 시설) 데이터의 facility_id 채우기·첫 시설 생성은 백엔드가 처음 시작될 때
+-- v10: 서식 본문(content_html) · 공지 사진(notice_photos) · 첨부파일(board_attachments) · 재고(inventory_*)·구매 요청 테이블과
+--      성능 점검 인덱스가 추가되었습니다. 모두 새 테이블·NULL 허용 컬럼·인덱스라 기존 데이터에 영향이 없습니다.
+-- v11: 학원 쇼핑몰 — 제휴몰 연결(shop_mall_links) · 주문(shop_orders, shop_order_items) 테이블과
+--      shop_products 의 mall_code·list_price·unit 컬럼이 추가되었습니다(역시 비파괴).
+-- v9(여러 학원): 기존(단일 학원) 데이터의 facility_id 채우기·첫 학원 생성은 백엔드가 처음 시작될 때
 -- 자동으로 한 번 실행합니다(app_meta.schema_version 기록). 이 스크립트는 테이블·컬럼·인덱스만 준비합니다.
 -- Supabase 는 public 스키마의 테이블을 Data API(anon 키)로 노출합니다.
 -- RLS(행 수준 보안)를 켜 두면 브라우저에서 테이블에 직접 접근할 수 없습니다.
@@ -726,12 +914,15 @@ ALTER TABLE community_posts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE facilities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shop_mall_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shop_orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE shop_products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE admin_todos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE assignments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE attendances ENABLE ROW LEVEL SECURITY;
 ALTER TABLE b2b_orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE b2b_sample_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE board_attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE child_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE community_comments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE community_likes ENABLE ROW LEVEL SECURITY;
@@ -740,19 +931,24 @@ ALTER TABLE enrollment_applications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE enrollments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE facility_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE facility_staff ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inventory_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE member_notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notice_photos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notice_reads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE parent_links ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_pending ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE shop_click_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE shop_order_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE assignment_files ENABLE ROW LEVEL SECURITY;
 ALTER TABLE assignment_submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE b2b_order_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE b2b_payment_pending ENABLE ROW LEVEL SECURITY;
 ALTER TABLE comment_reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inventory_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purchase_requests ENABLE ROW LEVEL SECURITY;
 
-SELECT 'setup 완료 — 테이블 39개 준비됨' AS result;
+SELECT 'setup 완료 — 테이블 47개 준비됨' AS result;

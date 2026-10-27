@@ -57,7 +57,7 @@ export default function Checkout({ hasChildren = true, onLinkChild }) {
       {result?.type === "cancel" && <div className="fl-banner warning">결제가 취소되었습니다.</div>}
       {result?.type === "fail" && <div className="fl-banner danger">결제에 실패했습니다{result.reason ? ` (${result.reason})` : ""}.</div>}
       {error && <div className="fl-banner danger">{error}</div>}
-      {!kakaoEnabled && <div className="fl-banner warning">카카오페이 결제가 아직 준비되지 않았습니다. 시설로 문의해 주세요.</div>}
+      {!kakaoEnabled && <div className="fl-banner warning">카카오페이 결제가 아직 준비되지 않았습니다. 학원으로 문의해 주세요.</div>}
 
       <div className="pp-card">
         <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>

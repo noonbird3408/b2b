@@ -5,10 +5,12 @@ import {
   fetchAdminNotifications, fetchAdminSummary, fetchAppSettings, fetchMe, fetchSyncVersion, importAdminSettings, loadDemoData,
   markAdminNotificationsRead, saveAppSettings, signOut, updateAdminAccount,
 } from "../api";
-import { NOTIFICATION_META, WEATHER_CITIES, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
+import { FACILITY_TYPES, NOTIFICATION_META, WEATHER_CITIES, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import { announceDataChanged } from "../utils/sync";
 import { resizeImageFile } from "../utils/image";
 import Brand from "./Brand.jsx";
+import SubjectPicker from "./SubjectPicker.jsx";
+import { BRAND } from "../utils/brand";
 
 const SETTINGS_STYLES = `
 .settings-tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:18px;overflow-x:auto;scrollbar-width:none;}
@@ -34,14 +36,20 @@ const initialNavItems = [
   { id: "members",     to: "/members",        label: "학생 관리",  icon: "👥" },
   { id: "classes",     to: "/classes",        label: "수업 관리",  icon: "📒" },
   { id: "attendances", to: "/attendances",    label: "출석 체크",  icon: "✓" },
-  { id: "kiosk",       to: "/kiosk",          label: "출석 키오스크", icon: "📲" },
   { id: "community",   to: "/community",      label: "커뮤니티",   icon: "🤝" },
   { id: "checkout",    to: "/admin-checkout", label: "수납·청구",  icon: "💳" },
   { id: "AIservice",   to: "/aiservice",      label: "AI 비서",    icon: "🤖" },
+  { id: "inventory",   to: "/inventory",      label: "재고 관리",  icon: "📦" },
   { id: "shop",        to: "/shop",           label: "쇼핑몰",     icon: "🛍️" },
 ];
-// 직원 계정이 볼 수 있는 화면 (학생·수업은 조회만 — 서버가 GET 만 허용)
-const STAFF_PATHS = ["/attendances", "/kiosk", "/members", "/classes", "/shop"];
+// 직원 계정이 볼 수 있는 화면 (학생·수업은 조회만 — 서버가 GET 만 허용). v10: 키오스크 삭제, 재고 관리 추가
+const STAFF_PATHS = ["/attendances", "/members", "/classes", "/inventory", "/shop"];
+// 메뉴 배지 (상단 요약 API 의 badges 값)
+const NAV_BADGES = {
+  community: (b) => b.moderation_pending,
+  members: (b) => b.applications_pending,
+  inventory: (b) => (b.inventory_low || 0) + (b.purchase_pending || 0),
+};
 const SYNC_INTERVAL = 6000;       // 데이터 버전 확인 (가벼운 요청)
 const SUMMARY_INTERVAL = 30000;   // 알림·배지 요약
 
@@ -52,6 +60,7 @@ function readLocalJson(key, fallback) {
     return fallback;
   }
 }
+const readLocal = (key, fallback) => { try { return localStorage.getItem(key) || fallback; } catch { return fallback; } };
 const writeLocal = (key, value) => { try { localStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value)); } catch { /* 무시 */ } };
 
 export default function Layout() {
@@ -80,8 +89,8 @@ export default function Layout() {
   const [academyInfo, setAcademyInfo] = useState(null);
   const [paymentSettings, setPaymentSettings] = useState(null);
 
-  const [theme, setTheme] = useState(() => localStorage.getItem("app_theme") || "light");
-  const [fontSize, setFontSize] = useState(() => localStorage.getItem("app_font_size") || "normal");
+  const [theme, setTheme] = useState(() => readLocal("app_theme", "light"));
+  const [fontSize, setFontSize] = useState(() => readLocal("app_font_size", "normal"));
   const [dragItemIndex, setDragItemIndex] = useState(null);
   const [dragOverIndex, setDragOverIndex] = useState(null);
   const [menuOrder, setMenuOrder] = useState(() => {
@@ -97,7 +106,7 @@ export default function Layout() {
   const isOwner = facility?.my_role === "owner";
   const account = me?.admin || {};
 
-  // ---- 세션·시설 확인: 관리자 모드 + 시설 선택이 끝난 세션만 셸에 진입 ----
+  // ---- 세션·학원 확인: 관리자 모드 + 학원 선택이 끝난 세션만 셸에 진입 ----
   useEffect(() => {
     let alive = true;
     fetchMe()
@@ -114,7 +123,7 @@ export default function Layout() {
     return () => { alive = false; };
   }, [navigate]);
 
-  // 서버가 428(시설 선택 필요)을 돌려주면 시설 선택 화면으로
+  // 서버가 428(학원 선택 필요)을 돌려주면 학원 선택 화면으로
   useEffect(() => {
     const onRequired = () => navigate("/", { replace: true });
     window.addEventListener(FACILITY_REQUIRED_EVENT, onRequired);
@@ -260,14 +269,14 @@ export default function Layout() {
   };
 
   const handleDemoData = async () => {
-    if (!window.confirm("시연용 가상 데이터(학생 12명·수업·출결·청구서·공지·커뮤니티)를 이 시설에 넣을까요?\n기존 데이터는 지우지 않습니다.")) return;
+    if (!window.confirm("시연용 가상 데이터(학생 12명·수업·출결·청구서·공지·커뮤니티)를 이 학원에 넣을까요?\n기존 데이터는 지우지 않습니다.")) return;
     try {
       const result = await loadDemoData(false).catch(async (error) => {
         if (error?.response?.status === 409 && window.confirm(`${errorText(error)}\n그래도 추가로 넣을까요?`)) return loadDemoData(true);
         throw error;
       });
       if (!result) return;
-      window.alert(`데모 데이터를 넣었습니다.\n\n· 키오스크: 보호자 번호 뒤 4자리 ${result.kiosk_digits}\n· 학부모 체험: 자녀 ${result.parent_demo.child_name} / ${result.parent_demo.phone}`);
+      window.alert(`데모 데이터를 넣었습니다.\n\n· 출석 알림: ${result.attendance_demo}\n· 학부모 체험: 자녀 ${result.parent_demo.child_name} / ${result.parent_demo.phone}\n· 재고 관리: 부족한 물품으로 '구매 확인'을 체험할 수 있습니다.`);
       setIsSettingsOpen(false);
       announceDataChanged();
       navigate("/dashboard");
@@ -346,7 +355,7 @@ export default function Layout() {
       const created = await createAdminAccount(newAccount);
       setAdminAccounts((current) => [...current.filter((a) => a.account_id !== created.account_id), created]);
       setNewAccount({ email: "", username: "", role: "staff" });
-      setSettingsMessage(`${created.email} 을(를) 이 시설의 ${created.role === "owner" ? "관리자" : "직원"}로 등록했습니다.`);
+      setSettingsMessage(`${created.email} 을(를) 이 학원의 ${created.role === "owner" ? "관리자" : "직원"}로 등록했습니다.`);
     } catch (error) {
       setSettingsMessage(errorText(error, "계정을 등록하지 못했습니다."));
     }
@@ -366,7 +375,7 @@ export default function Layout() {
   };
 
   const handleAccountRemove = async (target) => {
-    if (!window.confirm(`${target.email} 의 이 시설 관리 권한을 해제할까요?`)) return;
+    if (!window.confirm(`${target.email} 의 이 학원 관리 권한을 해제할까요?`)) return;
     try {
       await deleteAdminAccount(target.account_id);
       setAdminAccounts((current) => current.filter((row) => row.account_id !== target.account_id));
@@ -381,7 +390,7 @@ export default function Layout() {
       const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
       const link = document.createElement("a");
       link.href = url;
-      link.download = `facilink-${facility?.facility_id}-${new Date().toISOString().slice(0, 10)}.json`;
+      link.download = `${BRAND.slug}-${facility?.facility_id}-${new Date().toISOString().slice(0, 10)}.json`;
       link.click();
       URL.revokeObjectURL(url);
     } catch (error) {
@@ -438,6 +447,9 @@ export default function Layout() {
               className={({ isActive }) => `nav-link${isActive ? " active" : ""}${dragOverIndex === index ? " drag-over" : ""}`}>
               <span style={{ width: 18, textAlign: "center" }}>{item.icon}</span>
               <span>{item.label}</span>
+              {NAV_BADGES[item.id] && NAV_BADGES[item.id](summary?.badges || {}) > 0 && (
+                <span className="nav-badge" aria-label={`처리할 일 ${NAV_BADGES[item.id](summary.badges)}건`}>{NAV_BADGES[item.id](summary.badges)}</span>
+              )}
             </NavLink>
           ))}
         </nav>
@@ -457,7 +469,7 @@ export default function Layout() {
           <div className="topbar-facility">
             <span className={`sync-dot${online ? "" : " off"}`} title={online ? `실시간 동기화 중 (v${dataVersion ?? "-"})` : "서버 연결 확인 중"} />
             <span className="name">{facility.name}</span>
-            <button type="button" className="btn ghost sm" onClick={() => navigate("/")}>시설 변경</button>
+            <button type="button" className="btn ghost sm" onClick={() => navigate("/")}>학원 변경</button>
           </div>
           <div className="topbar-actions">
             {isOwner && (
@@ -568,7 +580,7 @@ export default function Layout() {
                     <h4>계정</h4>
                     <p>{account.username} · {account.email} · {isOwner ? "원장" : "직원"}</p>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      <button className="btn ghost sm" type="button" onClick={() => navigate("/")}>시설 변경</button>
+                      <button className="btn ghost sm" type="button" onClick={() => navigate("/")}>학원 변경</button>
                       <button className="btn ghost sm" type="button" onClick={() => navigate("/?role=1")}>역할 변경</button>
                       <button className="btn danger sm" type="button" onClick={handleLogout}>로그아웃</button>
                     </div>
@@ -589,10 +601,10 @@ export default function Layout() {
                     </div>
                   </div>
                   <div className="settings-form-grid">
-                    <div className="form-row"><label>시설 이름</label><input className="input" value={academyInfo.name || ""} onChange={setA("name")} /></div>
-                    <div className="form-row"><label>시설 유형</label>
+                    <div className="form-row"><label>학원 이름</label><input className="input" value={academyInfo.name || ""} onChange={setA("name")} /></div>
+                    <div className="form-row"><label>학원 종류</label>
                       <select className="select" value={academyInfo.facilityType || "학원"} onChange={setA("facilityType")}>
-                        {["학원", "체육관", "도장", "기타"].map((t) => <option key={t}>{t}</option>)}
+                        {FACILITY_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                       </select></div>
                     <div className="form-row"><label>지점</label><input className="input" value={academyInfo.branch || ""} onChange={setA("branch")} /></div>
                     <div className="form-row"><label>지역 (학부모 검색)</label><input className="input" value={academyInfo.region || ""} onChange={setA("region")} placeholder="예: 경기 용인시" /></div>
@@ -613,6 +625,8 @@ export default function Layout() {
                     </div>
                   </div>
                   <div className="form-row"><label>주소</label><input className="input" value={academyInfo.address || ""} onChange={setA("address")} /></div>
+                  <div className="form-row"><label>주요 과목 <small className="muted" style={{ fontWeight: 400 }}>— 쇼핑몰 교재·교구 추천에 사용</small></label>
+                    <SubjectPicker value={academyInfo.subjects || []} onChange={(subjects) => setAcademyInfo({ ...academyInfo, subjects })} /></div>
                   <div className="form-row"><label>소개</label><textarea value={academyInfo.description || ""} onChange={setA("description")} maxLength={1000} /></div>
                 </div>
               ) : <div className="fl-skeleton" style={{ height: 240 }} />)}
@@ -647,7 +661,8 @@ export default function Layout() {
                       <select className="select" value={row.role} onChange={(e) => handleAccountChange(row, "role", e.target.value)} aria-label="역할">
                         <option value="owner">원장</option><option value="staff">직원</option>
                       </select>
-                      <select className="select" value={row.pricing_tier} onChange={(e) => handleAccountChange(row, "pricing_tier", e.target.value)} aria-label="B2B 등급">
+                      <select className="select" value={row.pricing_tier} onChange={(e) => handleAccountChange(row, "pricing_tier", e.target.value)} aria-label="B2B 등급"
+                        disabled={!me.can_edit_pricing} title={me.can_edit_pricing ? undefined : "B2B 계약 등급(할인율)은 플랫폼 운영자만 바꿀 수 있습니다"}>
                         <option value="STANDARD">일반</option><option value="VIP">VIP</option>
                       </select>
                       <button type="button" className="btn danger sm" disabled={row.account_id === account.account_id} onClick={() => handleAccountRemove(row)}>해제</button>
@@ -661,7 +676,7 @@ export default function Layout() {
                     </select>
                     <button className="btn sm" type="submit">추가</button>
                   </form>
-                  <p className="muted" style={{ margin: 0 }}>추가한 Google 계정은 로그인 → 관리자 선택 후 이 시설에 들어올 수 있습니다.</p>
+                  <p className="muted" style={{ margin: 0 }}>추가한 Google 계정은 로그인 → 관리자 선택 후 이 학원에 들어올 수 있습니다.</p>
                 </div>
               )}
 
@@ -669,7 +684,7 @@ export default function Layout() {
                 <div style={{ display: "grid", gap: 12 }}>
                   <section className="settings-section">
                     <h4>백업 및 복원</h4>
-                    <p>이 시설의 데이터를 JSON 으로 내보냅니다. 복원은 기관·수납 설정만 덮어씁니다.</p>
+                    <p>이 학원의 데이터를 JSON 으로 내보냅니다. 복원은 기관·수납 설정만 덮어씁니다.</p>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
                       <button className="btn ghost sm" type="button" onClick={handleExportData}>내보내기</button>
                       <label className="btn ghost sm" style={{ cursor: "pointer" }}>설정 복원<input type="file" accept="application/json,.json" onChange={handleImportSettings} style={{ display: "none" }} /></label>

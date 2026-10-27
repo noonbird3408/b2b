@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-시설 통합 관리 시스템 — 배포 준비 도우미 (Supabase + Google 로그인 + Vercel)
+학원 통합 관리 시스템 — 배포 준비 도우미 (Supabase + Google 로그인 + Vercel)
 
   python setup.py          # 대화형 배포 준비 (Windows: setup.bat 더블클릭)
   python setup.py check    # Supabase 연결·테이블 확인 (없으면 테이블 생성도 가능)
@@ -238,7 +238,7 @@ def prompt_google_client_id(current):
 # ---------------------------------------------------------------------
 def prepare():
     say("=" * 64)
-    say(" 시설 통합 관리 시스템 — 배포 준비 (Supabase + Google 로그인 + Vercel)")
+    say(" 학원 통합 관리 시스템 — 배포 준비 (Supabase + Google 로그인 + Vercel)")
     say("=" * 64)
     if sys.version_info < (3, 10):
         raise SystemExit(f"  ✗ Python 3.10 이상이 필요합니다 (현재 {sys.version.split()[0]}).")
@@ -288,7 +288,7 @@ def prepare():
             updates[key] = default
 
     step(5, "환경변수 파일 저장")
-    update_env_file(ENV_FILE, updates, header="# 시설 통합 관리 시스템 — 로컬/점검용 환경변수 (커밋 금지)")
+    update_env_file(ENV_FILE, updates, header="# 학원 통합 관리 시스템 — 로컬/점검용 환경변수 (커밋 금지)")
     merged = {**current, **updates}
     say("  ✓ backend/.env 저장")
     vercel_lines = ["# Vercel → 프로젝트 → Settings → Environment Variables 에 붙여 넣을 값 (커밋 금지)",

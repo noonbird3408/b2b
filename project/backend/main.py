@@ -1,5 +1,5 @@
 # =====================================================================
-# 시설 통합 관리 시스템 - FastAPI 백엔드 (v8)
+# 학원 통합 관리 시스템 - FastAPI 백엔드 (v8)
 # 배포 : Vercel(api/index.py 가 이 app 을 실행) + Supabase(PostgreSQL)
 # 로컬 미리보기(선택): python ../setup.py local  →  python ../setup.py run
 # Swagger : http://localhost:8000/docs (로컬 실행 시)
@@ -25,7 +25,7 @@ import logging
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Union
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 import requests  # 카카오페이 / Google / 쇼핑몰 REST 호출용
@@ -45,6 +45,8 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, DataError
 from sqlalchemy.pool import NullPool
+
+import shop_market as _shop_market   # noqa: E402  (제휴몰·상품 시드·과목 감지·가격 계산 — 순수 모듈)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("facility")
@@ -141,22 +143,22 @@ Base = declarative_base()
 
 
 # =====================================================================
-# v9 멀티 시설(멀티 테넌트) — 한 DB 에 여러 시설의 데이터를 두고 facility_id 로 구분
+# v9 멀티 학원(멀티 테넌트) — 한 DB 에 여러 학원의 데이터를 두고 facility_id 로 구분
 #
 #   설계: 공유 테이블 + facility_id 컬럼(Shared schema, tenant column) 방식
-#     - 대안 1) 시설마다 스키마/DB 분리: 격리는 강하지만 Supabase 무료 플랜·마이그레이션 관리가 어려움
+#     - 대안 1) 학원마다 스키마/DB 분리: 격리는 강하지만 Supabase 무료 플랜·마이그레이션 관리가 어려움
 #     - 대안 2) PostgreSQL RLS: DB 계정·세션 변수 설계가 필요하고 트랜잭션 풀러(6543)와 궁합이 나쁨
-#   → 애플리케이션 계층에서 "자동 필터"를 걸어 개발자가 WHERE 조건을 빠뜨려도 다른 시설 데이터가 보이지 않게 함
+#   → 애플리케이션 계층에서 "자동 필터"를 걸어 개발자가 WHERE 조건을 빠뜨려도 다른 학원 데이터가 보이지 않게 함
 #
 #   동작
-#     1) 요청 인증 단계(_authorize)에서 db.info["facility_id"] 에 선택한 시설을 기록
-#     2) do_orm_execute 이벤트: 모든 SELECT/UPDATE/DELETE 에 TenantMixin.facility_id == 현재 시설 조건을 자동 추가
+#     1) 요청 인증 단계(_authorize)에서 db.info["facility_id"] 에 선택한 학원을 기록
+#     2) do_orm_execute 이벤트: 모든 SELECT/UPDATE/DELETE 에 TenantMixin.facility_id == 현재 학원 조건을 자동 추가
 #        (조회·집계·JOIN·서브쿼리·관계 지연 로딩·db.get 모두 적용 — tests/test_tenancy.py 로 검증)
 #     3) before_flush 이벤트: 새로 추가되는 행에 facility_id 를 자동으로 채움
-#   시설 문맥이 없는 요청(로그인, 시설 목록, 카카오페이 콜백, Cron)은 필터 없이 동작합니다.
+#   학원 문맥이 없는 요청(로그인, 학원 목록, 카카오페이 콜백, Cron)은 필터 없이 동작합니다.
 # =====================================================================
 class TenantMixin:
-    """시설별로 나뉘는 테이블. facility_id 는 자동으로 채워지고 조회 시 자동으로 필터됩니다."""
+    """학원별로 나뉘는 테이블. facility_id 는 자동으로 채워지고 조회 시 자동으로 필터됩니다."""
     facility_id = Column(Integer, index=True)
 
 
@@ -197,7 +199,7 @@ def _tenant_fill(session, flush_context, instances):
 
 @event.listens_for(Session, "after_flush_postexec")
 def _bump_data_version(session, flush_context):
-    """시설 데이터가 바뀌면 facilities.data_version + 1 — 다른 화면(관리자·학부모)이 폴링으로 감지해 즉시 새로고침"""
+    """학원 데이터가 바뀌면 facilities.data_version + 1 — 다른 화면(관리자·학부모)이 폴링으로 감지해 즉시 새로고침"""
     _flush_data_version(session)
 
 
@@ -242,7 +244,7 @@ class Member(TenantMixin, Base):
 
 class Attendance(TenantMixin, Base):
     __tablename__ = "attendances"
-    # v9: 출결은 "학생 × 날짜 × 수업" 단위. class_id 가 비어 있으면 시설 출입(수업 무관) 기록.
+    # v9: 출결은 "학생 × 날짜 × 수업" 단위. class_id 가 비어 있으면 학원 출입(수업 무관) 기록.
     #     중복 방지 유니크 인덱스(uq_attendance_member_date_class)는 클래스 정의 아래에서 만듭니다.
     attendance_id    = Column(Integer, primary_key=True, autoincrement=True)
     member_id        = Column(Integer, ForeignKey("members.member_id"), nullable=False, index=True)
@@ -284,8 +286,10 @@ class Notice(TenantMixin, Base):
     is_pinned        = Column(Boolean,     default=False)
     # v8.1: 반 공지 — 값이 있으면 그 반 수강생의 학부모에게만 보이는 공지 (없으면 전체 공지)
     class_id         = Column(Integer, index=True)
-    created_at       = Column(TIMESTAMP,   default=_now, server_default=func.now())
+    created_at       = Column(TIMESTAMP,   default=_now, server_default=func.now(), index=True)
     updated_at       = Column(TIMESTAMP,   default=_now, server_default=func.now(), onupdate=_now)
+    # v10: 서식(글꼴·굵기·색) 본문 — 서버가 허용 목록으로 정리한 HTML. content 에는 검색·알림용 순수 텍스트를 둠
+    content_html     = Column(Text)
 
 
 # 수업 (classes)
@@ -407,7 +411,7 @@ class AdminTodo(TenantMixin, Base):
 class ActivityLog(TenantMixin, Base):
     __tablename__ = "activity_logs"
     log_id     = Column(Integer, primary_key=True, autoincrement=True)
-    actor_type = Column(String(10), nullable=False)        # admin / parent / kiosk / system
+    actor_type = Column(String(10), nullable=False)        # admin / parent / system (kiosk: v9 이전 기록)
     actor_id   = Column(Integer)                           # admin_accounts.account_id 또는 app_users.user_id
     action     = Column(String(40), nullable=False, index=True)
     target_type = Column(String(20))
@@ -453,7 +457,7 @@ class CommunityPost(TenantMixin, Base):
     content    = Column(Text, nullable=False)
     photos     = Column(Text)   # v7 이전 형식(사진 JSON). v8 부터는 community_photos 테이블 사용
     like_count = Column(Integer, default=0)
-    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now(), index=True)
     # v9: 게시판 형태 커뮤니티 — 제목·말머리·작성자(관리자/학부모)·고정·조회수·검토 상태
     title       = Column(String(200))
     category    = Column(String(20), default="FREE")      # FREE / QUESTION / PHOTO / INFO (공지는 notices 테이블)
@@ -463,6 +467,7 @@ class CommunityPost(TenantMixin, Base):
     view_count  = Column(Integer, default=0)
     status      = Column(String(10), default="VISIBLE")   # VISIBLE / PENDING(자동 검토 대기) / HIDDEN
     updated_at  = Column(TIMESTAMP)
+    content_html = Column(Text)                           # v10: 서식 본문(정리된 HTML). content 는 순수 텍스트
 
 class CommunityComment(TenantMixin, Base):
     __tablename__ = "community_comments"
@@ -509,6 +514,35 @@ class CommunityPhoto(TenantMixin, Base):
     position   = Column(Integer, nullable=False, default=0)
     mime_type  = Column(String(30), nullable=False, default="image/jpeg")
     data       = Column(Text, nullable=False)   # base64 본문(data URL 머리말 제외)
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+    # v10: 바둑판(갤러리) 보기용 작은 사진(긴 변 480px, 약 30~60KB) — 목록에서 원본(최대 1.1MB) 대신 사용
+    thumb      = Column(Text)
+
+
+# v10: 공지 사진 (게시글 사진과 같은 방식 — 목록엔 URL 만, 사진은 한 장씩 내려받음)
+class NoticePhoto(TenantMixin, Base):
+    __tablename__ = "notice_photos"
+    photo_id   = Column(Integer, primary_key=True, autoincrement=True)
+    notice_id  = Column(Integer, ForeignKey("notices.notice_id", ondelete="CASCADE"), nullable=False, index=True)
+    position   = Column(Integer, nullable=False, default=0)
+    mime_type  = Column(String(30), nullable=False, default="image/jpeg")
+    data       = Column(Text, nullable=False)
+    thumb      = Column(Text)
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+
+
+# v10: 게시글·공지 첨부파일 — Vercel 은 파일을 영구 저장하지 않으므로 DB 에 base64 로 보관 (파일당 4MB, 글당 5개)
+#      둘 중 하나(post_id / notice_id)만 채워집니다. 내려받기는 항상 '다운로드'로만(브라우저에서 실행·표시 안 함).
+class BoardAttachment(TenantMixin, Base):
+    __tablename__ = "board_attachments"
+    attachment_id = Column(Integer, primary_key=True, autoincrement=True)
+    post_id    = Column(Integer, ForeignKey("community_posts.post_id", ondelete="CASCADE"), index=True)
+    notice_id  = Column(Integer, ForeignKey("notices.notice_id", ondelete="CASCADE"), index=True)
+    file_name  = Column(String(255), nullable=False)
+    mime_type  = Column(String(100), nullable=False, default="application/octet-stream")
+    size_bytes = Column(Integer, nullable=False, default=0)
+    data       = Column(Text, nullable=False)
+    user_id    = Column(Integer)                 # 올린 app_users (학부모 첨부 삭제 권한 확인용)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
 
 
@@ -562,7 +596,7 @@ class UserSession(Base):
     token_hash = Column(String(64), primary_key=True)
     user_id = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
     active_role = Column(String(10))            # None(선택 전) / parent / admin
-    facility_id = Column(Integer)               # v9: 지금 들어가 있는 시설 (역할별로 고름)
+    facility_id = Column(Integer)               # v9: 지금 들어가 있는 학원 (역할별로 고름)
     expires_at = Column(TIMESTAMP, nullable=False, index=True)
     revoked = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
@@ -580,7 +614,7 @@ class ParentLink(TenantMixin, Base):
 
 
 class AcademySetting(Base):
-    """v8 이하 단일 시설 설정(키-값). v9 부터는 facilities 행에 저장하며, 이 테이블은 최초 마이그레이션 때만 읽습니다."""
+    """v8 이하 단일 학원 설정(키-값). v9 부터는 facilities 행에 저장하며, 이 테이블은 최초 마이그레이션 때만 읽습니다."""
     __tablename__ = "academy_settings"
     setting_key = Column(String(64), primary_key=True)
     setting_value = Column(Text, nullable=False)
@@ -588,7 +622,7 @@ class AcademySetting(Base):
 
 
 # ---------------------------------------------------------------------
-# v9 시설(테넌트) · 시설 직원 · 시설 회원(학부모) · 자녀 프로필 · 가입 신청
+# v9 학원(테넌트) · 학원 직원 · 학원 회원(학부모) · 자녀 프로필 · 가입 신청
 # ---------------------------------------------------------------------
 class Facility(Base):
     __tablename__ = "facilities"
@@ -612,7 +646,7 @@ class Facility(Base):
 
 
 class FacilityStaff(TenantMixin, Base):
-    """시설별 관리자 권한 (owner=원장, staff=직원). 한 계정이 여러 시설을 관리할 수 있습니다."""
+    """학원별 관리자 권한 (owner=원장, staff=직원). 한 계정이 여러 학원을 관리할 수 있습니다."""
     __tablename__ = "facility_staff"
     __table_args__ = (UniqueConstraint("facility_id", "account_id", name="uq_facility_staff"),)
     staff_id   = Column(Integer, primary_key=True, autoincrement=True)
@@ -622,7 +656,7 @@ class FacilityStaff(TenantMixin, Base):
 
 
 class FacilityMember(TenantMixin, Base):
-    """학부모가 '입장'한 시설 = 커뮤니티 멤버. 관리자 제재(경고·채팅 금지·강퇴)도 여기에 기록합니다."""
+    """학부모가 '입장'한 학원 = 커뮤니티 멤버. 관리자 제재(경고·채팅 금지·강퇴)도 여기에 기록합니다."""
     __tablename__ = "facility_members"
     __table_args__ = (UniqueConstraint("facility_id", "user_id", name="uq_facility_member"),)
     membership_id = Column(Integer, primary_key=True, autoincrement=True)
@@ -637,7 +671,7 @@ class FacilityMember(TenantMixin, Base):
 
 
 class ChildProfile(Base):
-    """학부모가 등록한 자녀 정보(시설과 무관). 시설에 가입 신청할 때 이 정보로 신청서를 만듭니다."""
+    """학부모가 등록한 자녀 정보(학원과 무관). 학원에 가입 신청할 때 이 정보로 신청서를 만듭니다."""
     __tablename__ = "child_profiles"
     child_id     = Column(Integer, primary_key=True, autoincrement=True)
     user_id      = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -655,7 +689,7 @@ class ChildProfile(Base):
 
 
 class EnrollmentApplication(TenantMixin, Base):
-    """학부모 → 시설 가입(수강) 신청. 승인되면 학생(members)·수강(enrollments)·자녀 연결(parent_links)이 생성됩니다."""
+    """학부모 → 학원 가입(수강) 신청. 승인되면 학생(members)·수강(enrollments)·자녀 연결(parent_links)이 생성됩니다."""
     __tablename__ = "enrollment_applications"
     application_id = Column(Integer, primary_key=True, autoincrement=True)
     user_id        = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -762,6 +796,10 @@ class ShopProduct(Base):
     source = Column(String(10), nullable=False, default="seed")   # seed / sync / manual
     active = Column(Boolean, nullable=False, default=True)
     updated_at = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
+    # v11 제휴몰: 어느 제휴몰 상품인지(shop_market.MALLS 코드, 기존 DDM 상품은 'ddm') · 정가(할인 표시) · 단위
+    mall_code = Column(String(30), index=True)
+    list_price = Column(Integer)                  # 정가. price(판매가)보다 크면 할인율 표시
+    unit = Column(String(20))
 
 
 # 쇼핑몰 상품 클릭 로그 (누가·언제·무엇을) — 추천 고도화를 위한 동작 데이터
@@ -770,8 +808,110 @@ class ShopClickEvent(TenantMixin, Base):
     event_id = Column(Integer, primary_key=True, autoincrement=True)
     account_id = Column(Integer, ForeignKey("admin_accounts.account_id", ondelete="CASCADE"), nullable=False, index=True)
     product_id = Column(Integer, ForeignKey("shop_products.product_id", ondelete="CASCADE"), nullable=False, index=True)
-    context = Column(String(30), nullable=False, default="catalog")   # catalog / recommendation
+    context = Column(String(30), nullable=False, default="catalog")   # catalog / recommendation / search / inventory
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now(), index=True)
+
+
+# ---------------------------------------------------------------------
+# v11 학원 쇼핑몰 — 제휴몰 연결 · 장바구니 주문 · 모의 결제 (실제 결제 대행사 호출 없음)
+#   주문 금액은 서버가 상품 가격으로 다시 계산하고(shop_market.quote), 결제 시 화면이 본 금액과 같은지 한 번 더 확인합니다.
+# ---------------------------------------------------------------------
+class ShopMallLink(TenantMixin, Base):
+    """학원이 '연결'한 제휴몰 — 학원 회원가(추가 할인)와 추천 우선순위에 쓰임"""
+    __tablename__ = "shop_mall_links"
+    __table_args__ = (UniqueConstraint("facility_id", "mall_code", name="uq_shop_mall_link"),)
+    link_id      = Column(Integer, primary_key=True, autoincrement=True)
+    mall_code    = Column(String(30), nullable=False)
+    connected_by = Column(Integer)                         # admin_accounts.account_id
+    created_at   = Column(TIMESTAMP, default=_now, server_default=func.now())
+
+
+class ShopOrder(TenantMixin, Base):
+    __tablename__ = "shop_orders"
+    order_id         = Column(Integer, primary_key=True, autoincrement=True)
+    order_number     = Column(String(40), nullable=False, unique=True, index=True)
+    account_id       = Column(Integer, nullable=False, index=True)       # 주문(요청)한 관리자
+    status           = Column(String(20), nullable=False, default="PENDING_PAYMENT", index=True)
+    list_total       = Column(Integer, nullable=False, default=0)        # 정가 합계
+    product_discount = Column(Integer, nullable=False, default=0)        # 상품 할인(정가 − 판매가)
+    member_discount  = Column(Integer, nullable=False, default=0)        # 학원 회원가 추가 할인
+    shipping_fee     = Column(Integer, nullable=False, default=0)
+    total            = Column(Integer, nullable=False)                   # 결제 금액
+    payment_method   = Column(String(20))
+    payment_tid      = Column(String(40))                                # 모의 결제 승인 번호 (MOCK-…)
+    memo             = Column(String(300), nullable=False, default="")
+    paid_by          = Column(Integer)
+    cancel_reason    = Column(String(200))
+    created_at       = Column(TIMESTAMP, default=_now, server_default=func.now(), index=True)
+    paid_at          = Column(TIMESTAMP)
+    received_at      = Column(TIMESTAMP)
+    canceled_at      = Column(TIMESTAMP)
+    items = relationship("ShopOrderItem", cascade="all, delete-orphan", order_by="ShopOrderItem.item_id")
+
+
+class ShopOrderItem(TenantMixin, Base):
+    __tablename__ = "shop_order_items"
+    item_id           = Column(Integer, primary_key=True, autoincrement=True)
+    order_id          = Column(Integer, ForeignKey("shop_orders.order_id", ondelete="CASCADE"), nullable=False, index=True)
+    product_id        = Column(Integer, ForeignKey("shop_products.product_id"), nullable=False)
+    mall_code         = Column(String(30), nullable=False)
+    product_name      = Column(String(200), nullable=False)          # 주문 당시 이름·가격 스냅샷
+    unit              = Column(String(20), nullable=False, default="개")
+    quantity          = Column(Integer, nullable=False)
+    list_price        = Column(Integer, nullable=False)
+    unit_price        = Column(Integer, nullable=False)                # 회원가 적용 후 단가
+    line_total        = Column(Integer, nullable=False)
+    inventory_item_id = Column(Integer)                                # 입고 처리 시 수량을 늘릴 재고 물품
+
+
+# ---------------------------------------------------------------------
+# v10 재고 관리 — 교재·도복·소모품 등 학원 물품의 수량을 기록하고, 부족하면 '구매 확인' 흐름으로 연결
+#   재고(inventory_items) → 입출고 기록(inventory_logs) → 구매 요청(purchase_requests: 요청 → 원장 승인/반려 → 입고)
+#   학원 유형과 무관하게 동작(분류는 자유 입력). 쇼핑몰 상품·B2B 상품과 연결하면 구매 화면으로 바로 이동합니다.
+# ---------------------------------------------------------------------
+class InventoryItem(TenantMixin, Base):
+    __tablename__ = "inventory_items"
+    item_id         = Column(Integer, primary_key=True, autoincrement=True)
+    name            = Column(String(100), nullable=False)
+    category        = Column(String(40), nullable=False, default="소모품")
+    unit            = Column(String(20), nullable=False, default="개")
+    quantity        = Column(Integer, nullable=False, default=0)
+    min_quantity    = Column(Integer, nullable=False, default=0)     # 안전 재고 — 이보다 적으면 '부족'
+    location        = Column(String(100), nullable=False, default="")
+    note            = Column(String(300), nullable=False, default="")
+    shop_product_id = Column(Integer, ForeignKey("shop_products.product_id", ondelete="SET NULL"))
+    b2b_sku         = Column(String(40))
+    keyword         = Column(String(100), nullable=False, default="")  # 쇼핑몰 검색어 (비우면 물품 이름)
+    active          = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(TIMESTAMP, default=_now, server_default=func.now())
+    updated_at      = Column(TIMESTAMP, default=_now, server_default=func.now(), onupdate=_now)
+
+
+class InventoryLog(TenantMixin, Base):
+    __tablename__ = "inventory_logs"
+    log_id         = Column(Integer, primary_key=True, autoincrement=True)
+    item_id        = Column(Integer, ForeignKey("inventory_items.item_id", ondelete="CASCADE"), nullable=False, index=True)
+    change         = Column(Integer, nullable=False)                   # +입고 / -사용·출고
+    quantity_after = Column(Integer, nullable=False)
+    reason         = Column(String(12), nullable=False, default="ADJUST")   # IN / OUT / ADJUST / PURCHASE
+    note           = Column(String(200), nullable=False, default="")
+    account_id     = Column(Integer)
+    created_at     = Column(TIMESTAMP, default=_now, server_default=func.now(), index=True)
+
+
+class PurchaseRequest(TenantMixin, Base):
+    __tablename__ = "purchase_requests"
+    request_id    = Column(Integer, primary_key=True, autoincrement=True)
+    item_id       = Column(Integer, ForeignKey("inventory_items.item_id", ondelete="CASCADE"), nullable=False, index=True)
+    quantity      = Column(Integer, nullable=False)
+    status        = Column(String(10), nullable=False, default="REQUESTED", index=True)  # REQUESTED/APPROVED/REJECTED/RECEIVED/CANCELED
+    note          = Column(String(300), nullable=False, default="")
+    requested_by  = Column(Integer)                  # admin_accounts.account_id
+    decided_by    = Column(Integer)
+    decision_note = Column(String(200))
+    decided_at    = Column(TIMESTAMP)
+    received_at   = Column(TIMESTAMP)
+    created_at    = Column(TIMESTAMP, default=_now, server_default=func.now(), index=True)
 
 
 # ---------------------------------------------------------------------
@@ -857,8 +997,10 @@ class AttendanceOut(BaseModel):
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     note: Optional[str] = None
-    class_id: Optional[int] = None          # v9: 수업별 출결 (없으면 시설 출입 기록)
+    class_id: Optional[int] = None          # v9: 수업별 출결 (없으면 학원 출입 기록)
     class_name: Optional[str] = None
+    parent_notified: Optional[int] = None   # v10: 이번 처리로 알림을 받은 학부모 수 (저장·변경 응답에만)
+    parent_linked: Optional[bool] = None    # v10: 학부모 계정이 연결된 학생인지 (미연결이면 알림 불가)
     class Config: from_attributes = True
 
 
@@ -906,17 +1048,36 @@ class NoticeOut(BaseModel):
     class_name: Optional[str] = None
     read_count: int = 0                     # v8.1: 읽은 학부모 수
     target_count: int = 0                   # v8.1: 공지를 받는 학부모 수
+    content_html: Optional[str] = None      # v10: 서식 본문(정리된 HTML)
+    photos: List[str] = []                  # v10: 공지 사진 URL
+    thumbs: List[str] = []                  # v10: 작은 사진 URL (바둑판 보기)
+    attachments: List[dict] = []            # v10: 첨부파일 [{attachment_id, file_name, size_bytes, url}]
     class Config: from_attributes = True
+
+
+class PhotoIn(BaseModel):
+    """v10: 사진 1장 — src(원본 data URL 또는 기존 사진 URL) + thumb(작은 사진 data URL, 선택)"""
+    src: str = Field(max_length=1_600_000)
+    thumb: Optional[str] = Field(None, max_length=200_000)
 
 
 class NoticeCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
-    content: str = Field(max_length=20000)
+    content: str = Field("", max_length=20000)
+    content_html: Optional[str] = Field(None, max_length=60000)   # v10: 서식 본문 (보내면 content 는 서버가 텍스트로 다시 만듦)
     author: str = Field("관리자", max_length=50)
     category: str = Field("GENERAL", max_length=20)
     is_pinned: bool = False
     class_id: Optional[int] = None          # 비우면 전체 공지
     notify_parents: bool = True             # 등록 시 학부모 알림 보내기
+    photos: Optional[List[Union[str, PhotoIn]]] = Field(None, max_length=20)   # v10: None 이면 수정 시 기존 사진 유지
+
+
+class NoticeDraftRequest(BaseModel):
+    """v10: 공지 자동 작성 — '에버랜드, 10/25, 선택 참여' 처럼 키워드·날짜·시간을 입력"""
+    keywords: str = Field(min_length=1, max_length=500)
+    class_id: Optional[int] = None
+    use_ai: bool = True
 
 
 class MemberBrief(BaseModel):
@@ -1105,7 +1266,8 @@ async def lifespan(app: "FastAPI"):
 # ---------------------------------------------------------------------
 # 앱 설정
 # ---------------------------------------------------------------------
-app = FastAPI(title="facilink API", version="0.9.0", lifespan=lifespan,
+APP_NAME = os.getenv("APP_NAME", "쑥쑥")
+app = FastAPI(title=f"{APP_NAME} API", version="0.11.0", lifespan=lifespan,
               # 운영(Vercel)에서는 API 문서 화면을 숨김 — 엔드포인트 목록 노출 최소화
               docs_url=None if IS_SERVERLESS else "/docs",
               redoc_url=None, openapi_url=None if IS_SERVERLESS else "/openapi.json")
@@ -1230,6 +1392,9 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ADMIN_SIGNUP_CODE = os.getenv("ADMIN_SIGNUP_CODE", "").strip()
 STAFF_SIGNUP_CODE = os.getenv("STAFF_SIGNUP_CODE", "").strip()
 CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+# v10 보안: B2B 계약 등급(VIP 할인율)은 '플랫폼 운영자'만 바꿀 수 있음 — 학원 원장이 자기 계정을 VIP 로 올려
+#           할인을 받는 권한 상승을 막기 위함. 콤마 구분 이메일 (비우면 아무도 바꿀 수 없음)
+PLATFORM_ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("PLATFORM_ADMIN_EMAILS", "").split(",") if e.strip()}
 # 초대 코드는 추측하기 어려워야 함 — 짧은 코드는 설정돼 있어도 사용하지 않음
 MIN_INVITE_CODE_LENGTH = 12
 for _name, _code in (("ADMIN_SIGNUP_CODE", ADMIN_SIGNUP_CODE), ("STAFF_SIGNUP_CODE", STAFF_SIGNUP_CODE)):
@@ -1283,14 +1448,14 @@ class RoleSelectRequest(BaseModel):
 
 
 class AccountAccessUpdate(BaseModel):
-    role: str
-    pricing_tier: str
+    role: str = Field(max_length=10)
+    pricing_tier: str = Field(max_length=20)
 
 
 class AdminAccountCreate(BaseModel):
     email: str = Field(max_length=254)
     username: str = Field("", max_length=100)
-    role: str = "staff"
+    role: str = Field("staff", max_length=10)
 
 
 class SettingsUpdate(BaseModel):
@@ -1299,15 +1464,15 @@ class SettingsUpdate(BaseModel):
 
 
 class B2BOrderItemInput(BaseModel):
-    sku: str
+    sku: str = Field(max_length=40)
     quantity: int
 
 
 class B2BOrderCreate(BaseModel):
-    items: List[B2BOrderItemInput]
-    payment_method: str
-    class_name: str = "전체 기관"
-    custom_note: str = ""
+    items: List[B2BOrderItemInput] = Field(max_length=100)
+    payment_method: str = Field(max_length=32)
+    class_name: str = Field("전체 기관", max_length=120)
+    custom_note: str = Field("", max_length=500)
 
 
 EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
@@ -1383,15 +1548,17 @@ _PUBLIC_API_PATHS = {
     "/api/payments/kakao-success", "/api/payments/kakao-cancel", "/api/payments/kakao-fail",
     "/api/cron/cleanup", "/api/health",
 }
-# 직원(staff) 계정도 사용할 수 있는 관리자 영역 (쇼핑몰·발주 + 출석 키오스크 + 알림함·상단 요약 + 출석 체크)
-_STAFF_API_PREFIXES = ("/api/b2b/", "/api/shop/", "/api/kiosk/", "/api/notifications", "/api/admin/summary",
+# 직원(staff) 계정도 사용할 수 있는 관리자 영역 (쇼핑몰·발주 + 재고 + 알림함·상단 요약 + 출석 체크)
+#   v10: 출석 키오스크 삭제 — 출석은 '출석 체크' 화면에서만 기록하고 학부모에게 바로 알림
+#        재고 관리(/api/inventory)는 직원도 조회·입출고·구매 요청 가능, 구매 승인·삭제는 원장만(핸들러에서 검사)
+_STAFF_API_PREFIXES = ("/api/b2b/", "/api/shop/", "/api/inventory", "/api/notifications", "/api/admin/summary",
                        "/api/attendances", "/api/sync")
 # 직원이 조회만 할 수 있는 영역 (출석 체크 화면에 필요한 학생·수업 목록)
 _STAFF_READ_PREFIXES = ("/api/members", "/api/classes", "/api/enrollments")
-# 시설을 고르기 전에도 쓸 수 있는 API (시설 목록·생성·입장 / 학부모 시설 검색·자녀 프로필·가입 신청 현황)
+# 학원을 고르기 전에도 쓸 수 있는 API (학원 목록·생성·입장 / 학부모 학원 검색·자녀 프로필·가입 신청 현황)
 _ADMIN_GLOBAL_PREFIXES = ("/api/facilities",)
 _PARENT_GLOBAL_PREFIXES = ("/api/parent/facilities", "/api/parent/child-profiles", "/api/parent/applications")
-FACILITY_REQUIRED_STATUS = 428   # 프론트는 이 코드를 받으면 시설 선택 화면으로 이동
+FACILITY_REQUIRED_STATUS = 428   # 프론트는 이 코드를 받으면 학원 선택 화면으로 이동
 
 
 def _public_api_request(method: str, path: str) -> bool:
@@ -1409,8 +1576,8 @@ def _json_error(request: Request, status_code: int, detail: str) -> JSONResponse
 
 
 def _authorize(request: Request, db: Session):
-    """세션·역할·시설 검사. 통과하면 None, 막아야 하면 (상태코드, 메시지)를 돌려줌.
-    통과하면 db.info["facility_id"] 가 설정되어 이후 모든 조회가 그 시설로 자동 제한됩니다."""
+    """세션·역할·학원 검사. 통과하면 None, 막아야 하면 (상태코드, 메시지)를 돌려줌.
+    통과하면 db.info["facility_id"] 가 설정되어 이후 모든 조회가 그 학원으로 자동 제한됩니다."""
     path = request.url.path
     session, user = _resolve_user_session(db, request.cookies.get(AUTH_COOKIE_NAME))
     if not session:
@@ -1423,16 +1590,16 @@ def _authorize(request: Request, db: Session):
         if path.startswith(_PARENT_GLOBAL_PREFIXES):
             return None
         if not session.facility_id:
-            return FACILITY_REQUIRED_STATUS, "이용할 시설을 먼저 선택하세요."
+            return FACILITY_REQUIRED_STATUS, "이용할 학원을 먼저 선택하세요."
         row = (db.query(FacilityMember, Facility)
                  .join(Facility, Facility.facility_id == FacilityMember.facility_id)
                  .filter(FacilityMember.user_id == user.user_id, FacilityMember.facility_id == session.facility_id,
                          Facility.deleted_at.is_(None)).first())
         if not row:
-            return FACILITY_REQUIRED_STATUS, "이 시설에 입장한 기록이 없습니다. 시설을 다시 선택하세요."
+            return FACILITY_REQUIRED_STATUS, "이 학원에 입장한 기록이 없습니다. 학원을 다시 선택하세요."
         membership, facility = row
         if membership.status == "BANNED":
-            return 403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다. 시설로 문의하세요."
+            return 403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다. 학원으로 문의하세요."
         request.state.membership = membership
         request.state.facility = facility
         db.info["facility_id"] = facility.facility_id
@@ -1446,13 +1613,13 @@ def _authorize(request: Request, db: Session):
     if path.startswith(_ADMIN_GLOBAL_PREFIXES):
         return None
     if not session.facility_id:
-        return FACILITY_REQUIRED_STATUS, "관리할 시설을 먼저 선택하세요."
+        return FACILITY_REQUIRED_STATUS, "관리할 학원을 먼저 선택하세요."
     row = (db.query(FacilityStaff.role, Facility)
              .join(Facility, Facility.facility_id == FacilityStaff.facility_id)
              .filter(FacilityStaff.account_id == account.account_id, FacilityStaff.facility_id == session.facility_id,
                      Facility.deleted_at.is_(None)).first())
     if not row:
-        return FACILITY_REQUIRED_STATUS, "이 시설의 관리 권한이 없습니다. 시설을 다시 선택하세요."
+        return FACILITY_REQUIRED_STATUS, "이 학원의 관리 권한이 없습니다. 학원을 다시 선택하세요."
     role, facility = row
     account.facility_role = role          # 매핑되지 않은 임시 속성 (DB 에 저장되지 않음)
     request.state.facility = facility
@@ -1470,7 +1637,28 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "X-Frame-Options": "DENY",
+    # v10: API 응답(JSON·사진·첨부)은 문서로 렌더링될 일이 없으므로 가장 엄격한 CSP — 혹시 HTML 로 해석돼도 스크립트 실행 불가
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 }
+if IS_SERVERLESS:
+    _SECURITY_HEADERS["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _cross_site_write(request: Request) -> bool:
+    """v10 CSRF 이중 방어: 쿠키(SameSite=Lax)에 더해, 다른 사이트에서 보낸 쓰기 요청을 Origin/Sec-Fetch-Site 로 차단.
+    (브라우저가 보내는 헤더만 검사 — 헤더가 없는 서버 간 호출·테스트 클라이언트는 그대로 통과)"""
+    if request.method not in _UNSAFE_METHODS:
+        return False
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return True
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    if origin in allow_origins:
+        return False
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+    return urlsplit(origin).netloc != host
 
 
 @app.middleware("http")
@@ -1479,6 +1667,9 @@ async def protect_api(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/") and DATABASE_PROBLEM and path != "/api/health":
         return _json_error(request, 503, DATABASE_PROBLEM)
+    if path.startswith("/api/") and _cross_site_write(request):
+        logger.warning("다른 출처의 쓰기 요청 차단 %s %s origin=%s", request.method, path, request.headers.get("origin"))
+        return _json_error(request, 403, "허용되지 않은 출처의 요청입니다.")
     if not path.startswith("/api/") or request.method == "OPTIONS" or _public_api_request(request.method, path):
         response = await call_next(request)
     else:
@@ -1513,7 +1704,7 @@ def current_account(request: Request) -> AdminAccount:
 
 
 def _facility_role(account: AdminAccount) -> str:
-    """현재 시설에서의 역할 (owner/staff). 시설을 고르기 전에는 계정의 기본 역할"""
+    """현재 학원에서의 역할 (owner/staff). 학원을 고르기 전에는 계정의 기본 역할"""
     return getattr(account, "facility_role", None) or account.role
 
 
@@ -1526,7 +1717,7 @@ def owner_account(account: AdminAccount = Depends(current_account)) -> AdminAcco
 def current_facility(request: Request) -> "Facility":
     facility = getattr(request.state, "facility", None)
     if facility is None:
-        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "학원을 먼저 선택하세요.")
     return facility
 
 
@@ -1546,7 +1737,8 @@ def current_parent(request: Request) -> AppUser:
 #   알림·로그 행은 원래 작업과 같은 트랜잭션에 추가되므로 작업이 커밋될 때만 함께 저장됩니다.
 # =====================================================================
 NOTIFICATION_KINDS = {"CHECK_IN", "CHECK_OUT", "ABSENT", "NOTICE", "INVOICE", "PAYMENT", "UNPAID",
-                      "ASSIGNMENT", "COMMENT", "MODERATION", "LINK", "APPLICATION", "SANCTION", "POST"}
+                      "ASSIGNMENT", "COMMENT", "MODERATION", "LINK", "APPLICATION", "SANCTION", "POST",
+                      "INVENTORY", "PURCHASE"}
 
 
 def _log(db: Session, actor_type: str, actor_id: Optional[int], action: str,
@@ -1589,7 +1781,7 @@ def _notify_parents(db: Session, member_ids, kind: str, title: str, body: str = 
 
 
 def _notify_all_parents(db: Session, kind: str, title: str, body: str = "", link: str = "") -> int:
-    """이 시설에 입장한 모든 학부모(커뮤니티 멤버)와 자녀가 연결된 학부모에게 1건씩 (전체 공지 등)"""
+    """이 학원에 입장한 모든 학부모(커뮤니티 멤버)와 자녀가 연결된 학부모에게 1건씩 (전체 공지 등)"""
     user_ids = {uid for (uid,) in db.query(ParentLink.user_id).distinct().all()}
     user_ids |= {uid for (uid,) in db.query(FacilityMember.user_id).filter(FacilityMember.status == "ACTIVE").all()}
     for user_id in user_ids:
@@ -1599,7 +1791,7 @@ def _notify_all_parents(db: Session, kind: str, title: str, body: str = "", link
 
 
 def _owner_user_ids(db: Session, facility_id: Optional[int] = None) -> List[int]:
-    """현재 시설의 원장(owner) 계정에 해당하는 Google 사용자 ID"""
+    """현재 학원의 원장(owner) 계정에 해당하는 Google 사용자 ID"""
     facility_id = facility_id or db.info.get("facility_id")
     if not facility_id:
         return []
@@ -1637,7 +1829,7 @@ def _list_notifications(db: Session, user_id: int, audience: str, limit: int, un
 
 
 class NotificationReadRequest(BaseModel):
-    ids: List[int] = []
+    ids: List[int] = Field(default_factory=list, max_length=500)
     all: bool = False
 
 
@@ -1651,16 +1843,6 @@ def _mark_notifications_read(db: Session, user_id: int, audience: str, payload: 
     updated = query.update({"is_read": True}, synchronize_session=False)
     db.commit()
     return {"updated": updated}
-
-
-def _mask_name(name: str) -> str:
-    """키오스크·공개 화면용 이름 가리기: 김민준 → 김*준, 이준 → 이*"""
-    name = (name or "").strip()
-    if len(name) <= 1:
-        return name or "?"
-    if len(name) == 2:
-        return name[0] + "*"
-    return name[0] + "*" * (len(name) - 2) + name[-1]
 
 
 def _signup_role(db: Session, invite_code: str) -> str:
@@ -1709,8 +1891,10 @@ def _me_out(db: Session, session: UserSession, user: AppUser) -> dict:
         "active_role": session.active_role,
         "admin": _account_to_out(account) if account else None,
         "can_admin": bool(account),
-        # 원장 계정(owner)만 새 시설을 만들 수 있음 (직원 초대로 들어온 계정은 초대받은 시설만 관리)
+        # 원장 계정(owner)만 새 학원을 만들 수 있음 (직원 초대로 들어온 계정은 초대받은 학원만 관리)
         "can_create_facility": bool(account and account.role == "owner"),
+        "can_edit_pricing": bool(account and account.email.lower() in PLATFORM_ADMIN_EMAILS),
+        "is_platform_admin": bool(account and account.email.lower() in PLATFORM_ADMIN_EMAILS),
         "facility": _facility_brief(facility, my_role) if facility else None,
     }
 
@@ -1805,7 +1989,7 @@ def auth_me(request: Request, db: Session = Depends(get_db)):
 def select_role(payload: RoleSelectRequest, request: Request, db: Session = Depends(get_db)):
     """로그인 후 역할 선택. 관리자 권한은 서버에서만 판정합니다(화면 분기만으로 보호하지 않음)."""
     session, user = _session_from_request(request, db)
-    session.facility_id = None          # v9: 역할을 바꾸면 시설도 다시 고름
+    session.facility_id = None          # v9: 역할을 바꾸면 학원도 다시 고름
     if payload.role == "parent":
         session.active_role = "parent"
     elif payload.role == "admin":
@@ -1846,7 +2030,7 @@ def auth_logout(request: Request, response: Response, db: Session = Depends(get_
 
 @app.get("/api/admin/accounts")
 def list_admin_accounts(db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
-    """이 시설의 관리자·직원 목록"""
+    """이 학원의 관리자·직원 목록"""
     rows = (db.query(AdminAccount, FacilityStaff.role)
               .join(FacilityStaff, FacilityStaff.account_id == AdminAccount.account_id)
               .order_by(FacilityStaff.staff_id).all())
@@ -1860,7 +2044,7 @@ def list_admin_accounts(db: Session = Depends(get_db), account: AdminAccount = D
 
 @app.post("/api/admin/accounts", status_code=201)
 def create_admin_account(payload: AdminAccountCreate, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
-    """원장이 관리자/직원 Google 이메일을 이 시설에 등록 → 그 사용자는 '관리자' 선택 후 이 시설에 들어올 수 있음"""
+    """원장이 관리자/직원 Google 이메일을 이 학원에 등록 → 그 사용자는 '관리자' 선택 후 이 학원에 들어올 수 있음"""
     email = payload.email.strip().lower()
     if not EMAIL_PATTERN.fullmatch(email):
         raise HTTPException(400, "올바른 이메일 주소를 입력하세요.")
@@ -1868,13 +2052,13 @@ def create_admin_account(payload: AdminAccountCreate, db: Session = Depends(get_
         raise HTTPException(400, "역할은 owner 또는 staff 여야 합니다.")
     row = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == email).first()
     if not row:
-        # 새 계정은 '직원' 기본 권한 — 다른 시설을 새로 만들 수는 없고 초대받은 시설만 관리
+        # 새 계정은 '직원' 기본 권한 — 다른 학원을 새로 만들 수는 없고 초대받은 학원만 관리
         row = AdminAccount(email=email, username=(payload.username.strip() or email.split("@")[0])[:100],
                            provider="google", role="staff")
         db.add(row)
         db.flush()
     if db.query(FacilityStaff).filter(FacilityStaff.account_id == row.account_id).first():
-        raise HTTPException(409, "이미 이 시설에 등록된 계정입니다.")
+        raise HTTPException(409, "이미 이 학원에 등록된 계정입니다.")
     db.add(FacilityStaff(account_id=row.account_id, role=payload.role))
     db.commit()
     db.refresh(row)
@@ -1890,11 +2074,13 @@ def update_admin_account(account_id: int, payload: AccountAccessUpdate, db: Sess
     staff = db.query(FacilityStaff).filter(FacilityStaff.account_id == account_id).first()
     target = db.query(AdminAccount).filter(AdminAccount.account_id == account_id).first()
     if not staff or not target:
-        raise HTTPException(404, "이 시설의 계정을 찾을 수 없습니다.")
+        raise HTTPException(404, "이 학원의 계정을 찾을 수 없습니다.")
     if payload.role not in {"owner", "staff"} or payload.pricing_tier not in {"STANDARD", "VIP"}:
         raise HTTPException(400, "계정 역할 또는 계약 등급이 올바르지 않습니다.")
     if staff.role == "owner" and payload.role != "owner" and _owner_count(db) <= 1:
         raise HTTPException(409, "마지막 원장 계정의 권한은 해제할 수 없습니다.")
+    if payload.pricing_tier != target.pricing_tier and account.email.lower() not in PLATFORM_ADMIN_EMAILS:
+        raise HTTPException(403, "B2B 계약 등급(할인율)은 플랫폼 운영자만 변경할 수 있습니다.")
     staff.role = payload.role
     target.pricing_tier = payload.pricing_tier
     db.commit()
@@ -1904,23 +2090,24 @@ def update_admin_account(account_id: int, payload: AccountAccessUpdate, db: Sess
 
 @app.delete("/api/admin/accounts/{account_id}", status_code=204)
 def remove_admin_account(account_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
-    """이 시설의 관리 권한만 회수 (계정 자체와 다른 시설 권한은 유지)"""
+    """이 학원의 관리 권한만 회수 (계정 자체와 다른 학원 권한은 유지)"""
     staff = db.query(FacilityStaff).filter(FacilityStaff.account_id == account_id).first()
     if not staff:
-        raise HTTPException(404, "이 시설의 계정을 찾을 수 없습니다.")
+        raise HTTPException(404, "이 학원의 계정을 찾을 수 없습니다.")
     if staff.role == "owner" and _owner_count(db) <= 1:
         raise HTTPException(409, "마지막 원장 계정은 삭제할 수 없습니다.")
     db.delete(staff)
     db.commit()
 
 
-FACILITY_TYPES = ("학원", "체육관", "도장", "기타")
+# 학원 종류 — "학원"은 교과(보습·입시). v11 에서 어학원·예체능·코딩·과학 추가(기존 값은 그대로 유효)
+FACILITY_TYPES = ("학원", "어학원", "예체능", "코딩·과학", "체육관", "도장", "기타")
 DEFAULT_ACADEMY_SETTINGS = {
-    "name": "우리 시설", "branch": "본점", "principal": "원장님",
+    "name": "우리 학원", "branch": "본점", "principal": "원장님",
     "role": "관리자", "phone": "", "address": "", "logo": "",
-    "facilityType": "학원",   # 시설 유형 — 쇼핑몰 추천 등 시설별 동작에 사용
+    "facilityType": "학원",   # 학원 유형 — 쇼핑몰 추천 등 학원별 동작에 사용
     "weatherCity": "용인",     # 대시보드 날씨 지역 (프론트의 도시 목록 중 하나)
-    "lateGraceMinutes": 10,   # 키오스크 등원 시 수업 시작 후 몇 분까지 '출석'으로 볼지
+    "lateGraceMinutes": 10,   # 수업 시작 후 몇 분까지 '출석'으로 볼지 (출석 체크 화면의 지각 안내 기준)
 }
 DEFAULT_PAYMENT_SETTINGS = {
     "defaultPaymentDay": "1",
@@ -1931,7 +2118,7 @@ DEFAULT_PAYMENT_SETTINGS = {
 }
 
 
-# v9: 설정은 시설(facilities) 행에 저장. academy 의 이름·지점·연락처 등은 시설 컬럼, 나머지는 settings_json
+# v9: 설정은 학원(facilities) 행에 저장. academy 의 이름·지점·연락처 등은 학원 컬럼, 나머지는 settings_json
 _ACADEMY_COLUMN_MAP = {"name": "name", "branch": "branch", "phone": "phone", "address": "address", "logo": "logo",
                        "facilityType": "facility_type", "region": "region", "description": "description"}
 
@@ -1939,13 +2126,13 @@ _ACADEMY_COLUMN_MAP = {"name": "name", "branch": "branch", "phone": "phone", "ad
 def _facility_of(db: Session, facility_id: Optional[int] = None) -> "Facility":
     facility_id = facility_id or db.info.get("facility_id")
     if not facility_id:
-        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "학원을 먼저 선택하세요.")
     cached = db.info.get("_facility_obj")
     if cached is not None and cached.facility_id == facility_id:
         return cached
     facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
     if not facility:
-        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+        raise HTTPException(404, "학원을 찾을 수 없습니다.")
     db.info["_facility_obj"] = facility
     return facility
 
@@ -2018,7 +2205,11 @@ def put_settings(payload: SettingsUpdate, db: Session = Depends(get_db), account
     if not str(academy.get("name", "")).strip():
         raise HTTPException(400, "기관명을 입력하세요.")
     if academy.get("facilityType") not in FACILITY_TYPES:
-        raise HTTPException(400, f"시설 유형은 {', '.join(FACILITY_TYPES)} 중 하나여야 합니다.")
+        raise HTTPException(400, f"학원 유형은 {', '.join(FACILITY_TYPES)} 중 하나여야 합니다.")
+    subjects = academy.get("subjects") or []
+    if not isinstance(subjects, list) or any(s not in _shop_market.SUBJECTS for s in subjects) or len(subjects) > 12:
+        raise HTTPException(400, "주요 과목 값이 올바르지 않습니다.")
+    academy["subjects"] = list(dict.fromkeys(subjects))
     try:
         fee = int(payment.get("baseTuitionFee", 0))
     except (ValueError, TypeError):
@@ -2056,8 +2247,8 @@ def _brand(db: Session) -> dict:
 
 
 # =====================================================================
-# v9 시설 관리 (관리자) — 시설 생성·수정·삭제·입장. 시설을 고르기 전에도 호출 가능(_ADMIN_GLOBAL_PREFIXES)
-#   - 이 구간의 요청은 시설 문맥(db.info["facility_id"])이 없으므로, 모든 조회에 facility_id 조건을 직접 겁니다.
+# v9 학원 관리 (관리자) — 학원 생성·수정·삭제·입장. 학원을 고르기 전에도 호출 가능(_ADMIN_GLOBAL_PREFIXES)
+#   - 이 구간의 요청은 학원 문맥(db.info["facility_id"])이 없으므로, 모든 조회에 facility_id 조건을 직접 겁니다.
 # =====================================================================
 class FacilityIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -2070,17 +2261,28 @@ class FacilityIn(BaseModel):
     is_public: bool = True
     principal: str = Field("", max_length=50)
     base_tuition_fee: Optional[int] = Field(None, ge=0, le=100_000_000)
+    subjects: Optional[List[str]] = Field(None, max_length=12)     # 주요 과목 (쇼핑몰 추천에 사용). None = 바꾸지 않음
+
+    @field_validator("subjects")
+    @classmethod
+    def valid_subjects(cls, v):
+        if v is None:
+            return v
+        bad = [s for s in v if s not in _shop_market.SUBJECTS]
+        if bad:
+            raise ValueError(f"알 수 없는 과목: {', '.join(bad[:3])}")
+        return list(dict.fromkeys(v))
 
     @field_validator("facility_type")
     @classmethod
     def valid_type(cls, v):
         if v not in FACILITY_TYPES:
-            raise ValueError(f"시설 유형은 {', '.join(FACILITY_TYPES)} 중 하나여야 합니다.")
+            raise ValueError(f"학원 유형은 {', '.join(FACILITY_TYPES)} 중 하나여야 합니다.")
         return v
 
 
 def _facility_counts(db: Session, facility_ids: List[int]) -> dict:
-    """시설별 재원생·학부모·대기 중인 가입 신청 수 (시설 문맥 없이 GROUP BY 3회)"""
+    """학원별 재원생·학부모·대기 중인 가입 신청 수 (학원 문맥 없이 GROUP BY 3회)"""
     ids = list(facility_ids) or [-1]
     q = lambda col, *conds: dict(db.query(col, func.count()).filter(col.in_(ids), *conds).group_by(col)
                                  .execution_options(all_facilities=True).all())
@@ -2097,6 +2299,7 @@ def _facility_admin_out(f: Facility, role: str, counts: dict) -> dict:
     return {**_facility_brief(f, role), "address": f.address or "", "phone": f.phone or "",
             "description": f.description or "", "is_public": bool(f.is_public),
             "principal": settings.get("principal") or "",
+            "subjects": settings.get("subjects") if isinstance(settings.get("subjects"), list) else [],
             "base_tuition_fee": _json_dict(f.payment_json).get("baseTuitionFee"),
             "student_count": int(counts["students"].get(f.facility_id, 0)),
             "parent_count": int(counts["parents"].get(f.facility_id, 0)),
@@ -2127,17 +2330,18 @@ def my_facilities(db: Session = Depends(get_db), account: AdminAccount = Depends
 def create_facility(payload: FacilityIn, request: Request, db: Session = Depends(get_db),
                     account: AdminAccount = Depends(current_account)):
     if account.role != "owner":
-        raise HTTPException(403, "새 시설은 원장 계정만 만들 수 있습니다. (직원 계정은 초대받은 시설만 관리)")
+        raise HTTPException(403, "새 학원은 원장 계정만 만들 수 있습니다. (직원 계정은 초대받은 학원만 관리)")
     if db.query(func.count(FacilityStaff.staff_id)).filter(
             FacilityStaff.account_id == account.account_id, FacilityStaff.role == "owner").execution_options(
             all_facilities=True).scalar() >= 20:
-        raise HTTPException(400, "한 계정이 만들 수 있는 시설은 20개까지입니다.")
+        raise HTTPException(400, "한 계정이 만들 수 있는 학원은 20개까지입니다.")
     user = request.state.user
     facility = Facility(name=payload.name.strip(), facility_type=payload.facility_type, branch=payload.branch.strip(),
                         region=payload.region.strip(), address=payload.address.strip(), phone=payload.phone.strip(),
                         description=payload.description.strip(), is_public=payload.is_public, created_by=user.user_id,
                         settings_json=json.dumps({"principal": payload.principal.strip() or (user.name or ""),
-                                                  "role": "원장", "weatherCity": "용인", "lateGraceMinutes": 10},
+                                                  "role": "원장", "weatherCity": "용인", "lateGraceMinutes": 10,
+                                                  "subjects": payload.subjects or []},
                                                  ensure_ascii=False),
                         payment_json=json.dumps({**DEFAULT_PAYMENT_SETTINGS, **(
                             {"baseTuitionFee": payload.base_tuition_fee} if payload.base_tuition_fee is not None else {})},
@@ -2154,7 +2358,7 @@ def create_facility(payload: FacilityIn, request: Request, db: Session = Depends
 def update_facility(facility_id: int, payload: FacilityIn, db: Session = Depends(get_db),
                     account: AdminAccount = Depends(current_account)):
     if _my_staff_role(db, account, facility_id) != "owner":
-        raise HTTPException(403, "이 시설의 원장만 정보를 수정할 수 있습니다.")
+        raise HTTPException(403, "이 학원의 원장만 정보를 수정할 수 있습니다.")
     facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
     facility.name, facility.facility_type = payload.name.strip(), payload.facility_type
     facility.branch, facility.region = payload.branch.strip(), payload.region.strip()
@@ -2163,6 +2367,8 @@ def update_facility(facility_id: int, payload: FacilityIn, db: Session = Depends
     settings = _json_dict(facility.settings_json)
     if payload.principal.strip():
         settings["principal"] = payload.principal.strip()
+    if payload.subjects is not None:
+        settings["subjects"] = payload.subjects
     facility.settings_json = json.dumps(settings, ensure_ascii=False)
     if payload.base_tuition_fee is not None:
         payment = {**DEFAULT_PAYMENT_SETTINGS, **_json_dict(facility.payment_json), "baseTuitionFee": payload.base_tuition_fee}
@@ -2176,12 +2382,12 @@ def update_facility(facility_id: int, payload: FacilityIn, db: Session = Depends
 @app.delete("/api/facilities/{facility_id}", status_code=204)
 def delete_facility(facility_id: int, confirm_name: str = Query(..., max_length=100), db: Session = Depends(get_db),
                     account: AdminAccount = Depends(current_account)):
-    """시설 삭제 = 보관 처리(deleted_at). 학생·결제 기록은 지우지 않아 실수로 지워도 DB 에서 복구할 수 있습니다."""
+    """학원 삭제 = 보관 처리(deleted_at). 학생·결제 기록은 지우지 않아 실수로 지워도 DB 에서 복구할 수 있습니다."""
     if _my_staff_role(db, account, facility_id) != "owner":
-        raise HTTPException(403, "이 시설의 원장만 삭제할 수 있습니다.")
+        raise HTTPException(403, "이 학원의 원장만 삭제할 수 있습니다.")
     facility = db.query(Facility).filter(Facility.facility_id == facility_id).first()
     if confirm_name.strip() != facility.name:
-        raise HTTPException(400, "확인을 위해 시설 이름을 정확히 입력하세요.")
+        raise HTTPException(400, "확인을 위해 학원 이름을 정확히 입력하세요.")
     facility.deleted_at = _now()
     db.query(UserSession).filter(UserSession.facility_id == facility_id).update(
         {"facility_id": None}, synchronize_session=False)
@@ -2192,7 +2398,7 @@ def delete_facility(facility_id: int, confirm_name: str = Query(..., max_length=
 def enter_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
                    account: AdminAccount = Depends(current_account)):
     if not _my_staff_role(db, account, facility_id):
-        raise HTTPException(403, "이 시설의 관리 권한이 없습니다.")
+        raise HTTPException(403, "이 학원의 관리 권한이 없습니다.")
     session = request.state.session
     session.facility_id = facility_id
     db.commit()
@@ -2208,8 +2414,8 @@ def exit_facility(request: Request, db: Session = Depends(get_db), account: Admi
 
 
 # =====================================================================
-# v9 학부모: 시설 검색·입장 / 자녀 프로필 / 가입(수강) 신청
-#   - 시설을 고르기 전에도 호출 가능(_PARENT_GLOBAL_PREFIXES). 시설 데이터는 공개 정보(이름·소개·수업 시간표·수강료)만.
+# v9 학부모: 학원 검색·입장 / 자녀 프로필 / 가입(수강) 신청
+#   - 학원을 고르기 전에도 호출 가능(_PARENT_GLOBAL_PREFIXES). 학원 데이터는 공개 정보(이름·소개·수업 시간표·수강료)만.
 # =====================================================================
 def _class_fee(c: "Class", payment: dict) -> int:
     """수업 수강료 = 수업에 입력한 월 수강료 → 설정의 반별 수강료 → 기본 수강료"""
@@ -2227,7 +2433,7 @@ def _class_fee(c: "Class", payment: dict) -> int:
 def _public_facility(db: Session, facility_id: int) -> Facility:
     facility = db.query(Facility).filter(Facility.facility_id == facility_id, Facility.deleted_at.is_(None)).first()
     if not facility:
-        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+        raise HTTPException(404, "학원을 찾을 수 없습니다.")
     return facility
 
 
@@ -2308,7 +2514,7 @@ def parent_facility_detail(facility_id: int, db: Session = Depends(get_db), user
     facility = _public_facility(db, facility_id)
     membership = _membership(db, user, facility_id)
     if not facility.is_public and not membership:
-        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+        raise HTTPException(404, "학원을 찾을 수 없습니다.")
     payment = {**DEFAULT_PAYMENT_SETTINGS, **_json_dict(facility.payment_json)}
     classes = _open_classes(db, facility_id)
     counts = dict(db.query(Enrollment.class_id, func.count(Enrollment.enrollment_id))
@@ -2328,17 +2534,17 @@ def _new_membership(user: AppUser, facility_id: int) -> FacilityMember:
 @app.post("/api/parent/facilities/{facility_id}/enter")
 def parent_enter_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
                           user: AppUser = Depends(current_parent)):
-    """시설 입장 — 처음이면 커뮤니티 멤버로 가입(공개 시설만). 강퇴된 시설은 입장 불가"""
+    """학원 입장 — 처음이면 커뮤니티 멤버로 가입(공개 학원만). 강퇴된 학원은 입장 불가"""
     facility = _public_facility(db, facility_id)
     membership = _membership(db, user, facility_id)
     if membership and membership.status == "BANNED":
-        raise HTTPException(403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다.")
+        raise HTTPException(403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다.")
     if not membership:
         if not facility.is_public:
-            raise HTTPException(404, "시설을 찾을 수 없습니다.")
+            raise HTTPException(404, "학원을 찾을 수 없습니다.")
         db.add(_new_membership(user, facility_id))
         db.info["facility_id"] = facility_id
-        _log(db, "parent", user.user_id, "facility.join", None, None, "시설 입장(커뮤니티 가입)")
+        _log(db, "parent", user.user_id, "facility.join", None, None, "학원 입장(커뮤니티 가입)")
     else:
         membership.last_seen_at = _now()
     session = request.state.session
@@ -2358,12 +2564,12 @@ def parent_exit_facility(request: Request, db: Session = Depends(get_db), user: 
 @app.delete("/api/parent/facilities/{facility_id}/membership", status_code=204)
 def parent_leave_facility(facility_id: int, request: Request, db: Session = Depends(get_db),
                           user: AppUser = Depends(current_parent)):
-    """시설 탈퇴(커뮤니티 멤버 해제 + 자녀 연결 해제). 제재 중인 계정은 탈퇴로 제재를 피할 수 없도록 막습니다."""
+    """학원 탈퇴(커뮤니티 멤버 해제 + 자녀 연결 해제). 제재 중인 계정은 탈퇴로 제재를 피할 수 없도록 막습니다."""
     membership = _membership(db, user, facility_id)
     if not membership:
-        raise HTTPException(404, "입장한 시설이 아닙니다.")
+        raise HTTPException(404, "입장한 학원이 아닙니다.")
     if membership.status == "BANNED" or (membership.muted_until and membership.muted_until > _now()):
-        raise HTTPException(409, "제재 기간에는 시설을 탈퇴할 수 없습니다.")
+        raise HTTPException(409, "제재 기간에는 학원을 탈퇴할 수 없습니다.")
     db.query(ParentLink).filter(ParentLink.user_id == user.user_id, ParentLink.facility_id == facility_id).execution_options(
         all_facilities=True).delete(synchronize_session=False)
     db.delete(membership)
@@ -2372,7 +2578,7 @@ def parent_leave_facility(facility_id: int, request: Request, db: Session = Depe
     db.commit()
 
 
-# ---------- 자녀 프로필 (시설과 무관, 본인 것만) ----------
+# ---------- 자녀 프로필 (학원과 무관, 본인 것만) ----------
 class ChildProfileIn(BaseModel):
     name: str = Field(min_length=1, max_length=50)
     gender: str
@@ -2481,20 +2687,20 @@ def _application_out(a: EnrollmentApplication, class_names: dict, facility_name:
 @app.post("/api/parent/facilities/{facility_id}/applications", status_code=201)
 def parent_apply(facility_id: int, payload: ApplicationIn, db: Session = Depends(get_db),
                  user: AppUser = Depends(current_parent)):
-    """자녀 가입 신청: 고른 수업의 수강료를 서버가 계산(예상 비용)하고, 시설 원장에게 알림"""
+    """자녀 가입 신청: 고른 수업의 수강료를 서버가 계산(예상 비용)하고, 학원 원장에게 알림"""
     facility = _public_facility(db, facility_id)
     membership = _membership(db, user, facility_id)
     if membership and membership.status == "BANNED":
-        raise HTTPException(403, "시설 관리자에 의해 이 시설 이용이 제한되었습니다.")
+        raise HTTPException(403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다.")
     if not membership and not facility.is_public:
-        raise HTTPException(404, "시설을 찾을 수 없습니다.")
+        raise HTTPException(404, "학원을 찾을 수 없습니다.")
     child = _own_child(db, user, payload.child_id)
-    db.info["facility_id"] = facility_id          # 이후 조회·저장은 이 시설로 자동 제한
+    db.info["facility_id"] = facility_id          # 이후 조회·저장은 이 학원으로 자동 제한
     duplicate = (db.query(EnrollmentApplication)
                    .filter(EnrollmentApplication.child_id == child.child_id,
                            EnrollmentApplication.status.in_(("PENDING", "APPROVED"))).first())
     if duplicate:
-        raise HTTPException(409, "이 자녀는 이미 이 시설에 신청했거나 등록되어 있습니다.")
+        raise HTTPException(409, "이 자녀는 이미 이 학원에 신청했거나 등록되어 있습니다.")
     class_ids = list(dict.fromkeys(payload.class_ids))
     classes = {c.class_id: c for c in _open_classes(db, facility_id)}
     unknown = [cid for cid in class_ids if cid not in classes]
@@ -2564,6 +2770,15 @@ def admin_summary(request: Request, db: Session = Depends(get_db), account: Admi
     pending_posts = db.query(func.count(CommunityPost.post_id)).filter(CommunityPost.status == "PENDING").scalar() or 0
     pending_apps = (db.query(func.count(EnrollmentApplication.application_id))
                       .filter(EnrollmentApplication.status == "PENDING").scalar() or 0)
+    # v10: 재고 부족(현재 수량 ≤ 안전 재고) · 승인 대기 구매 요청 — 메뉴 배지
+    inventory_low = (db.query(func.count(InventoryItem.item_id))
+                       .filter(InventoryItem.active.is_(True), InventoryItem.min_quantity > 0,
+                               InventoryItem.quantity <= InventoryItem.min_quantity).scalar() or 0)
+    inventory_low += (db.query(func.count(InventoryItem.item_id))
+                        .filter(InventoryItem.active.is_(True), InventoryItem.min_quantity <= 0,
+                                InventoryItem.quantity <= 0).scalar() or 0)
+    purchase_pending = (db.query(func.count(PurchaseRequest.request_id))
+                          .filter(PurchaseRequest.status == "REQUESTED").scalar() or 0)
     todos = (db.query(AdminTodo).filter(AdminTodo.account_id == account.account_id, AdminTodo.done.is_(False),
                                         AdminTodo.due_time != "").order_by(AdminTodo.due_time).all())
     unread = (db.query(func.count(Notification.notification_id))
@@ -2576,7 +2791,8 @@ def admin_summary(request: Request, db: Session = Depends(get_db), account: Admi
         "data_version": int(facility.data_version or 0),
         "unread_notifications": int(unread),
         "badges": {"moderation_pending": int(pending_reviews) + int(pending_posts),
-                   "applications_pending": int(pending_apps)},
+                   "applications_pending": int(pending_apps),
+                   "inventory_low": int(inventory_low), "purchase_pending": int(purchase_pending)},
         "todos": [{"todo_id": t.todo_id, "due_time": t.due_time, "text": t.text} for t in todos],
         "server_time": _now().isoformat(timespec="seconds"),
     }
@@ -2766,6 +2982,15 @@ def import_admin_settings(payload: SettingsUpdate, db: Session = Depends(get_db)
     payment = {**DEFAULT_PAYMENT_SETTINGS, **payload.payment}
     if not str(academy.get("name", "")).strip():
         raise HTTPException(400, "가져올 데이터에 기관명이 없습니다.")
+    # v11: 가져온 파일도 화면 저장과 같은 규칙으로 정리 (학원 종류·주요 과목·수강료)
+    if academy.get("facilityType") not in FACILITY_TYPES:
+        academy["facilityType"] = "학원"
+    subjects = academy.get("subjects") if isinstance(academy.get("subjects"), list) else []
+    academy["subjects"] = [x for x in dict.fromkeys(subjects) if x in _shop_market.SUBJECTS][:12]
+    try:
+        payment["baseTuitionFee"] = max(0, int(payment.get("baseTuitionFee") or 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "기본 수강료는 숫자여야 합니다.")
     _write_settings(db, academy, payment)
     return {"ok": True}
 
@@ -3166,7 +3391,7 @@ def _member_class_overview(db: Session, member_ids: Optional[List[int]] = None, 
         if cid:
             att[(mid, cid)] = st
         else:
-            day_level[mid] = st          # 수업과 무관한 시설 출입 기록(v8 이전 데이터 포함)
+            day_level[mid] = st          # 수업과 무관한 학원 출입 기록(v8 이전 데이터 포함)
     # 수업별 최근 30일 출석률 = (출석 + 지각) ÷ 출결 기록 수 — 한 번의 GROUP BY 로 계산
     rate_query = (db.query(Attendance.member_id, Attendance.class_id, func.count(Attendance.attendance_id),
                            func.sum(case((Attendance.status.in_(("PRESENT", "LATE")), 1), else_=0)))
@@ -3232,9 +3457,12 @@ def list_members(
         query = query.join(Enrollment, Enrollment.member_id == Member.member_id) \
                      .filter(Enrollment.class_id == class_id)
     rows = query.add_columns(_HAS_PHOTO).order_by(Member.member_id).all()
-    unpaid = _unpaid_by_member(db)
-    overview = _member_class_overview(db)
-    linked = {mid for (mid,) in db.query(ParentLink.member_id).distinct()}
+    # [PERF v10] 필터(반·검색)가 있으면 그 학생들만 집계 — 기존: 항상 전체 학생의 수업·출결·미납을 계산
+    ids = None if not (status or q or class_id) else [m.member_id for m, _ in rows]
+    unpaid = _unpaid_by_member(db, ids)
+    overview = _member_class_overview(db, ids)
+    linked_q = db.query(ParentLink.member_id).distinct()
+    linked = {mid for (mid,) in (linked_q.filter(ParentLink.member_id.in_(ids or [-1])) if ids is not None else linked_q)}
     return [_member_out(m, has_photo, unpaid.get(m.member_id, (0, 0)), overview.get(m.member_id, []),
                         m.member_id in linked) for m, has_photo in rows]
 
@@ -3509,7 +3737,7 @@ def reject_application(application_id: int, payload: ApplicationDecision, db: Se
     name = _json_dict(row.snapshot).get("name") or "자녀"
     db.add(Notification(user_id=row.user_id, audience="parent", kind="APPLICATION", link="children",
                         title=f"{name} 학생 가입 신청이 반려되었습니다",
-                        body=payload.reason.strip() or "자세한 내용은 시설로 문의해 주세요."))
+                        body=payload.reason.strip() or "자세한 내용은 학원으로 문의해 주세요."))
     _log(db, "admin", account.account_id, "application.reject", "application", application_id, "가입 반려")
     db.commit()
     return {"application_id": application_id, "status": "REJECTED"}
@@ -3609,9 +3837,9 @@ def delete_attendance(attendance_id: int, db: Session = Depends(get_db)):
 
 
 # =====================================================================
-# 수업 시간표 · 출결 처리 공통 (키오스크·출석 화면 공용)
-#   v9: 출결은 "학생 × 날짜 × 수업" 단위. 키오스크 등원은 그날 그 학생의 수업마다 기록하고(시작 시각 기준 지각 판정),
-#       그날 수업이 없으면 수업과 무관한 시설 출입 기록 1건을 남깁니다.
+# 수업 시간표 · 출결 처리 공통
+#   v9: 출결은 "학생 × 날짜 × 수업" 단위.
+#   v10: 출석 키오스크를 없애고 '출석 체크' 화면 하나로 통합 — 출석·지각·결석·하원을 누르면 즉시 학부모 알림.
 # =====================================================================
 ATTENDANCE_STATUSES = ("PRESENT", "LATE", "ABSENT")
 STATUS_KO = {"PRESENT": "출석", "LATE": "지각", "ABSENT": "결석"}
@@ -3656,48 +3884,25 @@ def _sessions_on(c: "Class", day: date) -> List[dict]:
     return sorted([s for s in _class_schedule(c) if s["day"] in (code, "DAILY")], key=lambda s: s["start"] or "99:99")
 
 
-def _member_sessions_today(db: Session, member_id: int, day: date) -> List[dict]:
-    rows = (db.query(Class).join(Enrollment, Enrollment.class_id == Class.class_id)
-              .filter(Enrollment.member_id == member_id).all())
-    sessions = []
-    for c in rows:
-        for sess in _sessions_on(c, day):
-            sessions.append({"class_id": c.class_id, "class_name": c.name, **sess})
-    return sorted(sessions, key=lambda x: x["start"] or "99:99")
-
-
-def _session_status(sess: dict, now: datetime, grace: int) -> str:
-    """등원 시각 기준 출석/지각: 수업 시작 + 유예시간 이후면 지각"""
-    if not sess.get("start"):
-        return "PRESENT"
-    hh, mm = map(int, sess["start"].split(":"))
-    start_at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return "PRESENT" if now <= start_at + timedelta(minutes=grace) else "LATE"
-
-
-def _auto_check_in_status(db: Session, member_id: int, now: datetime) -> str:
-    """(이전 버전 호환) 오늘 가장 이른 수업 기준 출석/지각"""
-    grace = int(_brand(db).get("lateGraceMinutes") or 10)
-    sessions = [s for s in _member_sessions_today(db, member_id, now.date()) if s["start"]]
-    return _session_status(sessions[0], now, grace) if sessions else "PRESENT"
-
-
 def _after_attendance_change(db: Session, member: Member, row: Attendance, before: Optional[str],
-                             actor_type: str, actor_id: Optional[int], class_name: Optional[str] = None) -> None:
-    """출결이 바뀌면 동작 로그 + (오늘 기록이면) 학부모 알림"""
+                             actor_type: str, actor_id: Optional[int], class_name: Optional[str] = None) -> int:
+    """출결이 바뀌면 동작 로그 + (오늘 기록이면) 학부모 알림. 알림을 받은 학부모 수를 돌려줍니다.
+    v10: 키오스크 대신 출석 체크 화면에서 '출석'을 누르는 순간 학부모 알림이 만들어집니다
+         (같은 상태로 다시 누르면 중복 알림 없음, 지난 날짜 수정은 알림 없음)."""
     label = f"[{class_name}] " if class_name else ""
     _log(db, actor_type, actor_id, "attendance.mark", "member", member.member_id,
          f"{row.attendance_date} {label}{STATUS_KO.get(row.status, row.status)}")
     if row.attendance_date != _today() or before == row.status:
-        return
+        return 0
     at = row.check_in_time.strftime("%H:%M") if row.check_in_time else _now().strftime("%H:%M")
     if row.status == "PRESENT":
-        _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석", f"{at}에 출석했습니다.", "children")
-    elif row.status == "LATE":
-        _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석(지각)", f"{at}에 출석했습니다.", "children")
-    elif row.status == "ABSENT":
-        _notify_parents(db, [member.member_id], "ABSENT", f"{label}{member.name} 학생 결석",
-                        "결석으로 처리되었습니다. 사정이 있으시면 시설로 연락 주세요.", "children")
+        return _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석", f"{at}에 출석했습니다.", "children")
+    if row.status == "LATE":
+        return _notify_parents(db, [member.member_id], "CHECK_IN", f"{label}{member.name} 학생 출석(지각)", f"{at}에 출석했습니다.", "children")
+    if row.status == "ABSENT":
+        return _notify_parents(db, [member.member_id], "ABSENT", f"{label}{member.name} 학생 결석",
+                               "결석으로 처리되었습니다. 사정이 있으시면 학원으로 연락 주세요.", "children")
+    return 0
 
 
 def _mark_attendance(db: Session, member: Member, day: date, status: str, actor_type: str,
@@ -3719,7 +3924,7 @@ def _mark_attendance(db: Session, member: Member, day: date, status: str, actor_
     if note is not None:
         row.note = note[:200] or None
     db.flush()
-    _after_attendance_change(db, member, row, before, actor_type, actor_id, class_name)
+    row.parent_notified = _after_attendance_change(db, member, row, before, actor_type, actor_id, class_name)  # 매핑되지 않은 임시 속성
     return row
 
 
@@ -3748,8 +3953,10 @@ def mark_attendance(payload: AttendanceMark, request: Request, db: Session = Dep
     actor_type, actor_id, _ = _actor(request)
     row = _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id, payload.note,
                            payload.class_id, cls.name if cls else None)
+    notified = getattr(row, "parent_notified", 0)
     db.commit(); db.refresh(row)
-    return _att_to_out(row, member.name, cls.name if cls else None)
+    return {**_att_to_out(row, member.name, cls.name if cls else None), "parent_notified": notified,
+            "parent_linked": bool(_parent_user_ids(db, [member.member_id]))}
 
 
 @app.post("/api/attendances/bulk")
@@ -3770,15 +3977,16 @@ def bulk_attendance(payload: AttendanceBulk, request: Request, db: Session = Dep
     checked_q = checked_q.filter(Attendance.class_id == cls.class_id) if cls else checked_q.filter(Attendance.class_id.is_(None))
     checked = {mid for (mid,) in checked_q}
     actor_type, actor_id, _ = _actor(request)
-    changed = 0
+    changed = notified = 0
     for member in members:
         if payload.only_unchecked and member.member_id in checked:
             continue
-        _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id,
-                         class_id=cls.class_id if cls else None, class_name=cls.name if cls else None)
+        row = _mark_attendance(db, member, payload.attendance_date, payload.status, actor_type, actor_id,
+                               class_id=cls.class_id if cls else None, class_name=cls.name if cls else None)
+        notified += getattr(row, "parent_notified", 0)
         changed += 1
     db.commit()
-    return {"changed": changed, "skipped": len(members) - changed}
+    return {"changed": changed, "skipped": len(members) - changed, "parent_notified": notified}
 
 
 @app.post("/api/attendances/{attendance_id}/checkout", response_model=AttendanceOut)
@@ -3789,12 +3997,12 @@ def checkout_attendance(attendance_id: int, request: Request, db: Session = Depe
     member = db.query(Member).filter(Member.member_id == row.member_id).first()
     cname = db.query(Class.name).filter(Class.class_id == row.class_id).scalar() if row.class_id else None
     actor_type, actor_id, _ = _actor(request)
-    _check_out(db, member, [row], actor_type, actor_id)
+    notified = _check_out(db, member, [row], actor_type, actor_id)
     db.commit(); db.refresh(row)
-    return _att_to_out(row, member.name, cname)
+    return {**_att_to_out(row, member.name, cname), "parent_notified": notified}
 
 
-def _check_out(db: Session, member: Member, rows: List[Attendance], actor_type: str, actor_id: Optional[int]) -> None:
+def _check_out(db: Session, member: Member, rows: List[Attendance], actor_type: str, actor_id: Optional[int]) -> int:
     rows = [r for r in rows if r.status != "ABSENT" and not r.check_out_time]
     if not rows:
         raise HTTPException(409, "하원 처리할 출석 기록이 없습니다(결석이거나 이미 하원).")
@@ -3803,126 +4011,12 @@ def _check_out(db: Session, member: Member, rows: List[Attendance], actor_type: 
         row.check_out_time = now_t
     _log(db, actor_type, actor_id, "attendance.checkout", "member", member.member_id, f"{rows[0].attendance_date} 하원")
     if rows[0].attendance_date == _today():
-        _notify_parents(db, [member.member_id], "CHECK_OUT", f"{member.name} 학생 하원",
-                        f"{now_t.strftime('%H:%M')}에 하원했습니다.", "children")
+        return _notify_parents(db, [member.member_id], "CHECK_OUT", f"{member.name} 학생 하원",
+                               f"{now_t.strftime('%H:%M')}에 하원했습니다.", "children")
+    return 0
 
 
-# ---------------------------------------------------------------------
-# 출석 키오스크 — 태블릿에서 보호자 연락처 뒤 4자리 → 등원/하원 (관리자·직원 세션으로 연 화면)
-#   이름은 가려서(김*준) 보여 주고, 학부모에게 즉시 알림이 갑니다.
-# ---------------------------------------------------------------------
-class KioskCheck(BaseModel):
-    member_id: int
-    action: str = Field(max_length=5)   # in / out
-
-
-_STATUS_RANK = {"PRESENT": 3, "LATE": 2, "ABSENT": 1}
-
-
-def _kiosk_member_out(db: Session, m: Member, today_rows: List[Attendance], class_names: List[str]) -> dict:
-    attended = [r for r in today_rows if r.status in ("PRESENT", "LATE")]
-    status = max((r.status for r in today_rows), key=lambda s: _STATUS_RANK.get(s, 0)) if today_rows else None
-    check_in = min((r.check_in_time for r in attended if r.check_in_time), default=None)
-    open_rows = [r for r in attended if not r.check_out_time]
-    check_out = max((r.check_out_time for r in attended if r.check_out_time), default=None) if not open_rows else None
-    next_action = "in" if not attended else ("out" if open_rows else "done")
-    return {
-        "member_id": m.member_id, "masked_name": _mask_name(m.name), "classes": class_names,
-        "today_status": status,
-        "check_in_time": check_in.strftime("%H:%M") if check_in else None,
-        "check_out_time": check_out.strftime("%H:%M") if check_out else None,
-        "next_action": next_action,
-    }
-
-
-@app.get("/api/kiosk/lookup")
-def kiosk_lookup(digits: str = Query(..., min_length=4, max_length=4), db: Session = Depends(get_db)):
-    if not digits.isdigit():
-        raise HTTPException(400, "숫자 4자리를 입력하세요.")
-    members = (db.query(Member).options(defer(Member.photo_url))
-                 .filter(Member.status == "ACTIVE",
-                         or_(_digits_expr(Member.father_phone).like(f"%{digits}"),
-                             _digits_expr(Member.mother_phone).like(f"%{digits}")))
-                 .order_by(Member.name).limit(10).all())
-    ids = [m.member_id for m in members]
-    today_rows: dict = {}
-    for a in db.query(Attendance).filter(Attendance.attendance_date == _today(), Attendance.member_id.in_(ids or [-1])):
-        today_rows.setdefault(a.member_id, []).append(a)
-    class_map: dict = {}
-    for member_id, name in (db.query(Enrollment.member_id, Class.name).join(Class, Class.class_id == Enrollment.class_id)
-                              .filter(Enrollment.member_id.in_(ids or [-1])).all()):
-        class_map.setdefault(member_id, []).append(name)
-    return [_kiosk_member_out(db, m, today_rows.get(m.member_id, []), class_map.get(m.member_id, [])) for m in members]
-
-
-@app.post("/api/kiosk/check")
-def kiosk_check(payload: KioskCheck, request: Request, db: Session = Depends(get_db)):
-    member = db.query(Member).filter(Member.member_id == payload.member_id, Member.status == "ACTIVE").first()
-    if not member:
-        raise HTTPException(404, "학생을 찾을 수 없습니다.")
-    actor_id = getattr(request.state, "account", None) and request.state.account.account_id
-    today, now = _today(), _now()
-    rows = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == today).all()
-    if payload.action == "in":
-        attended = [r for r in rows if r.status in ("PRESENT", "LATE")]
-        if attended:
-            first = min((r.check_in_time for r in attended if r.check_in_time), default=None)
-            raise HTTPException(409, f"{_mask_name(member.name)} 학생은 이미 {first.strftime('%H:%M') if first else ''} 등원했습니다.")
-        grace = int(_brand(db).get("lateGraceMinutes") or 10)
-        sessions = _member_sessions_today(db, member.member_id, today)
-        at = now.time().replace(second=0, microsecond=0)
-        statuses = []
-        seen = set()
-        for sess in sessions:
-            if sess["class_id"] in seen:
-                continue
-            seen.add(sess["class_id"])
-            st = _session_status(sess, now, grace)
-            statuses.append(st)
-            _mark_attendance(db, member, today, st, "kiosk", actor_id, class_id=sess["class_id"],
-                             class_name=sess["class_name"], at=at)
-        if not sessions:
-            statuses.append("PRESENT")
-            _mark_attendance(db, member, today, "PRESENT", "kiosk", actor_id, at=at)
-        late = statuses and statuses[0] == "LATE"
-        message = f"{_mask_name(member.name)} 학생 {'등원 (지각)' if late else '등원 완료'}"
-    elif payload.action == "out":
-        if not any(r.status in ("PRESENT", "LATE") for r in rows):
-            raise HTTPException(409, "오늘 등원 기록이 없습니다. 먼저 등원을 눌러 주세요.")
-        _check_out(db, member, rows, "kiosk", actor_id)
-        message = f"{_mask_name(member.name)} 학생 하원 완료"
-    else:
-        raise HTTPException(400, "action 은 in 또는 out 이어야 합니다.")
-    db.commit()
-    rows = db.query(Attendance).filter(Attendance.member_id == member.member_id, Attendance.attendance_date == today).all()
-    return {**_kiosk_member_out(db, member, rows, []), "message": message,
-            "parent_notified": bool(_parent_user_ids(db, [member.member_id]))}
-
-
-@app.get("/api/kiosk/today")
-def kiosk_today(db: Session = Depends(get_db)):
-    today = _today()
-    rows = db.query(Attendance).filter(Attendance.attendance_date == today).all()
-    by_member: dict = {}
-    for a in rows:
-        by_member.setdefault(a.member_id, []).append(a)
-    checked_in = sum(1 for rs in by_member.values() if any(r.status in ("PRESENT", "LATE") for r in rs))
-    checked_out = sum(1 for rs in by_member.values()
-                      if any(r.check_out_time for r in rs) and not any(r.status != "ABSENT" and not r.check_out_time for r in rs))
-    recent = (db.query(Attendance, Member.name).join(Member, Member.member_id == Attendance.member_id)
-                .filter(Attendance.attendance_date == today, Attendance.status != "ABSENT")
-                .order_by(func.coalesce(Attendance.check_out_time, Attendance.check_in_time).desc()).limit(20).all())
-    seen, recent_out = set(), []
-    for a, name in recent:
-        if a.member_id in seen:
-            continue
-        seen.add(a.member_id)
-        recent_out.append({"masked_name": _mask_name(name), "status": a.status,
-                           "time": (a.check_out_time or a.check_in_time).strftime("%H:%M") if (a.check_out_time or a.check_in_time) else None,
-                           "action": "out" if a.check_out_time else "in"})
-    active = db.query(func.count(Member.member_id)).filter(Member.status == "ACTIVE").scalar() or 0
-    return {"brand": _brand(db), "date": today.isoformat(), "active_members": int(active),
-            "checked_in": checked_in, "checked_out": checked_out, "recent": recent_out[:6]}
+_STATUS_RANK = {"PRESENT": 3, "LATE": 2, "ABSENT": 1}   # 하루에 여러 수업 기록이 있을 때 대표 상태
 
 
 # ---------------------------------------------------------------------
@@ -3949,7 +4043,7 @@ def list_payments(
     query = db.query(Payment, Member.name).outerjoin(Member, Member.member_id == Payment.member_id)
     if member_id:
         query = query.filter(Payment.member_id == member_id)
-    rows = query.order_by(Payment.paid_at.desc()).all()
+    rows = query.order_by(Payment.paid_at.desc(), Payment.payment_id.desc()).limit(1000).all()
     return [_payment_to_out(p, name) for p, name in rows]
 
 
@@ -3999,9 +4093,9 @@ def _kakao_headers():
 
 class KakaoReadyRequest(BaseModel):
     member_id: int
-    amount: int
-    item_name: str = "수강료"
-    payment_type: str = "TUITION"
+    amount: int = Field(gt=0, le=100_000_000)
+    item_name: str = Field("수강료", min_length=1, max_length=100)
+    payment_type: str = Field("TUITION", max_length=20)
     invoice_id: Optional[int] = None   # [PAY] 청구서 연결 시 결제 성공하면 PAID 처리
 
 
@@ -4097,9 +4191,14 @@ def _approve_b2b_kakao_payment(order_id: str, pg_token: str, db: Session, front:
     ).with_for_update().first()
     if not pending:
         return None
-    db.info["facility_id"] = pending.facility_id      # 공개 콜백 → 결제 대기 행의 시설로 이후 조회·기록을 제한
+    db.info["facility_id"] = pending.facility_id      # 공개 콜백 → 결제 대기 행의 학원으로 이후 조회·기록을 제한
     order = db.query(B2BOrder).filter(B2BOrder.order_id == pending.order_id).first()
     if pending.status != "READY" or not order:
+        return RedirectResponse(f"{front}/b2b-shop?payment=fail&reason=already")
+    if order.status != "AWAITING_PAYMENT" or int(order.total) != int(pending.amount):
+        # v11 보안: 결제창을 연 뒤 주문이 반려·정산되었거나 금액이 바뀐 경우 승인(출금)하지 않음
+        pending.status = "CANCELED"
+        db.commit()
         return RedirectResponse(f"{front}/b2b-shop?payment=fail&reason=already")
     body = {
         "cid": KAKAO_CID,
@@ -4121,6 +4220,12 @@ def _approve_b2b_kakao_payment(order_id: str, pg_token: str, db: Session, front:
         db.commit()
         return RedirectResponse(f"{front}/b2b-shop?payment=fail&reason=approve")
     result = payment_response.json()
+    approved_total = (result.get("amount") or {}).get("total")
+    if approved_total is not None and int(approved_total) != int(pending.amount):
+        logger.error("B2B KakaoPay 승인 금액 불일치 order=%s 저장=%s 승인=%s", order_id, pending.amount, approved_total)
+        pending.status = "FAILED"
+        db.commit()
+        return RedirectResponse(f"{front}/b2b-shop?payment=fail&reason=amount")
     pending.status = "APPROVED"
     order.status = "PAID"
     order.paid_at = _now()
@@ -4142,12 +4247,19 @@ def kakao_success(request: Request, order_id: str = Query(..., max_length=64), p
     if not pending:
         # 주문 정보가 없는 경우 (잘못된 접근 등)
         return RedirectResponse(f"{front}/checkout?kakao=fail&reason=expired")
-    # 공개 콜백(세션 없음) → 결제 대기 행의 시설로 이후 조회·기록을 제한 (결제·알림·data_version 이 그 시설에 기록됨)
+    # 공개 콜백(세션 없음) → 결제 대기 행의 학원으로 이후 조회·기록을 제한 (결제·알림·data_version 이 그 학원에 기록됨)
     db.info["facility_id"] = pending.facility_id
     result_url = f"{front}{_payment_result_path(pending.partner_user_id)}"
     if pending.status != "READY":
         # 이미 처리된 주문 — 중복 승인 방지
         return RedirectResponse(f"{result_url}?kakao=fail&reason=already")
+    if pending.invoice_id:
+        # v10 보안: 결제창을 연 뒤 현장 수납·다른 결제로 이미 납부된 청구서면 승인(출금)하지 않음 — 이중 결제 방지
+        inv_status = db.query(Invoice.status).filter(Invoice.invoice_id == pending.invoice_id).scalar()
+        if inv_status != "UNPAID":
+            pending.status = "CANCELED"
+            db.commit()
+            return RedirectResponse(f"{result_url}?kakao=fail&reason=already")
 
     body = {
         "cid": KAKAO_CID,
@@ -4172,6 +4284,13 @@ def kakao_success(request: Request, order_id: str = Query(..., max_length=64), p
     result = resp.json()
     aid = result.get("aid", "")
     today = _today()
+    approved_total = (result.get("amount") or {}).get("total")
+    if approved_total is not None and int(approved_total) != int(pending.amount):
+        # 승인 금액이 서버에 저장한 금액과 다르면 기록하지 않고 운영자 확인이 필요하다고 남김
+        logger.error("KakaoPay 승인 금액 불일치 order=%s 저장=%s 승인=%s", order_id, pending.amount, approved_total)
+        pending.status = "FAILED"
+        db.commit()
+        return RedirectResponse(f"{result_url}?kakao=fail&reason=amount")
 
     # ✅ 결제 이력 기록 + 회원 납부일 갱신 (미납 상태 해제)
     member = db.query(Member).filter(Member.member_id == pending.member_id).first()
@@ -4270,7 +4389,7 @@ def list_kakao_pending(status: Optional[str] = None, db: Session = Depends(get_d
     q = db.query(PaymentPending)
     if status:
         q = q.filter(PaymentPending.status == status)
-    rows = q.order_by(PaymentPending.created_at.desc()).all()
+    rows = q.order_by(PaymentPending.created_at.desc()).limit(500).all()
     # [PERF] 전체 회원(사진 포함)을 읽던 방식 → 필요한 회원의 이름만 조회
     member_ids = {p.member_id for p in rows}
     names = dict(db.query(Member.member_id, Member.name).filter(Member.member_id.in_(member_ids)).all()) if member_ids else {}
@@ -4297,13 +4416,21 @@ def cleanup_kakao_pending(
 
 # ---------------------------------------------------------------------
 # 공지사항 (notices) API
+#   v10: 서식 본문(content_html) · 공지 사진 · 첨부파일 · 자동 작성(POST /api/notices/draft)
 # ---------------------------------------------------------------------
+import richtext as _richtext        # noqa: E402  (서식 HTML 허용 목록 정리 — 순수 모듈)
+import notice_draft as _notice_draft   # noqa: E402  (공지 자동 작성 — 규칙 기반 파서 + 템플릿)
+
+
 def _notice_to_out(n: Notice, class_names: Optional[dict] = None, read_counts: Optional[dict] = None,
-                   target_counts: Optional[dict] = None) -> dict:
+                   target_counts: Optional[dict] = None, photo_ids: Optional[List[int]] = None,
+                   attachments: Optional[List[dict]] = None, parent: bool = False) -> dict:
+    photo_ids = photo_ids or []
     return {
         "notice_id": n.notice_id,
         "title":     n.title,
         "content":   n.content,
+        "content_html": n.content_html or None,
         "author":    n.author,
         "category":  n.category,
         "is_pinned": bool(n.is_pinned),
@@ -4312,6 +4439,9 @@ def _notice_to_out(n: Notice, class_names: Optional[dict] = None, read_counts: O
         "class_name": (class_names or {}).get(n.class_id) if n.class_id else None,
         "read_count": int((read_counts or {}).get(n.notice_id, 0)),
         "target_count": int((target_counts or {}).get(n.class_id or 0, 0)),
+        "photos": [_board_photo_path("notice", pid, parent) for pid in photo_ids],
+        "thumbs": [_board_photo_path("notice", pid, parent, thumb=True) for pid in photo_ids],
+        "attachments": attachments or [],
     }
 
 
@@ -4331,7 +4461,10 @@ def _notices_out(db: Session, rows: List[Notice]) -> List[dict]:
                          .filter(NoticeRead.notice_id.in_(ids or [-1])).group_by(NoticeRead.notice_id).all())
     class_names = dict(db.query(Class.class_id, Class.name).all())
     targets = _notice_targets(db)
-    return [_notice_to_out(n, class_names, read_counts, targets) for n in rows]
+    photos = _photo_ids_by_owner(db, NoticePhoto, NoticePhoto.notice_id, ids)
+    files = _attachments_by_owner(db, "notice", ids, parent=False)
+    return [_notice_to_out(n, class_names, read_counts, targets, photos.get(n.notice_id), files.get(n.notice_id))
+            for n in rows]
 
 
 def _validate_notice_class(db: Session, class_id: Optional[int]) -> Optional[str]:
@@ -4341,6 +4474,22 @@ def _validate_notice_class(db: Session, class_id: Optional[int]) -> Optional[str
     if not name:
         raise HTTPException(404, "공지 대상 반을 찾을 수 없습니다.")
     return name
+
+
+def _notice_kind(value: Optional[str]) -> str:
+    if value and value not in NOTICE_KINDS:
+        raise HTTPException(400, "공지 종류는 GENERAL(일반) / EVENT(행사) / URGENT(긴급) 중 하나여야 합니다.")
+    return value or "GENERAL"
+
+
+def _rich_body(content: str, content_html: Optional[str], max_text: int) -> tuple:
+    """(순수 텍스트, 정리된 HTML 또는 None). 서식 HTML 이 오면 서버가 허용 목록으로 정리하고 텍스트를 다시 만듦"""
+    if content_html is not None and content_html.strip():
+        html, text_value = _richtext.sanitize_html(content_html)
+        if len(text_value) > max_text:
+            raise HTTPException(413, f"본문은 {max_text:,}자 이하로 입력하세요.")
+        return text_value, (html or None)
+    return content or "", None
 
 
 @app.get("/api/notices", response_model=List[NoticeOut])
@@ -4355,16 +4504,20 @@ def list_notices(class_id: Optional[int] = None, db: Session = Depends(get_db)):
 @app.post("/api/notices", response_model=NoticeOut, status_code=201)
 def create_notice(payload: NoticeCreate, request: Request, db: Session = Depends(get_db)):
     class_name = _validate_notice_class(db, payload.class_id)
-    n = Notice(**payload.model_dump(exclude={"notify_parents"}))
+    photos = _parse_photo_items(payload.photos or [], ref_re=_NOTICE_PHOTO_REF_RE)
+    content, content_html = _rich_body(payload.content, payload.content_html, 20000)
+    if not content.strip() and not photos:
+        raise HTTPException(400, "내용 또는 사진을 입력하세요.")
+    n = Notice(title=payload.title.strip(), content=content, content_html=content_html, author=payload.author,
+               category=_notice_kind(payload.category), is_pinned=payload.is_pinned, class_id=payload.class_id or None)
     if "author" not in payload.model_fields_set or not payload.author.strip():
         n.author = _admin_author(db, request)        # 작성자를 보내지 않으면 기관 설정의 원장 이름
-    if not payload.class_id:
-        n.class_id = None
     db.add(n); db.flush()
+    _save_board_photos(db, NoticePhoto, "notice_id", n.notice_id, photos)
     sent = 0
     if payload.notify_parents:
         title = f"[{class_name}] {n.title}" if class_name else f"[공지] {n.title}"
-        body = n.content[:120]
+        body = n.content[:120] or ("사진 공지가 올라왔습니다." if photos else "")
         if class_name:
             member_ids = [mid for (mid,) in db.query(Enrollment.member_id).filter(Enrollment.class_id == n.class_id)]
             sent = _notify_parents(db, member_ids, "NOTICE", title, body, "notices")
@@ -4381,8 +4534,11 @@ def delete_notice(notice_id: int, db: Session = Depends(get_db)):
     n = db.query(Notice).filter(Notice.notice_id == notice_id).first()
     if not n:
         raise HTTPException(404, "공지사항을 찾을 수 없습니다.")
-    db.query(NoticeRead).filter(NoticeRead.notice_id == notice_id).delete(synchronize_session=False)
+    # PostgreSQL 외래키: 읽음 기록·사진·첨부를 먼저 지움
+    for model in (NoticeRead, NoticePhoto, BoardAttachment):
+        db.query(model).filter(model.notice_id == notice_id).delete(synchronize_session=False)
     db.delete(n); db.commit()
+
 
 @app.put("/api/notices/{notice_id}", response_model=NoticeOut)
 def update_notice(notice_id: int, payload: NoticeCreate, db: Session = Depends(get_db)):
@@ -4391,16 +4547,50 @@ def update_notice(notice_id: int, payload: NoticeCreate, db: Session = Depends(g
     if not n:
         raise HTTPException(404, "공지사항을 찾을 수 없습니다.")
     _validate_notice_class(db, payload.class_id)
-    n.title = payload.title
-    n.content = payload.content
+    if "content_html" in payload.model_fields_set:
+        n.content, n.content_html = _rich_body(payload.content, payload.content_html, 20000)
+    elif payload.content != n.content:            # 서식 없이 글만 바꾼 경우(이전 버전 화면) → 서식 제거
+        n.content, n.content_html = payload.content, None
+    if payload.photos is not None:                # 사진 목록을 보낸 경우에만 사진을 맞춤 (고정 토글 등은 그대로)
+        existing = {pid for (pid,) in db.query(NoticePhoto.photo_id).filter(NoticePhoto.notice_id == notice_id)}
+        items = _parse_photo_items(payload.photos, existing, ref_re=_NOTICE_PHOTO_REF_RE)
+        _replace_board_photos(db, NoticePhoto, "notice_id", notice_id, existing, items)
+    n.title = payload.title.strip()
     if "author" in payload.model_fields_set and payload.author.strip():
         n.author = payload.author
-    n.category = payload.category
+    n.category = _notice_kind(payload.category)
     n.is_pinned = payload.is_pinned
     n.class_id = payload.class_id or None
     db.commit()
     db.refresh(n)
     return _notices_out(db, [n])[0]
+
+
+@app.post("/api/notices/draft")
+def draft_notice(payload: NoticeDraftRequest, db: Session = Depends(get_db)):
+    """공지 자동 작성: 키워드·날짜·시간 → 공지 제목·본문 초안 (저장하지 않음 — 관리자가 확인·수정 후 등록)
+    1) 규칙 기반 파서가 날짜·시간·참여 방식·비용·준비물·장소를 추출 → 템플릿 완성 (항상 동작)
+    2) GEMINI_API_KEY 가 있고 use_ai=true 면 문장만 다듬음. 실패하면 1) 결과 사용. 개인정보는 보내지 않음."""
+    class_name = _validate_notice_class(db, payload.class_id)
+    academy = _read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS)
+    facility = {k: academy.get(k) for k in ("name", "principal", "phone", "facilityType")}
+    parsed = _notice_draft.parse_keywords(payload.keywords, _today())
+    target = f"{class_name} 반" if class_name else ""
+    draft = _notice_draft.build_template(parsed, facility, target)
+    source = "template"
+    if payload.use_ai and GEMINI_API_KEY:
+        try:
+            resp = generate_content_with_fallback(contents=[_notice_draft.ai_prompt(parsed, facility, draft, target)])
+            match = re.search(r"\{.*\}", resp.text or "", re.S)
+            polished = json.loads(match.group(0)) if match else {}
+            if isinstance(polished, dict) and str(polished.get("title", "")).strip() and str(polished.get("content", "")).strip():
+                draft["title"] = str(polished["title"]).strip()[:200]
+                draft["content"] = str(polished["content"]).strip()[:20000]
+                source = "ai"
+        except Exception as exc:        # AI 한도·네트워크 문제 → 템플릿 결과로 계속 (시연 안정성)
+            logger.warning("공지 AI 다듬기 실패, 템플릿 사용: %s", exc)
+    return {**draft, "content_html": _richtext.text_to_html(draft["content"]), "source": source,
+            "parsed": parsed.as_dict(), "warnings": parsed.warnings, "class_id": payload.class_id}
 
 
 # ---------------------------------------------------------------------
@@ -4419,17 +4609,19 @@ SEARCH_FIELDS = ("title", "content", "title_content", "author")
 class CommunityPostCreate(BaseModel):
     title: str = Field("", max_length=200)
     content: str = Field("", max_length=10000)
+    content_html: Optional[str] = Field(None, max_length=60000)   # v10: 서식 본문
     category: str = Field("FREE", max_length=20)
     author: str = Field("관리자", max_length=50)      # (이전 버전 호환 — 작성자는 서버가 정함)
-    photos: List[str] = []   # 새 사진: data URL (프론트가 줄여서 보냄)
+    photos: List[Union[str, PhotoIn]] = Field(default_factory=list, max_length=20)   # 새 사진: data URL (프론트가 줄여서 보냄)
     is_pinned: bool = False
 
 
 class CommunityPostUpdate(BaseModel):
     title: Optional[str] = Field(None, max_length=200)
     content: str = Field("", max_length=10000)
+    content_html: Optional[str] = Field(None, max_length=60000)
     category: Optional[str] = Field(None, max_length=20)
-    photos: List[str] = []   # 기존 사진은 받은 사진 URL 그대로, 새 사진은 data URL
+    photos: List[Union[str, PhotoIn]] = Field(default_factory=list, max_length=20)   # 기존 사진은 받은 사진 URL 그대로, 새 사진은 data URL
     is_pinned: Optional[bool] = None
 
 
@@ -4439,11 +4631,27 @@ class CommunityCommentCreate(BaseModel):
 
 
 _PHOTO_REF_RE = re.compile(r"^/api/(?:parent/)?community/photos/(\d+)$")
+_NOTICE_PHOTO_REF_RE = re.compile(r"^/api/(?:parent/)?notices/photos/(\d+)$")
+THUMB_MAX_CHARS = 200_000                  # 작은 사진 1장 상한 (프론트가 480px 로 줄여서 보냄 ≈ 30~60KB)
 
 
 def _community_photo_path(photo_id: int, parent: bool) -> str:
     # 학부모 화면은 /api/parent/* 만 통과하므로 역할별로 경로를 나눠 줍니다(같은 사진).
     return f"/api/{'parent/' if parent else ''}community/photos/{photo_id}"
+
+
+def _board_photo_path(kind: str, photo_id: int, parent: bool, thumb: bool = False) -> str:
+    """kind: post(게시글 사진) / notice(공지 사진). thumb=True 면 바둑판 보기용 작은 사진"""
+    base = _community_photo_path(photo_id, parent) if kind == "post" else \
+        f"/api/{'parent/' if parent else ''}notices/photos/{photo_id}"
+    return f"{base}?size=thumb" if thumb else base
+
+
+def _photo_response(mime: str, data: str, thumb: Optional[str], size: str) -> Response:
+    """size=thumb 이고 작은 사진이 있으면 작은 사진(JPEG), 없으면(v9 이전 사진) 원본"""
+    if size == "thumb" and thumb:
+        return _image_response("image/jpeg", thumb)
+    return _image_response(mime, data)
 
 
 def _photo_mime(value: str) -> str:
@@ -4474,14 +4682,88 @@ def _migrate_legacy_photos(db: Session, post_ids: List[int]) -> None:
     db.commit()
 
 
-def _photo_ids_by_post(db: Session, post_ids: List[int]) -> dict:
+def _photo_ids_by_owner(db: Session, model, owner_col, owner_ids: List[int]) -> dict:
+    """게시글/공지 ID → 사진 ID 목록 (사진 본문은 읽지 않음 — 1번의 IN 쿼리)"""
     result: dict = {}
-    if post_ids:
-        for photo_id, post_id in (db.query(CommunityPhoto.photo_id, CommunityPhoto.post_id)
-                                    .filter(CommunityPhoto.post_id.in_(post_ids))
-                                    .order_by(CommunityPhoto.post_id, CommunityPhoto.position, CommunityPhoto.photo_id)):
-            result.setdefault(post_id, []).append(photo_id)
+    if owner_ids:
+        for photo_id, owner_id in (db.query(model.photo_id, owner_col).filter(owner_col.in_(owner_ids))
+                                     .order_by(owner_col, model.position, model.photo_id)):
+            result.setdefault(owner_id, []).append(photo_id)
     return result
+
+
+def _photo_ids_by_post(db: Session, post_ids: List[int]) -> dict:
+    return _photo_ids_by_owner(db, CommunityPhoto, CommunityPhoto.post_id, post_ids)
+
+
+# ---------- v10 첨부파일 (게시글·공지 공용) ----------
+ATTACHMENT_MAX_COUNT = 5
+# 확장자 허용 목록 → 내려받을 때 쓸 MIME. 실행 파일·스크립트·HTML·SVG 는 받지 않음 (악성 파일 유포 방지)
+ATTACHMENT_TYPES = {
+    "pdf": "application/pdf", "hwp": "application/x-hwp", "hwpx": "application/haansofthwpx",
+    "doc": "application/msword", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint", "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "txt": "text/plain", "csv": "text/csv", "zip": "application/zip",
+    "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+    "mp3": "audio/mpeg", "mp4": "video/mp4", "m4a": "audio/mp4",
+}
+
+
+def _attachment_url(kind: str, attachment_id: int, parent: bool) -> str:
+    return f"/api/{'parent/' if parent else ''}community/attachments/{attachment_id}"
+
+
+def _attachments_by_owner(db: Session, kind: str, owner_ids: List[int], parent: bool,
+                          viewer_user_id: Optional[int] = None) -> dict:
+    """kind: post / notice → {owner_id: [첨부 메타]} (파일 본문은 읽지 않음)"""
+    if not owner_ids:
+        return {}
+    col = BoardAttachment.post_id if kind == "post" else BoardAttachment.notice_id
+    result: dict = {}
+    for aid, owner_id, name, size, uid in (db.query(BoardAttachment.attachment_id, col, BoardAttachment.file_name,
+                                                    BoardAttachment.size_bytes, BoardAttachment.user_id)
+                                             .filter(col.in_(owner_ids)).order_by(BoardAttachment.attachment_id)):
+        result.setdefault(owner_id, []).append({
+            "attachment_id": aid, "file_name": name, "size_bytes": int(size or 0),
+            "url": _attachment_url(kind, aid, parent), "mine": bool(viewer_user_id and uid == viewer_user_id)})
+    return result
+
+
+def _safe_download(file_name: str, mime: str, data_b64: str) -> Response:
+    """첨부파일 내려받기 공통 — 항상 '다운로드'(attachment)로 보내고, 브라우저가 실행·해석할 수 있는 형식은
+    application/octet-stream 으로 바꿔 저장형 XSS 를 막습니다. (X-Content-Type-Options: nosniff 는 미들웨어가 붙임)"""
+    from urllib.parse import quote
+    inline_safe = mime in ("application/pdf",) or (mime.startswith("image/") and mime != "image/svg+xml")
+    media_type = mime if inline_safe else "application/octet-stream"
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", file_name)[:100] or "file"
+    return Response(content=base64.b64decode(data_b64), media_type=media_type,
+                    headers={"Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(file_name)}",
+                             "Cache-Control": "private, no-store",
+                             "Content-Security-Policy": "default-src 'none'; sandbox"})
+
+
+def _attachment_type(file_name: str) -> str:
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    if ext not in ATTACHMENT_TYPES:
+        raise HTTPException(400, "올릴 수 없는 파일 형식입니다. (문서·한글·엑셀·PDF·이미지·압축 파일만 가능)")
+    return ATTACHMENT_TYPES[ext]
+
+
+def _add_attachment(db: Session, kind: str, owner_id: int, upload: tuple, user_id: Optional[int]) -> BoardAttachment:
+    name, _client_mime, content = upload
+    col = BoardAttachment.post_id if kind == "post" else BoardAttachment.notice_id
+    count = db.query(func.count(BoardAttachment.attachment_id)).filter(col == owner_id).scalar() or 0
+    if count >= ATTACHMENT_MAX_COUNT:
+        raise HTTPException(400, f"첨부파일은 글마다 {ATTACHMENT_MAX_COUNT}개까지 올릴 수 있습니다.")
+    if not content:
+        raise HTTPException(400, "빈 파일은 올릴 수 없습니다.")
+    row = BoardAttachment(file_name=name, mime_type=_attachment_type(name), size_bytes=len(content),
+                          data=base64.b64encode(content).decode(), user_id=user_id,
+                          **({"post_id": owner_id} if kind == "post" else {"notice_id": owner_id}))
+    db.add(row)
+    db.flush()
+    return row
 
 
 def _post_title(p: CommunityPost) -> str:
@@ -4492,7 +4774,8 @@ def _post_title(p: CommunityPost) -> str:
 
 
 def _post_to_out(p: CommunityPost, photo_ids: List[int], parent: bool = False,
-                 comment_count: int = 0, liked: bool = False, viewer_user_id: Optional[int] = None) -> dict:
+                 comment_count: int = 0, liked: bool = False, viewer_user_id: Optional[int] = None,
+                 attachments: Optional[List[dict]] = None) -> dict:
     category = p.category if p.category in POST_CATEGORIES else "FREE"
     return {
         "kind": "post", "key": f"p{p.post_id}",
@@ -4502,7 +4785,10 @@ def _post_to_out(p: CommunityPost, photo_ids: List[int], parent: bool = False,
         "author_role": p.author_role or "admin",
         "category": category, "category_label": POST_CATEGORIES[category],
         "content": p.content,
+        "content_html": p.content_html or None,          # v10: 서식 본문 (없으면 content 를 그대로 표시)
         "photos": [_community_photo_path(pid, parent) for pid in photo_ids],
+        "thumbs": [_board_photo_path("post", pid, parent, thumb=True) for pid in photo_ids],
+        "attachments": attachments or [],
         "like_count": p.like_count or 0,
         "liked": liked,                     # v8.1: 내가 좋아요를 눌렀는지
         "comment_count": comment_count,     # v8.1: 보이는 댓글 수
@@ -4544,8 +4830,9 @@ def _posts_out(db: Session, rows: List[CommunityPost], parent: bool, user_id: Op
     photo_map = _photo_ids_by_post(db, ids)
     counts = _comment_counts(db, ids)
     liked = _liked_posts(db, user_id, ids)
-    return [_post_to_out(p, photo_map.get(p.post_id, []), parent, int(counts.get(p.post_id, 0)), p.post_id in liked, user_id)
-            for p in rows]
+    files = _attachments_by_owner(db, "post", ids, parent, user_id)
+    return [_post_to_out(p, photo_map.get(p.post_id, []), parent, int(counts.get(p.post_id, 0)), p.post_id in liked, user_id,
+                         files.get(p.post_id)) for p in rows]
 
 
 def _list_posts(db: Session, parent: bool, limit: int, user_id: Optional[int] = None) -> List[dict]:
@@ -4566,23 +4853,45 @@ def _parent_post_visibility(user_id: Optional[int]):
                and_(CommunityPost.status == "PENDING", CommunityPost.user_id == user_id))
 
 
-def _parse_photo_items(items: List[str], existing_ids: Optional[set] = None) -> list:
-    """사진 목록 검증 → [("keep", photo_id) | ("new", (mime, base64))]"""
+def _parse_photo_items(items: list, existing_ids: Optional[set] = None, ref_re=_PHOTO_REF_RE) -> list:
+    """사진 목록 검증 → [("keep", photo_id) | ("new", (mime, base64, thumb_base64|None))]
+    항목은 문자열(원본 data URL 또는 기존 사진 URL) 또는 {src, thumb}(v10: 작은 사진 포함)"""
     if len(items) > COMMUNITY_PHOTO_MAX_COUNT:
-        raise HTTPException(400, f"사진은 게시물당 {COMMUNITY_PHOTO_MAX_COUNT}장까지 올릴 수 있습니다.")
-    if sum(len(item or "") for item in items) > COMMUNITY_PHOTOS_TOTAL_MAX_CHARS:
+        raise HTTPException(400, f"사진은 글마다 {COMMUNITY_PHOTO_MAX_COUNT}장까지 올릴 수 있습니다.")
+    pairs = [(item, None) if isinstance(item, str) else (item.src, item.thumb) for item in items]
+    if sum(len(src or "") + len(thumb or "") for src, thumb in pairs) > COMMUNITY_PHOTOS_TOTAL_MAX_CHARS:
         raise HTTPException(413, "한 번에 올리는 사진 용량이 너무 큽니다. 사진 수를 줄여 주세요.")
     parsed = []
-    for item in items:
-        ref = _PHOTO_REF_RE.match((item or "").split("?", 1)[0])
+    for src, thumb in pairs:
+        ref = ref_re.match((src or "").split("?", 1)[0])
         if ref:
             photo_id = int(ref.group(1))
             if existing_ids is None or photo_id not in existing_ids:
-                raise HTTPException(400, "이 게시물의 사진이 아닙니다.")
+                raise HTTPException(400, "이 글의 사진이 아닙니다.")
             parsed.append(("keep", photo_id))
         else:
-            parsed.append(("new", _parse_image_data_url(item, COMMUNITY_PHOTO_MAX_CHARS, "사진")))
+            mime, body = _parse_image_data_url(src, COMMUNITY_PHOTO_MAX_CHARS, "사진")
+            thumb_body = _parse_image_data_url(thumb, THUMB_MAX_CHARS, "작은 사진")[1] if thumb else None
+            parsed.append(("new", (mime, body, thumb_body)))
     return parsed
+
+
+def _save_board_photos(db: Session, model, fk_name: str, owner_id: int, items: list) -> None:
+    """사진 저장(게시글·공지 공용): 유지할 사진은 순서만 바꾸고, 새 사진은 추가"""
+    for position, (kind, value) in enumerate(items):
+        if kind == "keep":
+            db.query(model).filter(model.photo_id == value).update({"position": position}, synchronize_session=False)
+        else:
+            mime, body, thumb = value
+            db.add(model(**{fk_name: owner_id}, position=position, mime_type=mime, data=body, thumb=thumb))
+
+
+def _replace_board_photos(db: Session, model, fk_name: str, owner_id: int, existing: set, items: list) -> None:
+    kept = {value for kind, value in items if kind == "keep"}
+    removed = existing - kept
+    if removed:
+        db.query(model).filter(model.photo_id.in_(removed)).delete(synchronize_session=False)
+    _save_board_photos(db, model, fk_name, owner_id, items)
 
 
 def _like_pattern(q: str) -> str:
@@ -4603,9 +4912,15 @@ def _search_condition(field: str, pattern: str, title_col, content_col, author_c
 
 def _notice_board_out(n: Notice, class_names: dict, read_counts: Optional[dict] = None,
                       targets: Optional[dict] = None, read_ids: Optional[set] = None,
-                      my_classes: Optional[dict] = None) -> dict:
+                      my_classes: Optional[dict] = None, photo_ids: Optional[List[int]] = None,
+                      attachments: Optional[List[dict]] = None) -> dict:
+    parent = read_ids is not None
+    photo_ids = photo_ids or []
     out = {"kind": "notice", "key": f"n{n.notice_id}", "notice_id": n.notice_id, "title": n.title,
-           "content": n.content, "author": n.author, "author_role": "admin",
+           "content": n.content, "content_html": n.content_html or None, "author": n.author, "author_role": "admin",
+           "photos": [_board_photo_path("notice", pid, parent) for pid in photo_ids],
+           "thumbs": [_board_photo_path("notice", pid, parent, thumb=True) for pid in photo_ids],
+           "attachments": attachments or [],
            "category": "NOTICE", "category_label": "공지",
            "notice_category": n.category if n.category in NOTICE_KINDS else "GENERAL",
            "notice_category_label": NOTICE_KINDS.get(n.category, "일반"),
@@ -4670,15 +4985,19 @@ def _board(db: Session, *, parent_user: Optional[AppUser], category: str, q: str
     all_notices = [x for k, _, x in merged if k == "n"] + pinned_notices
     all_posts = [x for k, _, x in merged if k == "p"] + pinned_posts
     class_names = dict(db.query(Class.class_id, Class.name).all())
+    notice_ids = list({n.notice_id for n in all_notices})
+    notice_photos = _photo_ids_by_owner(db, NoticePhoto, NoticePhoto.notice_id, notice_ids)
+    notice_files = _attachments_by_owner(db, "notice", notice_ids, bool(parent_user))
     if parent_user:
         read_ids = {nid for (nid,) in db.query(NoticeRead.notice_id).filter(NoticeRead.user_id == user_id)}
-        notice_out = lambda n: _notice_board_out(n, class_names, read_ids=read_ids, my_classes=my_classes)
+        notice_out = lambda n: _notice_board_out(n, class_names, read_ids=read_ids, my_classes=my_classes,
+                                                 photo_ids=notice_photos.get(n.notice_id), attachments=notice_files.get(n.notice_id))
     else:
-        ids = [n.notice_id for n in all_notices]
         read_counts = dict(db.query(NoticeRead.notice_id, func.count(NoticeRead.read_id))
-                             .filter(NoticeRead.notice_id.in_(ids or [-1])).group_by(NoticeRead.notice_id).all())
+                             .filter(NoticeRead.notice_id.in_(notice_ids or [-1])).group_by(NoticeRead.notice_id).all())
         targets = _notice_targets(db)
-        notice_out = lambda n: _notice_board_out(n, class_names, read_counts, targets)
+        notice_out = lambda n: _notice_board_out(n, class_names, read_counts, targets, photo_ids=notice_photos.get(n.notice_id),
+                                                 attachments=notice_files.get(n.notice_id))
     post_out = {d["post_id"]: d for d in _posts_out(db, list({p.post_id: p for p in all_posts}.values()), bool(parent_user), user_id)}
     items = [notice_out(x) if k == "n" else post_out[x.post_id] for k, _, x in merged]
     pinned = [notice_out(n) for n in pinned_notices] + [post_out[p.post_id] for p in pinned_posts]
@@ -4708,11 +5027,79 @@ def get_community_post(post_id: int, request: Request, db: Session = Depends(get
 
 
 @app.get("/api/community/photos/{photo_id}")
-def get_community_photo(photo_id: int, db: Session = Depends(get_db)):
-    row = db.query(CommunityPhoto.mime_type, CommunityPhoto.data).filter(CommunityPhoto.photo_id == photo_id).first()
+def get_community_photo(photo_id: int, size: str = Query("full", max_length=5), db: Session = Depends(get_db)):
+    columns = (CommunityPhoto.mime_type, CommunityPhoto.thumb if size == "thumb" else CommunityPhoto.data)
+    row = db.query(*columns).filter(CommunityPhoto.photo_id == photo_id).first()
     if not row:
         raise HTTPException(404, "사진을 찾을 수 없습니다.")
-    return _image_response(row.mime_type, row.data)
+    if size == "thumb" and not row[1]:          # 작은 사진이 없는 이전 사진 → 원본
+        return get_community_photo(photo_id, "full", db)
+    return _photo_response(row[0], row[1], row[1] if size == "thumb" else None, size)
+
+
+@app.get("/api/notices/photos/{photo_id}")
+def get_notice_photo(photo_id: int, size: str = Query("full", max_length=5), db: Session = Depends(get_db)):
+    row = db.query(NoticePhoto.mime_type, NoticePhoto.data, NoticePhoto.thumb).filter(NoticePhoto.photo_id == photo_id).first()
+    if not row:
+        raise HTTPException(404, "사진을 찾을 수 없습니다.")
+    return _photo_response(row.mime_type, row.data, row.thumb, size)
+
+
+async def _read_attachment_upload(file: UploadFile) -> tuple:
+    upload = await _read_upload(file)
+    if not upload:
+        raise HTTPException(400, "파일을 선택하세요.")
+    _attachment_type(upload[0])
+    return upload
+
+
+def _attachment_or_404(db: Session, attachment_id: int) -> BoardAttachment:
+    row = db.query(BoardAttachment).filter(BoardAttachment.attachment_id == attachment_id).first()
+    if not row:
+        raise HTTPException(404, "첨부파일을 찾을 수 없습니다.")
+    return row
+
+
+def _attachment_meta(row: BoardAttachment, parent: bool, viewer_user_id: Optional[int] = None) -> dict:
+    kind = "post" if row.post_id else "notice"
+    return {"attachment_id": row.attachment_id, "file_name": row.file_name, "size_bytes": row.size_bytes,
+            "url": _attachment_url(kind, row.attachment_id, parent), "mine": bool(viewer_user_id and row.user_id == viewer_user_id)}
+
+
+@app.post("/api/community/posts/{post_id}/attachments", status_code=201)
+async def upload_post_attachment(post_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """관리자 글에 첨부파일 추가 (파일 1개씩, 4MB 이하, 글마다 5개). 학부모 글은 작성자만 첨부"""
+    upload = await _read_attachment_upload(file)
+    post = db.query(CommunityPost.post_id, CommunityPost.author_role).filter(CommunityPost.post_id == post_id).first()
+    if not post:
+        raise HTTPException(404, "게시물을 찾을 수 없습니다.")
+    if (post.author_role or "admin") != "admin":
+        raise HTTPException(403, "학부모가 쓴 글에는 첨부파일을 추가할 수 없습니다.")
+    row = _add_attachment(db, "post", post_id, upload, request.state.user.user_id)
+    db.commit()
+    return _attachment_meta(row, False, request.state.user.user_id)
+
+
+@app.post("/api/notices/{notice_id}/attachments", status_code=201)
+async def upload_notice_attachment(notice_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    upload = await _read_attachment_upload(file)
+    if not db.query(Notice.notice_id).filter(Notice.notice_id == notice_id).first():
+        raise HTTPException(404, "공지사항을 찾을 수 없습니다.")
+    row = _add_attachment(db, "notice", notice_id, upload, request.state.user.user_id)
+    db.commit()
+    return _attachment_meta(row, False, request.state.user.user_id)
+
+
+@app.get("/api/community/attachments/{attachment_id}")
+def download_board_attachment(attachment_id: int, db: Session = Depends(get_db)):
+    row = _attachment_or_404(db, attachment_id)
+    return _safe_download(row.file_name, row.mime_type, row.data)
+
+
+@app.delete("/api/community/attachments/{attachment_id}", status_code=204)
+def delete_board_attachment(attachment_id: int, db: Session = Depends(get_db)):
+    db.delete(_attachment_or_404(db, attachment_id))
+    db.commit()
 
 
 def _admin_author(db: Session, request: Request) -> str:
@@ -4729,12 +5116,7 @@ def _admin_author(db: Session, request: Request) -> str:
 
 
 def _save_new_photos(db: Session, post_id: int, items: list) -> None:
-    for position, (kind, value) in enumerate(items):
-        if kind == "keep":
-            db.query(CommunityPhoto).filter(CommunityPhoto.photo_id == value).update({"position": position}, synchronize_session=False)
-        else:
-            mime, body = value
-            db.add(CommunityPhoto(post_id=post_id, position=position, mime_type=mime, data=body))
+    _save_board_photos(db, CommunityPhoto, "post_id", post_id, items)
 
 
 def _post_category(value: Optional[str]) -> str:
@@ -4747,12 +5129,13 @@ def _post_category(value: Optional[str]) -> str:
 def create_community_post(payload: CommunityPostCreate, request: Request, db: Session = Depends(get_db)):
     """게시물 작성 (관리자). 사진은 data URL 리스트로 받아 사진 테이블에 따로 저장합니다."""
     photos = _parse_photo_items(payload.photos or [])
-    if not payload.content.strip() and not photos:
+    content, content_html = _rich_body(payload.content, payload.content_html, 10000)
+    if not content.strip() and not photos:
         raise HTTPException(400, "내용 또는 사진을 입력하세요.")
     user = request.state.user
-    p = CommunityPost(author=_admin_author(db, request), title=payload.title.strip() or None, content=payload.content,
-                      category=_post_category(payload.category), user_id=user.user_id, author_role="admin",
-                      is_pinned=payload.is_pinned, status="VISIBLE", photos=None)
+    p = CommunityPost(author=_admin_author(db, request), title=payload.title.strip() or None, content=content,
+                      content_html=content_html, category=_post_category(payload.category), user_id=user.user_id,
+                      author_role="admin", is_pinned=payload.is_pinned, status="VISIBLE", photos=None)
     db.add(p)
     db.flush()
     _save_new_photos(db, p.post_id, photos)
@@ -4796,6 +5179,7 @@ def _delete_post(db: Session, p: CommunityPost) -> None:
     db.query(CommunityLike).filter(CommunityLike.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityComment).filter(CommunityComment.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityPhoto).filter(CommunityPhoto.post_id == post_id).delete(synchronize_session=False)
+    db.query(BoardAttachment).filter(BoardAttachment.post_id == post_id).delete(synchronize_session=False)
     db.delete(p)
 
 
@@ -4812,14 +5196,16 @@ def _update_post(db: Session, p: CommunityPost, payload: CommunityPostUpdate) ->
     _migrate_legacy_photos(db, [p.post_id])
     existing = {pid for (pid,) in db.query(CommunityPhoto.photo_id).filter(CommunityPhoto.post_id == p.post_id)}
     items = _parse_photo_items(payload.photos or [], existing)
-    if not payload.content.strip() and not items:
+    if "content_html" in payload.model_fields_set:
+        content, content_html = _rich_body(payload.content, payload.content_html, 10000)
+    elif payload.content != p.content:
+        content, content_html = payload.content, None
+    else:
+        content, content_html = p.content, p.content_html
+    if not content.strip() and not items:
         raise HTTPException(400, "내용 또는 사진을 입력하세요.")
-    kept = {value for kind, value in items if kind == "keep"}
-    removed = existing - kept
-    if removed:
-        db.query(CommunityPhoto).filter(CommunityPhoto.photo_id.in_(removed)).delete(synchronize_session=False)
-    _save_new_photos(db, p.post_id, items)
-    p.content = payload.content
+    _replace_board_photos(db, CommunityPhoto, "post_id", p.post_id, existing, items)
+    p.content, p.content_html = content, content_html
     if payload.title is not None:
         p.title = payload.title.strip() or None
     if payload.category is not None:
@@ -5011,10 +5397,10 @@ def sanction_member(membership_id: int, payload: SanctionRequest, request: Reque
         title, body = "커뮤니티 글·댓글 제한이 해제되었습니다", ""
     elif payload.action == "ban":
         m.status = "BANNED"
-        title, body = "시설 이용이 제한되었습니다", reason
+        title, body = "학원 이용이 제한되었습니다", reason
     elif payload.action == "unban":
         m.status = "ACTIVE"
-        title, body = "시설 이용 제한이 해제되었습니다", ""
+        title, body = "학원 이용 제한이 해제되었습니다", ""
     else:
         raise HTTPException(400, "action 은 warn / mute / unmute / ban / unban 중 하나여야 합니다.")
     if reason:
@@ -5162,8 +5548,8 @@ def moderation_export(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------
 class InvoiceCreate(BaseModel):
     member_id: int
-    item_name: str = "수강료"
-    amount: int
+    item_name: str = Field("수강료", min_length=1, max_length=200)
+    amount: int = Field(gt=0, le=100_000_000)
     due_date: Optional[date] = None
 
 
@@ -5186,7 +5572,7 @@ def list_invoices(status: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(Invoice, Member.name).outerjoin(Member, Member.member_id == Invoice.member_id)
     if status:
         q = q.filter(Invoice.status == status)
-    rows = q.order_by(Invoice.status.asc(), Invoice.created_at.desc()).all()
+    rows = q.order_by(Invoice.status.asc(), Invoice.created_at.desc()).limit(1000).all()
     return [_invoice_to_out(iv, name) for iv, name in rows]
 
 
@@ -5218,7 +5604,7 @@ OFFLINE_METHODS = {"CASH": "현금", "TRANSFER": "계좌이체", "CARD": "카드
 
 
 class InvoicePaidRequest(BaseModel):
-    method: str = "CASH"
+    method: str = Field("CASH", max_length=10)
     paid_at: Optional[date] = None
     note: Optional[str] = Field(None, max_length=150)
 
@@ -5307,8 +5693,8 @@ def bulk_create_invoices(payload: InvoiceBulkCreate, request: Request, db: Sessi
 
 
 class InvoiceUpdate(BaseModel):
-    item_name: Optional[str] = None
-    amount: Optional[int] = None
+    item_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    amount: Optional[int] = Field(None, gt=0, le=100_000_000)
     due_date: Optional[date] = None
 
 
@@ -5860,7 +6246,7 @@ async def _read_upload(file: Optional[UploadFile]) -> Optional[tuple]:
     original = os.path.basename(file.filename.replace("\\", "/"))[-200:]
     if not original:
         raise HTTPException(400, "유효하지 않은 파일명입니다.")
-    content = await file.read()
+    content = await file.read(MAX_UPLOAD_BYTES + 1)     # 한도보다 1바이트만 더 읽고 판단 (큰 파일을 통째로 메모리에 올리지 않음)
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"첨부 파일은 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB 이하만 가능합니다.")
     return original, (file.content_type or "application/octet-stream")[:100], content
@@ -5982,10 +6368,8 @@ def _assignment_file_response(db: Session, assignment_id: int) -> Response:
     row = db.query(AssignmentFile).filter(AssignmentFile.assignment_id == assignment_id).first()
     if not row:
         raise HTTPException(404, "첨부 파일이 없습니다. (v8.1 이전에 올린 파일은 서버에 남아 있지 않을 수 있습니다)")
-    from urllib.parse import quote
-    return Response(content=base64.b64decode(row.data), media_type=row.mime_type,
-                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(row.file_name)}",
-                             "Cache-Control": "private, no-store"})
+    # v10: 업로드한 쪽이 보낸 MIME(text/html 등)을 그대로 쓰지 않고, 안전한 다운로드 응답으로 통일
+    return _safe_download(row.file_name, row.mime_type, row.data)
 
 
 @app.get("/api/assignments/{assignment_id}/file")
@@ -6016,8 +6400,11 @@ def list_submissions(assignment_id: int, db: Session = Depends(get_db)):
 @app.put("/api/assignments/{assignment_id}/submissions/{member_id}")
 def update_submission(assignment_id: int, member_id: int, payload: SubmissionUpdate, request: Request,
                       db: Session = Depends(get_db)):
-    if not db.query(Assignment.assignment_id).filter(Assignment.assignment_id == assignment_id).first():
+    class_id = db.query(Assignment.class_id).filter(Assignment.assignment_id == assignment_id).scalar()
+    if not class_id:
         raise HTTPException(404, "과제를 찾을 수 없습니다.")
+    if not db.query(Enrollment.enrollment_id).filter(Enrollment.class_id == class_id, Enrollment.member_id == member_id).first():
+        raise HTTPException(400, "이 반을 수강하는 학생이 아닙니다.")
     row = db.query(AssignmentSubmission).filter(AssignmentSubmission.assignment_id == assignment_id,
                                                 AssignmentSubmission.member_id == member_id).first()
     if payload.status == "NONE":
@@ -6353,7 +6740,7 @@ def parent_children(db: Session = Depends(get_db), user: AppUser = Depends(curre
 
 @app.post("/api/parent/children", status_code=201)
 def parent_link_child(payload: ParentChildLink, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
-    """(이미 시설에 등록된 학생) 자녀 연결: 자녀 이름 + 시설에 등록된 보호자 연락처가 일치해야 함.
+    """(이미 학원에 등록된 학생) 자녀 연결: 자녀 이름 + 학원에 등록된 보호자 연락처가 일치해야 함.
     로그인한 Google 계정에만 연결되고, 실패 5회 시 30분 잠금(무차별 대입 방지)."""
     row = db.query(AppUser).filter(AppUser.user_id == user.user_id).first()
     _ensure_not_locked(row)
@@ -6368,7 +6755,7 @@ def parent_link_child(payload: ParentChildLink, db: Session = Depends(get_db), u
                     .first())
     if not member:
         _record_failed_attempt(db, row)
-        raise HTTPException(404, "일치하는 학생을 찾지 못했습니다. 이름과 시설에 등록한 보호자 연락처를 확인하세요.")
+        raise HTTPException(404, "일치하는 학생을 찾지 못했습니다. 이름과 학원에 등록한 보호자 연락처를 확인하세요.")
     _clear_failed_attempts(row)
     if not db.query(ParentLink).filter(ParentLink.user_id == user.user_id, ParentLink.member_id == member.member_id).first():
         db.add(ParentLink(user_id=user.user_id, member_id=member.member_id))
@@ -6523,17 +6910,17 @@ class MembershipUpdate(BaseModel):
 @app.put("/api/parent/membership")
 def parent_update_membership(payload: MembershipUpdate, request: Request, db: Session = Depends(get_db),
                              user: AppUser = Depends(current_parent)):
-    """커뮤니티 닉네임 변경 (시설마다 따로). 이후 새 글·댓글에 적용"""
+    """커뮤니티 닉네임 변경 (학원마다 따로). 이후 새 글·댓글에 적용"""
     membership = getattr(request.state, "membership", None)
     if not membership:
-        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "학원을 먼저 선택하세요.")
     nickname = re.sub(r"\s+", " ", payload.nickname).strip()
     if len(nickname) < 2 or re.search(r"(관리자|원장|admin|운영자)", nickname, re.I):
         raise HTTPException(400, "사용할 수 없는 닉네임입니다. (2~20자, 관리자로 오해할 수 있는 이름 제외)")
     taken = (db.query(FacilityMember.membership_id)
                .filter(FacilityMember.nickname == nickname, FacilityMember.membership_id != membership.membership_id).first())
     if taken:
-        raise HTTPException(409, "이 시설에서 이미 사용 중인 닉네임입니다.")
+        raise HTTPException(409, "이 학원에서 이미 사용 중인 닉네임입니다.")
     membership.nickname = nickname
     db.commit()
     return _membership_out(membership)
@@ -6591,7 +6978,7 @@ def parent_assignment_file(assignment_id: int, db: Session = Depends(get_db), us
 def _require_can_write(request: Request) -> FacilityMember:
     membership = getattr(request.state, "membership", None)
     if not membership:
-        raise HTTPException(FACILITY_REQUIRED_STATUS, "시설을 먼저 선택하세요.")
+        raise HTTPException(FACILITY_REQUIRED_STATUS, "학원을 먼저 선택하세요.")
     if membership.muted_until and membership.muted_until > _now():
         until = membership.muted_until.strftime("%m월 %d일 %H:%M")
         raise HTTPException(403, f"관리자에 의해 {until}까지 글·댓글 작성이 제한되었습니다.")
@@ -6647,10 +7034,11 @@ def parent_create_post(payload: CommunityPostCreate, request: Request, db: Sessi
     title = payload.title.strip()
     if not title:
         raise HTTPException(400, "제목을 입력하세요.")
-    if not payload.content.strip() and not photos:
+    content, content_html = _rich_body(payload.content, payload.content_html, 10000)
+    if not content.strip() and not photos:
         raise HTTPException(400, "내용 또는 사진을 입력하세요.")
-    result = _moderate_text(f"{title}\n{payload.content}")
-    p = CommunityPost(author=_parent_author(membership, user), title=title, content=payload.content,
+    result = _moderate_text(f"{title}\n{content}")          # 서식이 아니라 순수 텍스트로 모니터링
+    p = CommunityPost(author=_parent_author(membership, user), title=title, content=content, content_html=content_html,
                       category=_post_category(payload.category), user_id=user.user_id, author_role="parent",
                       is_pinned=False, status="PENDING" if result.flagged else "VISIBLE", photos=None)
     db.add(p); db.flush()
@@ -6695,13 +7083,77 @@ def parent_delete_post(post_id: int, db: Session = Depends(get_db), user: AppUse
 
 
 @app.get("/api/parent/community/photos/{photo_id}")
-def parent_community_photo(photo_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
-    row = (db.query(CommunityPhoto.mime_type, CommunityPhoto.data)
+def parent_community_photo(photo_id: int, size: str = Query("full", max_length=5), db: Session = Depends(get_db),
+                           user: AppUser = Depends(current_parent)):
+    row = (db.query(CommunityPhoto.mime_type, CommunityPhoto.data, CommunityPhoto.thumb)
              .join(CommunityPost, CommunityPost.post_id == CommunityPhoto.post_id)
              .filter(CommunityPhoto.photo_id == photo_id, _parent_post_visibility(user.user_id)).first())
     if not row:
         raise HTTPException(404, "사진을 찾을 수 없습니다.")
-    return _image_response(row.mime_type, row.data)
+    return _photo_response(row.mime_type, row.data, row.thumb, size)
+
+
+def _parent_notice_filter(db: Session, user: AppUser):
+    """학부모에게 보이는 공지: 전체 공지 + 자녀가 듣는 반의 공지"""
+    my_classes = _parent_class_children(db, user)
+    return or_(Notice.class_id.is_(None), Notice.class_id.in_(list(my_classes) or [-1]))
+
+
+@app.get("/api/parent/notices/photos/{photo_id}")
+def parent_notice_photo(photo_id: int, size: str = Query("full", max_length=5), db: Session = Depends(get_db),
+                        user: AppUser = Depends(current_parent)):
+    row = (db.query(NoticePhoto.mime_type, NoticePhoto.data, NoticePhoto.thumb)
+             .join(Notice, Notice.notice_id == NoticePhoto.notice_id)
+             .filter(NoticePhoto.photo_id == photo_id, _parent_notice_filter(db, user)).first())
+    if not row:
+        raise HTTPException(404, "사진을 찾을 수 없습니다.")
+    return _photo_response(row.mime_type, row.data, row.thumb, size)
+
+
+def _parent_attachment_or_404(db: Session, attachment_id: int, user: AppUser) -> BoardAttachment:
+    """학부모가 볼 수 있는 글(공개 글·본인 검토 대기 글·대상 공지)의 첨부만"""
+    row = _attachment_or_404(db, attachment_id)
+    if row.post_id:
+        visible = db.query(CommunityPost.post_id).filter(CommunityPost.post_id == row.post_id,
+                                                         _parent_post_visibility(user.user_id)).first()
+    else:
+        visible = db.query(Notice.notice_id).filter(Notice.notice_id == row.notice_id, _parent_notice_filter(db, user)).first()
+    if not visible:
+        raise HTTPException(404, "첨부파일을 찾을 수 없습니다.")
+    return row
+
+
+@app.get("/api/parent/community/attachments/{attachment_id}")
+def parent_download_attachment(attachment_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    row = _parent_attachment_or_404(db, attachment_id, user)
+    return _safe_download(row.file_name, row.mime_type, row.data)
+
+
+@app.post("/api/parent/community/posts/{post_id}/attachments", status_code=201)
+async def parent_upload_attachment(post_id: int, request: Request, file: UploadFile = File(...), db: Session = Depends(get_db),
+                                   user: AppUser = Depends(current_parent)):
+    """본인 글에만 첨부 (글·댓글 금지 중이면 불가)"""
+    _require_can_write(request)
+    upload = await _read_attachment_upload(file)
+    post = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(
+        CommunityPost.post_id == post_id, CommunityPost.user_id == user.user_id, CommunityPost.author_role == "parent").first()
+    if not post:
+        raise HTTPException(404, "본인이 쓴 글에만 첨부할 수 있습니다.")
+    row = _add_attachment(db, "post", post_id, upload, user.user_id)
+    _log(db, "parent", user.user_id, "community.attach", "post", post_id, "첨부파일 추가")
+    db.commit()
+    return _attachment_meta(row, True, user.user_id)
+
+
+@app.delete("/api/parent/community/attachments/{attachment_id}", status_code=204)
+def parent_delete_attachment(attachment_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    row = _attachment_or_404(db, attachment_id)
+    owner = row.post_id and db.query(CommunityPost.post_id).filter(
+        CommunityPost.post_id == row.post_id, CommunityPost.user_id == user.user_id, CommunityPost.author_role == "parent").first()
+    if not owner:
+        raise HTTPException(404, "본인 글의 첨부파일만 삭제할 수 있습니다.")
+    db.delete(row)
+    db.commit()
 
 
 @app.post("/api/parent/community/posts/{post_id}/like")
@@ -6723,7 +7175,7 @@ def parent_create_comment(post_id: int, payload: ParentCommentCreate, request: R
     if not content:
         raise HTTPException(400, "댓글은 1~1000자로 입력하세요.")
     post = _parent_post_or_404(db, post_id, user)
-    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지 — 시설 닉네임)
+    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지 — 학원 닉네임)
     comment = CommunityComment(post_id=post_id, author=_parent_author(membership, user), content=content,
                                user_id=user.user_id, author_role="parent")
     db.add(comment); db.flush()
@@ -6753,64 +7205,82 @@ def parent_delete_comment(comment_id: int, db: Session = Depends(get_db), user: 
 
 
 # =====================================================================
-# 외부 쇼핑몰 연동 (/api/shop/*) — 기본: https://ddmmall77.com
-#   - 결제/주문은 쇼핑몰에서 처리, 이 시스템은 카탈로그·추천·클릭 로그만 관리
-#   - 추천 v1: 규칙/콘텐츠 기반 (시설 유형 + 회원 규모 + 공지/수업의 행사 키워드 + 클릭 이력)
+# 학원 쇼핑몰 (/api/shop/*) — v11: 여러 제휴몰(가상) + 기존 외부 쇼핑몰(DDM) 을 한 화면에서
+#   - 왜 필요한가·제휴몰·가격 규칙은 backend/shop_market.py 머리말 참고
+#   - 추천 v2: 규칙/콘텐츠 기반 (개설 수업·학원 소개의 '과목' + 재고 부족 + 행사 키워드 + 연결한 제휴몰 + 할인 + 클릭 이력)
+#   - 장바구니 → 주문 → 모의 결제 → 입고(재고 반영). 금액은 서버가 계산하고 결제는 실제로 일어나지 않음
 #   - 쇼핑몰이 /products.json 을 제공하면 POST /api/shop/sync 로 카탈로그 자동 갱신
 # =====================================================================
+
 SHOP_BASE_URL = os.getenv("SHOP_BASE_URL", "https://ddmmall77.com").rstrip("/")
 SHOP_NAME = os.getenv("SHOP_NAME", "DDM")
-SHOP_CATEGORIES = ["야구점퍼", "키링", "태권도 용품", "매달", "기타굿즈", "단체주문"]
+SHOP_CATEGORIES = list(_shop_market.CATEGORIES)
+# v10 까지의 DDM 상품 분류 → v11 공통 분류 (시드 상품만 옮김, 직접 등록한 상품은 그대로)
+_LEGACY_SHOP_CATEGORY = {"야구점퍼": "단체복·굿즈", "키링": "단체복·굿즈", "기타굿즈": "단체복·굿즈", "단체주문": "단체복·굿즈",
+                         "매달": "상장·기념품", "태권도 용품": "체육·무도 용품"}
 
 SHOP_SEEDS = [
-    {"external_id": "seed:jumper-team", "name": "단체 야구점퍼 맞춤 제작", "category": "야구점퍼",
+    {"external_id": "seed:jumper-team", "name": "단체 야구점퍼 맞춤 제작", "category": "단체복·굿즈",
      "description": "1벌부터 제작 · 시안 무료 · 10벌 이상 단체 할인", "path": "/custom.html",
      "tags": "단체복,유니폼,팀,행사,대회,졸업", "facility_types": ""},
-    {"external_id": "seed:jumper-design", "name": "야구점퍼 직접 디자인하기", "category": "야구점퍼",
+    {"external_id": "seed:jumper-design", "name": "야구점퍼 직접 디자인하기", "category": "단체복·굿즈",
      "description": "정면·후면 디자인을 직접 구성하고 접수", "path": "/custom.html",
      "tags": "단체복,디자인,유니폼", "facility_types": ""},
-    {"external_id": "seed:keyring", "name": "아크릴 키링 주문제작", "category": "키링",
+    {"external_id": "seed:keyring", "name": "아크릴 키링 주문제작", "category": "단체복·굿즈",
      "description": "1개부터 · 4~7cm · 볼체인/열쇠고리 선택 · 개별 OPP 포장", "path": "/keyring.html",
      "tags": "기념품,선물,수료,졸업,이벤트,홍보", "facility_types": ""},
-    {"external_id": "seed:medal", "name": "맞춤 매달", "category": "매달",
+    {"external_id": "seed:medal", "name": "맞춤 매달", "category": "상장·기념품",
      "description": "대회·시상·승급 기념 매달 1개부터 제작", "path": "/index.html#list",
      "tags": "매달,시상,대회,승급,수료", "facility_types": ""},
-    {"external_id": "seed:taekwondo", "name": "태권도 용품", "category": "태권도 용품",
+    {"external_id": "seed:taekwondo", "name": "태권도 용품", "category": "체육·무도 용품",
      "description": "도장 운영에 필요한 태권도 용품", "path": "/index.html#list",
      "tags": "태권도,도복,띠,승급,심사", "facility_types": "도장"},
-    {"external_id": "seed:goods", "name": "기타 굿즈", "category": "기타굿즈",
+    {"external_id": "seed:goods", "name": "기타 굿즈", "category": "단체복·굿즈",
      "description": "기관 로고를 넣은 홍보·기념 굿즈", "path": "/index.html#list",
      "tags": "홍보,기념품,선물,모집", "facility_types": ""},
-    {"external_id": "seed:inquiry", "name": "단체 주문 견적·시안 상담", "category": "단체주문",
+    {"external_id": "seed:inquiry", "name": "단체 주문 견적·시안 상담", "category": "단체복·굿즈",
      "description": "단체복 10벌 이상 할인 · 제작 7~10일 · 3만원 이상 무료배송", "path": "/inquiry.html",
      "tags": "단체복,견적,대회,행사", "facility_types": ""},
 ]
 
 # (키워드들, 관련 상품 태그, 표시 이름)
 SHOP_EVENT_RULES = [
-    (("대회", "시합", "경기", "토너먼트"), ("매달", "대회", "단체복"), "대회"),
-    (("심사", "승급", "승단", "품새"), ("승급", "매달", "태권도"), "승급·심사"),
-    (("수료", "졸업", "종강", "방학식"), ("수료", "졸업", "기념품"), "수료·졸업"),
-    (("행사", "캠프", "체육대회", "운동회", "발표회", "소풍", "축제", "공연"), ("행사", "단체복", "기념품"), "행사"),
-    (("개강", "입관", "오픈", "신규", "모집", "체험"), ("홍보", "모집", "기념품"), "신규 모집"),
+    (("대회", "시합", "경기", "토너먼트"), ("매달", "대회", "단체복", "트로피"), "대회"),
+    (("심사", "승급", "승단", "품새"), ("승급", "매달", "태권도", "띠"), "승급·심사"),
+    (("수료", "졸업", "종강", "방학식"), ("수료", "졸업", "기념품", "상장"), "수료·졸업"),
+    (("행사", "캠프", "체육대회", "운동회", "발표회", "소풍", "축제", "공연", "견학"), ("행사", "단체복", "기념품"), "행사"),
+    (("개강", "입관", "오픈", "신규", "모집", "체험"), ("홍보", "모집", "기념품", "전단지"), "신규 모집"),
 ]
 
 
 class ShopProductInput(BaseModel):
-    name: str
-    category: str
-    url: str
-    description: str = ""
-    price: Optional[int] = None
-    image_url: Optional[str] = None
-    tags: str = ""
-    facility_types: str = ""
-    min_quantity: int = 1
+    name: str = Field(max_length=200)
+    category: str = Field(max_length=60)
+    url: str = Field(max_length=500)
+    description: str = Field("", max_length=500)
+    price: Optional[int] = Field(None, ge=0, le=100_000_000)
+    image_url: Optional[str] = Field(None, max_length=500)
+    tags: str = Field("", max_length=300)
+    facility_types: str = Field("", max_length=100)
+    min_quantity: int = Field(1, ge=1, le=100_000)
     active: bool = True
+    list_price: Optional[int] = Field(None, ge=0, le=100_000_000)     # 정가 (판매가보다 크면 할인 표시)
+    unit: str = Field("개", max_length=20)
+    mall_code: Optional[str] = Field(None, max_length=30)              # 비우면 '직접 등록'
 
 
 class ShopClickInput(BaseModel):
-    context: str = "catalog"
+    context: str = Field("catalog", max_length=30)
+
+
+def _validate_image_url(url: Optional[str]) -> Optional[str]:
+    """상품 이미지 주소는 http(s) 만 (javascript:, data: 등 거부)"""
+    url = (url or "").strip()
+    if not url:
+        return None
+    if not re.fullmatch(r"https?://[^\s\"'<>]+", url):
+        raise HTTPException(400, "이미지 주소는 http(s):// 로 시작해야 합니다.")
+    return url[:500]
 
 
 def _shop_url(path_or_url: str) -> str:
@@ -6820,7 +7290,9 @@ def _shop_url(path_or_url: str) -> str:
 
 
 def _with_tracking(url: str, context: str) -> str:
-    """쇼핑몰 유입 분석용 UTM 파라미터 (#fragment 는 유지)"""
+    """쇼핑몰 유입 분석용 UTM 파라미터 (#fragment 는 유지). 앱 안 주소(/shop?…)는 그대로"""
+    if not url or url.startswith("/"):
+        return url
     parts = urlsplit(url)
     query = dict(parse_qsl(parts.query))
     query.update({"utm_source": "facility_manager", "utm_medium": "referral", "utm_content": context})
@@ -6839,27 +7311,62 @@ def _validate_http_url(url: str) -> str:
 
 
 def _ensure_shop_products(db: Session) -> None:
-    existing = {eid for (eid,) in db.query(ShopProduct.external_id).all()}
-    missing = [seed for seed in SHOP_SEEDS if seed["external_id"] not in existing]
-    if not missing:
+    """시드 상품(DDM 7종 + 가상 제휴몰 상품)을 한 번 넣고, v10 이전 DDM 시드의 분류·제휴몰 코드를 채움 (비파괴)"""
+    rows = db.query(ShopProduct.product_id, ShopProduct.external_id, ShopProduct.mall_code, ShopProduct.category,
+                    ShopProduct.source).all()
+    existing = {r.external_id for r in rows}
+    changed = False
+    for seed in SHOP_SEEDS:
+        if seed["external_id"] not in existing:
+            data = {k: v for k, v in seed.items() if k != "path"}
+            db.add(ShopProduct(**data, url=_shop_url(seed["path"]), source="seed", mall_code="ddm"))
+            changed = True
+    for seed in _shop_market.PRODUCT_SEEDS:
+        if seed["external_id"] not in existing:
+            db.add(ShopProduct(**seed, url=f"/shop?mall={seed['mall_code']}", source="seed"))
+            changed = True
+    for r in rows:
+        updates = {}
+        if r.mall_code is None and r.source in ("seed", "sync"):
+            updates["mall_code"] = "ddm"
+        if r.source == "seed" and r.category in _LEGACY_SHOP_CATEGORY:
+            updates["category"] = _LEGACY_SHOP_CATEGORY[r.category]
+        if updates:
+            db.query(ShopProduct).filter(ShopProduct.product_id == r.product_id).update(updates, synchronize_session=False)
+            changed = True
+    if not changed:
         return
-    for seed in missing:
-        data = {k: v for k, v in seed.items() if k != "path"}
-        db.add(ShopProduct(**data, url=_shop_url(seed["path"]), source="seed"))
     try:
         db.commit()
     except IntegrityError:
         db.rollback()  # 동시 첫 요청이 같은 시드를 넣은 경우
 
 
-def _shop_product_out(p: ShopProduct, context: str = "catalog") -> dict:
+def _mall_brief(code: Optional[str]) -> dict:
+    m = _shop_market.mall_of(code)
+    return {"code": m["code"], "name": m["name"], "logo": m["logo"], "color": m["color"],
+            "external": bool(m.get("external"))}
+
+
+def _shop_product_out(p: ShopProduct, context: str = "catalog", connected: Optional[set] = None) -> dict:
+    mall = _shop_market.mall_of(p.mall_code)
+    internal = (p.url or "").startswith("/")
+    purchasable = p.price is not None and not mall.get("external") and bool(p.active)
+    member = None
+    if purchasable and connected is not None and mall["code"] in connected and mall["member_rate"] > 0:
+        member = _shop_market.member_price(p.price, mall["member_rate"])
+    list_price = p.list_price if p.list_price and p.price and p.list_price > p.price else None
     return {
         "product_id": p.product_id, "external_id": p.external_id, "name": p.name,
         "category": p.category, "description": p.description, "price": p.price,
-        "price_label": f"{p.price:,}원~" if p.price else "견적 문의",
-        "url": _with_tracking(p.url, context), "image_url": p.image_url,
+        "list_price": list_price, "discount_rate": _shop_market.discount_rate(list_price, p.price),
+        "member_price": member, "unit": p.unit or "개",
+        "price_label": (f"{p.price:,}원" if purchasable else f"{p.price:,}원~") if p.price else "견적 문의",
+        "url": p.url if internal else _with_tracking(p.url, context), "image_url": p.image_url,
         "tags": _split_csv(p.tags), "facility_types": _split_csv(p.facility_types),
         "min_quantity": p.min_quantity, "source": p.source, "active": bool(p.active),
+        "mall": _mall_brief(p.mall_code), "purchasable": purchasable, "external_link": not internal,
+        "subjects": _shop_market.subject_tags(p.tags),
     }
 
 
@@ -6871,8 +7378,26 @@ def _facility_type(db: Session) -> str:
     return facility
 
 
+def _connected_malls(db: Session) -> set:
+    return {code for (code,) in db.query(ShopMallLink.mall_code).all()}
+
+
+def _academy_subjects(db: Session) -> List[dict]:
+    """개설 수업(종료되지 않은 것)·학원 소개·학원 종류·원장이 고른 주요 과목 → 과목별 점수와 근거"""
+    academy = _read_settings(db, "academy_info", DEFAULT_ACADEMY_SETTINGS)
+    classes = (db.query(Class.name, Class.description)
+                 .filter(or_(Class.end_date.is_(None), Class.end_date >= _today())).limit(200).all())
+    manual = academy.get("subjects") if isinstance(academy.get("subjects"), list) else []
+    return _shop_market.detect_subjects(classes, academy.get("description") or "", _facility_type(db), manual)
+
+
+def _low_stock_items(db: Session) -> List[InventoryItem]:
+    items = db.query(InventoryItem).filter(InventoryItem.active.is_(True)).limit(500).all()
+    return [i for i in items if _stock_status(i) != "OK"]
+
+
 def _shop_context(db: Session) -> dict:
-    """추천에 쓰는 시설 신호 수집 (개인정보 없이 집계/텍스트만)"""
+    """추천에 쓰는 학원 신호 수집 (개인정보 없이 집계/텍스트만)"""
     since_notice = _now() - timedelta(days=60)
     active_members = db.query(func.count(Member.member_id)).filter(Member.status == "ACTIVE").scalar() or 0
     class_sizes = (db.query(func.count(Enrollment.enrollment_id))
@@ -6891,20 +7416,41 @@ def _shop_context(db: Session) -> dict:
             if hit:
                 events.append({"label": label, "keyword": hit, "source": source, "tags": tags})
                 break
+    low = [{"item_id": i.item_id, "name": i.name, "terms": _shop_terms(i.keyword or i.name),
+            "shop_product_id": i.shop_product_id, "status": _stock_status(i)} for i in _low_stock_items(db)]
     return {"facility_type": _facility_type(db), "active_members": int(active_members),
-            "largest_class": largest_class, "events": events}
+            "largest_class": largest_class, "events": events, "subjects": _academy_subjects(db),
+            "connected": _connected_malls(db), "low_stock": low}
 
 
 def _score_shop_product(p: ShopProduct, ctx: dict, clicks: int) -> tuple:
+    """추천 점수와 '왜 추천했는지' — 점수 정의는 /api/shop/recommendations 의 definition 참고"""
     tags = set(_split_csv(p.tags))
     facilities = _split_csv(p.facility_types)
+    mall = _shop_market.mall_of(p.mall_code)
     score, reasons = 1.0, []
     if facilities:
         if ctx["facility_type"] in facilities:
             score += 4
-            reasons.append(f"{ctx['facility_type']} 시설 맞춤 상품")
+            reasons.append(f"{ctx['facility_type']} 맞춤 상품")
         else:
             score -= 5
+    # 과목: 우리 학원 과목과 상품 과목이 겹치면 (과목 점수 비례, 최대 +6)
+    subject_rows = {r["subject"]: r for r in ctx.get("subjects", [])}
+    product_subjects = [s for s in _shop_market.subject_tags(p.tags) if s in subject_rows]
+    if product_subjects:
+        best = max(product_subjects, key=lambda s: subject_rows[s]["score"])
+        score += min(6.0, 2 + subject_rows[best]["score"])
+        row = subject_rows[best]
+        reasons.append(f"{row['evidence']} → {best} {'교재·교구' if p.category in ('교재', '수업 교구') else '용품'}")
+    elif _shop_market.subject_tags(p.tags) and subject_rows:
+        score -= 2                                   # 우리 학원에 없는 과목의 전용 상품은 뒤로
+    # 재고 부족: 부족한 물품과 이름·검색어가 맞는 상품 (+4)
+    for low in ctx.get("low_stock", []):
+        if low["shop_product_id"] == p.product_id or (low["terms"] and _shop_text_score(p, low["terms"])):
+            score += 4
+            reasons.append(f"재고 {'품절' if low['status'] == 'OUT' else '부족'}: {low['name']}")
+            break
     for event in ctx["events"]:
         matched = tags.intersection(event["tags"])
         if matched:
@@ -6917,6 +7463,14 @@ def _score_shop_product(p: ShopProduct, ctx: dict, clicks: int) -> tuple:
     elif "단체복" in tags and group > 0:
         score += 1
         reasons.append(f"활성 회원 {ctx['active_members']}명 규모 단체복")
+    if mall["code"] in ctx.get("connected", set()):
+        score += 1.5
+        if mall["member_rate"] > 0:
+            reasons.append(f"연결한 {mall['name']} — 학원 회원가 {round(mall['member_rate'] * 100)}% 추가 할인")
+    rate = _shop_market.discount_rate(p.list_price, p.price)
+    if rate >= 15:
+        score += 1
+        reasons.append(f"정가 대비 {rate}% 할인 중")
     if clicks:
         score += min(3.0, round(clicks ** 0.5, 2))
         reasons.append(f"최근 90일 관리자 조회 {clicks}회")
@@ -6935,7 +7489,7 @@ def list_shop_products(q: str = "", category: str = "", include_inactive: bool =
                        db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
     _ensure_shop_products(db)
     query = db.query(ShopProduct)
-    if not (include_inactive and _facility_role(account) == "owner"):
+    if not (include_inactive and account.email.lower() in PLATFORM_ADMIN_EMAILS):
         query = query.filter(ShopProduct.active.is_(True))
     if category and category != "전체":
         query = query.filter(ShopProduct.category == category)
@@ -6944,7 +7498,135 @@ def list_shop_products(q: str = "", category: str = "", include_inactive: bool =
         pattern = f"%{safe}%"
         query = query.filter(or_(func.lower(ShopProduct.name).like(pattern, escape="\\"),
                                  func.lower(ShopProduct.tags).like(pattern, escape="\\")))
-    return [_shop_product_out(p) for p in query.order_by(ShopProduct.category, ShopProduct.name).limit(200).all()]
+    connected = _connected_malls(db)
+    return [_shop_product_out(p, "catalog", connected) for p in query.order_by(ShopProduct.category, ShopProduct.name).limit(300).all()]
+
+
+# ---------- v10 쇼핑몰 검색 · 맞춤 검색 ----------
+#   검색: 여러 단어(AND) × 상품명·태그·분류·설명 가중치 + 동의어(도복→태권도, 메달→매달 …)
+#   맞춤 검색: 우리 학원 신호(학원 유형·회원 규모·공지/수업 행사 키워드·최근 클릭)로 같은 검색 결과의 순서를 바꿈
+#   필터: 분류 · 가격대 · 단체 인원(최소 주문 수량 이하) · 우리 학원용만 · 견적 문의 상품 포함 여부 · 정렬
+SHOP_SYNONYMS = {
+    "도복": ["태권도", "도복"], "띠": ["태권도", "띠", "승급"], "메달": ["매달"], "단체복": ["야구점퍼", "단체복", "유니폼"],
+    "유니폼": ["단체복", "야구점퍼"], "점퍼": ["야구점퍼"], "자켓": ["야구점퍼"], "재킷": ["야구점퍼"], "기념품": ["기념품", "키링", "굿즈"],
+    "선물": ["선물", "기념품", "키링"], "굿즈": ["굿즈", "기념품", "홍보"], "트로피": ["매달", "시상"], "상장": ["시상", "매달"],
+    "졸업": ["졸업", "수료"], "대회": ["대회", "시합"], "홍보": ["홍보", "모집"], "키홀더": ["키링"],
+}
+SHOP_SORTS = ("relevance", "price_asc", "price_desc", "name", "popular", "discount")
+
+
+def _shop_terms(q: str) -> List[List[str]]:
+    """검색어 → 단어별 (원래 단어 + 동의어) 목록. 단어 사이는 AND, 동의어는 OR"""
+    words = [w for w in re.split(r"[\s,]+", (q or "").strip().lower()) if w][:6]
+    return [list(dict.fromkeys([w] + SHOP_SYNONYMS.get(w, []))) for w in words]
+
+
+def _shop_text_score(p: ShopProduct, terms: List[List[str]]) -> Optional[tuple]:
+    """모든 단어가 어딘가에 맞으면 (점수, 맞은 위치) — 하나라도 안 맞으면 None"""
+    fields = [("name", (p.name or "").lower(), 6), ("tags", (getattr(p, "tags", "") or "").lower(), 4),
+              ("category", (p.category or "").lower(), 3), ("description", (p.description or "").lower(), 1)]
+    score, hits = 0.0, []
+    for alternatives in terms:
+        best = 0
+        for label, value, weight in fields:
+            for i, term in enumerate(alternatives):
+                if term and term in value:
+                    w = weight if i == 0 else weight * 0.7          # 동의어로 맞으면 조금 낮게
+                    if w > best:
+                        best = w
+                        if label not in hits:
+                            hits.append(label)
+        if not best:
+            return None
+        score += best
+    return score, hits
+
+
+@app.get("/api/shop/search")
+def search_shop_products(q: str = Query("", max_length=100), category: str = Query("", max_length=60),
+                         min_price: Optional[int] = Query(None, ge=0, le=100_000_000),
+                         max_price: Optional[int] = Query(None, ge=0, le=100_000_000),
+                         quantity: Optional[int] = Query(None, ge=1, le=10000),
+                         fit: str = Query("all", max_length=10), include_quote: bool = True,
+                         personalize: bool = True, sort: str = Query("relevance", max_length=12),
+                         limit: int = Query(60, ge=1, le=200), mall: str = Query("", max_length=30),
+                         discount_only: bool = False, purchasable_only: bool = False,
+                         db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    _ensure_shop_products(db)
+    if sort not in SHOP_SORTS:
+        raise HTTPException(400, f"정렬은 {', '.join(SHOP_SORTS)} 중 하나여야 합니다.")
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(400, "최저 가격이 최고 가격보다 큽니다.")
+    query = db.query(ShopProduct).filter(ShopProduct.active.is_(True))
+    if category and category != "전체":
+        query = query.filter(ShopProduct.category == category)
+    if mall:
+        query = query.filter(ShopProduct.mall_code == mall)
+    rows = query.limit(500).all()
+    terms = _shop_terms(q)
+    connected = _connected_malls(db)
+    ctx = _shop_context(db) if personalize or fit == "facility" else None
+    clicks = {}
+    if personalize:
+        clicks = dict(db.query(ShopClickEvent.product_id, func.count(ShopClickEvent.event_id))
+                        .filter(ShopClickEvent.created_at >= _now() - timedelta(days=90))
+                        .group_by(ShopClickEvent.product_id).all())
+    items = []
+    for p in rows:
+        matched = _shop_text_score(p, terms) if terms else (0.0, [])
+        if matched is None:
+            continue
+        if p.price is None and not include_quote:
+            continue
+        if p.price is not None and ((min_price is not None and p.price < min_price) or (max_price is not None and p.price > max_price)):
+            continue
+        if quantity is not None and (p.min_quantity or 1) > quantity:
+            continue
+        if discount_only and not _shop_market.discount_rate(p.list_price, p.price):
+            continue
+        if purchasable_only and (p.price is None or _shop_market.mall_of(p.mall_code).get("external")):
+            continue
+        facilities = _split_csv(p.facility_types)
+        if fit == "facility" and facilities and ctx and ctx["facility_type"] not in facilities:
+            continue
+        text_score, hits = matched
+        fit_score, reasons = (_score_shop_product(p, ctx, int(clicks.get(p.product_id, 0))) if personalize and ctx else (0.0, []))
+        if personalize and fit_score <= 0 and not terms:
+            continue                        # 맞춤 검색에서 우리 학원과 맞지 않는 상품은 뺌 (검색어가 있으면 유지)
+        if quantity and (p.min_quantity or 1) > 1:
+            reasons = reasons + [f"{quantity}명 단체 주문 가능 (최소 {p.min_quantity}개)"]
+        items.append({**_shop_product_out(p, "search", connected), "score": round(text_score * 2 + max(fit_score, 0), 2),
+                      "text_score": text_score, "matched_in": hits,
+                      "reasons": [r for r in reasons if r != "기본 추천 상품"] if personalize else [],
+                      "clicks_90d": int(clicks.get(p.product_id, 0))})
+    if sort == "price_asc":
+        items.sort(key=lambda x: (x["price"] is None, x["price"] or 0, x["name"]))
+    elif sort == "price_desc":
+        items.sort(key=lambda x: (x["price"] is None, -(x["price"] or 0), x["name"]))
+    elif sort == "name":
+        items.sort(key=lambda x: x["name"])
+    elif sort == "popular":
+        items.sort(key=lambda x: (-x["clicks_90d"], -x["score"], x["name"]))
+    elif sort == "discount":
+        items.sort(key=lambda x: (-x["discount_rate"], -x["score"], x["name"]))
+    else:
+        items.sort(key=lambda x: (-x["score"], x["name"]))
+    # 추천 검색어: 우리 학원의 행사 키워드 + 상품 태그에서 자주 나오는 단어
+    suggestions = []
+    if ctx:
+        suggestions += [e["keyword"] for e in ctx["events"]]
+    tag_counts: dict = {}
+    for p in rows:
+        for t in _split_csv(p.tags):
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+    suggestions += [t for t, _ in sorted(tag_counts.items(), key=lambda kv: -kv[1])]
+    return {"items": items[:limit], "total": len(items),
+            "suggestions": list(dict.fromkeys(s for s in suggestions if s))[:10],
+            "facility_type": ctx["facility_type"] if ctx else None,
+            "applied": {"q": q.strip(), "category": category or "전체", "min_price": min_price, "max_price": max_price,
+                        "quantity": quantity, "fit": fit, "include_quote": include_quote, "personalize": personalize,
+                        "sort": sort, "mall": mall or None, "discount_only": discount_only, "purchasable_only": purchasable_only},
+            "definition": "점수 = 검색 일치(상품명 6·태그 4·분류 3·설명 1, 동의어 70%) × 2 + 맞춤 점수(과목·재고 부족·행사 키워드·회원 규모·연결한 제휴몰·할인·최근 90일 조회)"}
 
 
 @app.get("/api/shop/recommendations")
@@ -6962,12 +7644,23 @@ def shop_recommendations(limit: int = Query(6, ge=1, le=20), db: Session = Depen
             scored.append((score, p, reasons))
     scored.sort(key=lambda item: (-item[0], item[1].name))
     return {
-        "strategy": "rule_based_v1",
-        "context": {k: v for k, v in ctx.items() if k != "events"} | {
-            "events": [{"label": e["label"], "keyword": e["keyword"], "source": e["source"]} for e in ctx["events"]]},
-        "items": [{**_shop_product_out(p, "recommendation"), "score": score, "reasons": reasons}
+        "strategy": "rule_based_v2",
+        "context": _shop_context_out(ctx),
+        "items": [{**_shop_product_out(p, "recommendation", ctx["connected"]), "score": score, "reasons": reasons}
                   for score, p, reasons in scored[:limit]],
+        "definition": "점수 = 1 + 과목 일치(2 + 과목 점수, 최대 6) + 재고 부족 물품 4 + 행사 키워드 3 + 단체 규모 1~3 "
+                      "+ 연결한 제휴몰 1.5 + 15% 이상 할인 1 + 조회수 √n(최대 3). 과목 점수 = 원장 선택 3 · 개설 수업 2(수업마다) · 학원 소개 1 · 학원 종류 0.8",
     }
+
+
+def _shop_context_out(ctx: dict) -> dict:
+    """화면에 보여 줄 추천 근거 (검색어 분해 결과 등 내부 값은 뺌)"""
+    return {"facility_type": ctx["facility_type"], "active_members": ctx["active_members"],
+            "largest_class": ctx["largest_class"],
+            "events": [{"label": e["label"], "keyword": e["keyword"], "source": e["source"]} for e in ctx["events"]],
+            "subjects": [{"subject": r["subject"], "score": r["score"], "evidence": r["evidence"]} for r in ctx["subjects"]],
+            "connected": sorted(ctx["connected"]),
+            "low_stock": [{"item_id": i["item_id"], "name": i["name"], "status": i["status"]} for i in ctx["low_stock"]]}
 
 
 @app.post("/api/shop/products/{product_id}/click", status_code=201)
@@ -6975,25 +7668,44 @@ def log_shop_click(product_id: int, payload: ShopClickInput, db: Session = Depen
                    account: AdminAccount = Depends(current_account)):
     if not db.query(ShopProduct.product_id).filter(ShopProduct.product_id == product_id).first():
         raise HTTPException(404, "상품을 찾을 수 없습니다.")
-    context = payload.context if payload.context in ("catalog", "recommendation") else "catalog"
+    context = payload.context if payload.context in ("catalog", "recommendation", "search", "inventory") else "catalog"
     db.add(ShopClickEvent(account_id=account.account_id, product_id=product_id, context=context))
     db.commit()
     return {"ok": True}
 
 
-@app.post("/api/shop/products", status_code=201)
-def create_shop_product(payload: ShopProductInput, db: Session = Depends(get_db),
-                        account: AdminAccount = Depends(owner_account)):
+def platform_admin(account: AdminAccount = Depends(current_account)) -> AdminAccount:
+    """쇼핑몰 상품 카탈로그는 모든 학원이 함께 보는 표(학원별로 나뉘지 않음) → 한 학원의 원장이 고치면 다른 학원에도 보임.
+    그래서 상품 추가·수정·비활성화·동기화는 플랫폼 운영자(PLATFORM_ADMIN_EMAILS)만 할 수 있습니다."""
+    if account.email.lower() not in PLATFORM_ADMIN_EMAILS:
+        raise HTTPException(403, "상품 목록은 모든 학원이 함께 쓰므로 플랫폼 운영자만 바꿀 수 있습니다.")
+    return account
+
+
+def _apply_shop_product(row: ShopProduct, payload: ShopProductInput) -> None:
     if not payload.name.strip() or not payload.category.strip():
         raise HTTPException(400, "상품명과 분류를 입력하세요.")
-    row = ShopProduct(
-        external_id=f"manual:{uuid.uuid4().hex[:12]}", name=payload.name.strip()[:200],
-        category=payload.category.strip()[:60], description=payload.description.strip()[:500],
-        price=payload.price if payload.price and payload.price > 0 else None,
-        url=_validate_http_url(payload.url), image_url=(payload.image_url or None) and payload.image_url[:500],
-        tags=payload.tags[:300], facility_types=payload.facility_types[:100],
-        min_quantity=max(1, payload.min_quantity), source="manual", active=payload.active,
-    )
+    mall_code = (payload.mall_code or "").strip() or None
+    if mall_code and mall_code not in _shop_market.MALL_BY_CODE and mall_code != "ddm":
+        raise HTTPException(400, "알 수 없는 제휴몰입니다.")
+    row.name, row.category = payload.name.strip()[:200], payload.category.strip()[:60]
+    row.description = payload.description.strip()[:500]
+    row.price = payload.price if payload.price and payload.price > 0 else None
+    row.list_price = payload.list_price if payload.list_price and row.price and payload.list_price > row.price else None
+    row.unit = (payload.unit or "개").strip()[:20] or "개"
+    row.mall_code = mall_code
+    row.url = (f"/shop?mall={mall_code}" if mall_code in _shop_market.MALL_BY_CODE and not payload.url.strip()
+               else _validate_http_url(payload.url))
+    row.image_url = _validate_image_url(payload.image_url)
+    row.tags, row.facility_types = payload.tags[:300], payload.facility_types[:100]
+    row.min_quantity, row.active = max(1, payload.min_quantity), payload.active
+
+
+@app.post("/api/shop/products", status_code=201)
+def create_shop_product(payload: ShopProductInput, db: Session = Depends(get_db),
+                        account: AdminAccount = Depends(platform_admin)):
+    row = ShopProduct(external_id=f"manual:{uuid.uuid4().hex[:12]}", source="manual")
+    _apply_shop_product(row, payload)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -7002,24 +7714,18 @@ def create_shop_product(payload: ShopProductInput, db: Session = Depends(get_db)
 
 @app.put("/api/shop/products/{product_id}")
 def update_shop_product(product_id: int, payload: ShopProductInput, db: Session = Depends(get_db),
-                        account: AdminAccount = Depends(owner_account)):
+                        account: AdminAccount = Depends(platform_admin)):
     row = db.query(ShopProduct).filter(ShopProduct.product_id == product_id).first()
     if not row:
         raise HTTPException(404, "상품을 찾을 수 없습니다.")
-    row.name, row.category = payload.name.strip()[:200], payload.category.strip()[:60]
-    row.description = payload.description.strip()[:500]
-    row.price = payload.price if payload.price and payload.price > 0 else None
-    row.url = _validate_http_url(payload.url)
-    row.image_url = (payload.image_url or None) and payload.image_url[:500]
-    row.tags, row.facility_types = payload.tags[:300], payload.facility_types[:100]
-    row.min_quantity, row.active = max(1, payload.min_quantity), payload.active
+    _apply_shop_product(row, payload)
     db.commit()
     db.refresh(row)
     return _shop_product_out(row)
 
 
 @app.delete("/api/shop/products/{product_id}", status_code=204)
-def deactivate_shop_product(product_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+def deactivate_shop_product(product_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(platform_admin)):
     """삭제 대신 비활성화(클릭 로그 보존). 시드 상품도 다시 생성되지 않습니다."""
     row = db.query(ShopProduct).filter(ShopProduct.product_id == product_id).first()
     if not row:
@@ -7029,7 +7735,7 @@ def deactivate_shop_product(product_id: int, db: Session = Depends(get_db), acco
 
 
 @app.post("/api/shop/sync")
-def sync_shop_products(db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+def sync_shop_products(db: Session = Depends(get_db), account: AdminAccount = Depends(platform_admin)):
     """쇼핑몰의 {SHOP_BASE_URL}/products.json 을 읽어 카탈로그를 갱신 (형식은 README 참고)"""
     feed_url = os.getenv("SHOP_FEED_URL", f"{SHOP_BASE_URL}/products.json")
     try:
@@ -7067,18 +7773,727 @@ def sync_shop_products(db: Session = Depends(get_db), account: AdminAccount = De
         else:
             updated += 1
         row.name = str(item["name"])[:200]
-        row.category = str(item.get("category") or "기타굿즈")[:60]
+        row.category = str(item.get("category") or "단체복·굿즈")[:60]
+        row.mall_code = row.mall_code or "ddm"
         row.description = str(item.get("description") or "")[:500]
         price = item.get("price")
-        row.price = int(price) if isinstance(price, (int, float)) and price > 0 else None
+        row.price = int(price) if isinstance(price, (int, float)) and 0 < price <= 100_000_000 else None
         row.url = url[:500]
         image = item.get("image") or item.get("image_url")
         row.image_url = _shop_url(str(image))[:500] if image else None
         row.tags, row.facility_types = tags[:300], facility_types[:100]
-        row.min_quantity = max(1, int(item.get("min_quantity") or 1))
+        try:
+            row.min_quantity = min(100_000, max(1, int(item.get("min_quantity") or 1)))
+        except (TypeError, ValueError):
+            row.min_quantity = 1
         row.active = bool(item.get("active", True))
     db.commit()
     return {"feed_url": feed_url, "created": created, "updated": updated}
+
+
+# ---------- v11 제휴몰 연결 · 장바구니 · 주문 · 모의 결제 ----------
+#   상태: PENDING_APPROVAL(직원이 결제 요청) → PENDING_PAYMENT(원장이 만든 주문) → PAID(모의 결제 완료) → RECEIVED(입고) / CANCELED
+#   권한: 주문 만들기·입고 = 직원·원장 / 결제·제휴몰 연결·다른 사람 주문 취소 = 원장
+#   돈: 주문 금액은 서버가 상품 가격으로 계산(shop_market.quote). 결제 시 화면이 본 금액(expected_total)과 다르면 거절
+class ShopCartLine(BaseModel):
+    product_id: int
+    quantity: int = Field(ge=1, le=_shop_market.MAX_LINE_QUANTITY)
+    inventory_item_id: Optional[int] = None          # 재고 관리에서 담은 경우 — 입고 처리 때 이 물품 수량을 늘림
+
+
+class ShopCartIn(BaseModel):
+    items: List[ShopCartLine] = Field(min_length=1, max_length=_shop_market.MAX_CART_LINES)
+
+
+class ShopOrderIn(ShopCartIn):
+    memo: str = Field("", max_length=300)
+
+
+class ShopPayIn(BaseModel):
+    method: str = Field(max_length=20)
+    expected_total: int = Field(ge=0, le=1_000_000_000)
+
+
+class ShopCancelIn(BaseModel):
+    reason: str = Field("", max_length=200)
+
+
+def _quote_cart(db: Session, lines: List[ShopCartLine]) -> dict:
+    _ensure_shop_products(db)
+    merged: dict = {}
+    for line in lines:                                   # 같은 상품이 두 줄이면 합침
+        key = line.product_id
+        if key in merged:
+            merged[key]["quantity"] += line.quantity
+            merged[key]["inventory_item_id"] = merged[key]["inventory_item_id"] or line.inventory_item_id
+        else:
+            merged[key] = {"product_id": line.product_id, "quantity": line.quantity, "inventory_item_id": line.inventory_item_id}
+    products = {p.product_id: p for p in db.query(ShopProduct).filter(ShopProduct.product_id.in_(list(merged))).all()}
+    inv_ids = {m["inventory_item_id"] for m in merged.values() if m["inventory_item_id"]}
+    valid_inv = {i for (i,) in db.query(InventoryItem.item_id).filter(InventoryItem.item_id.in_(inv_ids or {-1}),
+                                                                       InventoryItem.active.is_(True)).all()}
+    lines_in = []
+    for m in merged.values():
+        p = products.get(m["product_id"])
+        if not p:
+            raise HTTPException(404, "장바구니에 없는 상품(삭제된 상품)이 있습니다. 장바구니를 새로 고쳐 주세요.")
+        if m["inventory_item_id"] and m["inventory_item_id"] not in valid_inv:
+            raise HTTPException(400, "연결한 재고 물품을 찾을 수 없습니다.")
+        if _shop_market.mall_of(p.mall_code).get("external"):
+            raise HTTPException(400, f"'{p.name}' 은(는) 외부 쇼핑몰 상품이라 해당 사이트에서 주문해야 합니다.")
+        lines_in.append({"product": {"product_id": p.product_id, "name": p.name, "price": p.price, "list_price": p.list_price,
+                                     "unit": p.unit or "개", "mall_code": p.mall_code, "min_quantity": p.min_quantity,
+                                     "active": bool(p.active)},
+                         "quantity": m["quantity"], "inventory_item_id": m["inventory_item_id"]})
+    try:
+        return _shop_market.quote(lines_in, _connected_malls(db))
+    except _shop_market.QuoteError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _mall_out(mall: dict, connected: set, subjects: List[dict], stats: dict, product_counts: dict) -> dict:
+    subject_rows = {r["subject"]: r for r in subjects}
+    matched = [s for s in mall["subjects"] if s in subject_rows]
+    score = sum(subject_rows[s]["score"] for s in matched) + (1 if not mall["subjects"] else 0)   # 공통몰은 누구에게나 조금
+    reasons = [f"{subject_rows[s]['evidence']} → {s}" for s in matched[:3]]
+    if not mall["subjects"]:
+        reasons.append("모든 학원 공통 소모품")
+    return {"code": mall["code"], "name": mall["name"], "logo": mall["logo"], "color": mall["color"],
+            "tagline": mall["tagline"], "subjects": mall["subjects"], "external": bool(mall.get("external")),
+            "shipping_fee": mall["shipping_fee"], "free_shipping_over": mall["free_shipping_over"],
+            "member_rate": mall["member_rate"], "member_rate_label": f"{round(mall['member_rate'] * 100)}%" if mall["member_rate"] else None,
+            "delivery_days": mall["delivery_days"], "connected": mall["code"] in connected,
+            "product_count": int(product_counts.get(mall["code"], 0)),
+            "recommend_score": round(score, 1), "recommended": bool(matched), "reasons": reasons,
+            "orders": stats.get(mall["code"], {"count": 0, "spent": 0, "saved": 0})}
+
+
+@app.get("/api/shop/malls")
+def list_shop_malls(db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """제휴몰 목록 + 우리 학원 과목과 맞는 정도(추천) + 연결 여부 + 이 학원의 구매 실적"""
+    _ensure_shop_products(db)
+    connected = _connected_malls(db)
+    subjects = _academy_subjects(db)
+    counts = dict(db.query(ShopProduct.mall_code, func.count(ShopProduct.product_id))
+                    .filter(ShopProduct.active.is_(True)).group_by(ShopProduct.mall_code).all())
+    stats: dict = {}
+    for code, count, spent, saved in (db.query(ShopOrderItem.mall_code, func.count(func.distinct(ShopOrderItem.order_id)),
+                                               func.sum(ShopOrderItem.line_total),
+                                               func.sum((ShopOrderItem.list_price - ShopOrderItem.unit_price) * ShopOrderItem.quantity))
+                                        .join(ShopOrder, ShopOrder.order_id == ShopOrderItem.order_id)
+                                        .filter(ShopOrder.status.in_(("PAID", "RECEIVED")))
+                                        .group_by(ShopOrderItem.mall_code).all()):
+        stats[code] = {"count": int(count or 0), "spent": int(spent or 0), "saved": int(saved or 0)}
+    malls = [_mall_out(m, connected, subjects, stats, counts) for m in _shop_market.MALLS]
+    malls.sort(key=lambda m: (not m["connected"], -m["recommend_score"], m["name"]))
+    external = _mall_out({**_shop_market.EXTERNAL_MALL, "name": SHOP_NAME}, connected, subjects, stats, counts)
+    return {"malls": malls, "external": {**external, "url": SHOP_BASE_URL},
+            "subjects": [{"subject": r["subject"], "score": r["score"], "evidence": r["evidence"]} for r in subjects],
+            "all_subjects": _shop_market.SUBJECTS,
+            "definition": "추천 = 제휴몰 취급 과목과 우리 학원 과목(원장 선택·개설 수업·학원 소개·학원 종류)이 겹치는 정도"}
+
+
+@app.post("/api/shop/malls/{code}/connect")
+def connect_shop_mall(code: str, request: Request, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    mall = _shop_market.MALL_BY_CODE.get(code)
+    if not mall:
+        raise HTTPException(404, "제휴몰을 찾을 수 없습니다.")
+    if not db.query(ShopMallLink.link_id).filter(ShopMallLink.mall_code == code).first():
+        db.add(ShopMallLink(mall_code=code, connected_by=account.account_id))
+        _log(db, "admin", account.account_id, "shop.mall_connect", "shop_mall", None, f"{mall['name']} 연결")
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()                     # 동시에 두 번 눌렀을 때
+    return {"code": code, "connected": True,
+            "message": f"{mall['name']}을(를) 연결했습니다. 학원 회원가 {round(mall['member_rate'] * 100)}%가 추가로 적용됩니다."}
+
+
+@app.delete("/api/shop/malls/{code}/connect")
+def disconnect_shop_mall(code: str, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    deleted = db.query(ShopMallLink).filter(ShopMallLink.mall_code == code).delete(synchronize_session=False)
+    if deleted:
+        _log(db, "admin", account.account_id, "shop.mall_disconnect", "shop_mall", None, f"{code} 연결 해제")
+    db.commit()
+    return {"code": code, "connected": False}
+
+
+@app.post("/api/shop/cart/quote")
+def quote_shop_cart(payload: ShopCartIn, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """장바구니 금액 미리 보기 (서버 계산 — 화면은 표시만)"""
+    return _quote_cart(db, payload.items)
+
+
+def _shop_order_out(order: ShopOrder, names: Optional[dict] = None) -> dict:
+    names = names or {}
+    groups: dict = {}
+    for it in order.items:
+        g = groups.setdefault(it.mall_code, {"mall": _mall_brief(it.mall_code), "items": []})
+        g["items"].append({"product_id": it.product_id, "name": it.product_name, "unit": it.unit, "quantity": it.quantity,
+                           "list_price": it.list_price, "unit_price": it.unit_price, "line_total": it.line_total,
+                           "discount_rate": _shop_market.discount_rate(it.list_price, it.unit_price),
+                           "inventory_item_id": it.inventory_item_id})
+    return {"order_id": order.order_id, "order_number": order.order_number, "status": order.status,
+            "status_label": _shop_market.ORDER_STATUSES.get(order.status, order.status),
+            "list_total": order.list_total, "product_discount": order.product_discount,
+            "member_discount": order.member_discount, "shipping_fee": order.shipping_fee, "total": order.total,
+            "saved": order.product_discount + order.member_discount,
+            "payment_method": order.payment_method,
+            "payment_method_label": _shop_market.PAYMENT_METHODS.get(order.payment_method or "", None),
+            "payment_tid": order.payment_tid, "memo": order.memo, "cancel_reason": order.cancel_reason,
+            "ordered_by": names.get(order.account_id), "paid_by": names.get(order.paid_by),
+            "created_at": order.created_at.isoformat() if order.created_at else None,
+            "paid_at": order.paid_at.isoformat() if order.paid_at else None,
+            "received_at": order.received_at.isoformat() if order.received_at else None,
+            "canceled_at": order.canceled_at.isoformat() if order.canceled_at else None,
+            "groups": list(groups.values()), "item_count": len(order.items), "mock_payment": True}
+
+
+def _account_names(db: Session, ids) -> dict:
+    ids = {i for i in ids if i}
+    return dict(db.query(AdminAccount.account_id, AdminAccount.username).filter(AdminAccount.account_id.in_(ids or {-1})).all())
+
+
+def _shop_order_or_404(db: Session, order_id: int, lock: bool = False) -> ShopOrder:
+    query = db.query(ShopOrder).filter(ShopOrder.order_id == order_id)
+    row = (query.with_for_update() if lock else query).first()
+    if not row:
+        raise HTTPException(404, "주문을 찾을 수 없습니다.")
+    return row
+
+
+@app.post("/api/shop/orders", status_code=201)
+def create_shop_order(payload: ShopOrderIn, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """장바구니 → 주문서. 원장이 만들면 '결제 대기', 직원이 만들면 '원장 승인 대기'(원장에게 알림)"""
+    quote = _quote_cart(db, payload.items)
+    role = _facility_role(account)
+    order = ShopOrder(order_number=f"SO-{_today():%Y%m%d}-{secrets.token_hex(3).upper()}", account_id=account.account_id,
+                      status="PENDING_PAYMENT" if role == "owner" else "PENDING_APPROVAL",
+                      list_total=quote["list_total"], product_discount=quote["product_discount"],
+                      member_discount=quote["member_discount"], shipping_fee=quote["shipping_fee"], total=quote["total"],
+                      memo=payload.memo.strip())
+    for g in quote["groups"]:
+        for it in g["items"]:
+            order.items.append(ShopOrderItem(product_id=it["product_id"], mall_code=g["mall"]["code"], product_name=it["name"][:200],
+                                             unit=it["unit"][:20], quantity=it["quantity"], list_price=it["list_price"],
+                                             unit_price=it["unit_price"], line_total=it["line_total"],
+                                             inventory_item_id=it.get("inventory_item_id")))
+    db.add(order)
+    db.flush()
+    first = quote["groups"][0]["items"][0]["name"]
+    more = sum(len(g["items"]) for g in quote["groups"]) - 1
+    summary = f"{first}{f' 외 {more}건' if more > 0 else ''} · {order.total:,}원"
+    if order.status == "PENDING_APPROVAL":
+        _notify_admins(db, "PURCHASE", f"쇼핑몰 결제 요청: {summary}",
+                       f"{account.username or '직원'} 님이 결제를 요청했습니다." + (f" 메모: {order.memo[:80]}" if order.memo else ""),
+                       "shop?tab=orders")
+    _log(db, "admin", account.account_id, "shop.order", "shop_order", order.order_id, summary)
+    db.commit()
+    db.refresh(order)
+    return _shop_order_out(order, _account_names(db, [order.account_id]))
+
+
+@app.get("/api/shop/orders")
+def list_shop_orders(status: str = Query("", max_length=20), db: Session = Depends(get_db),
+                     account: AdminAccount = Depends(current_account)):
+    query = db.query(ShopOrder).options(selectinload(ShopOrder.items))
+    if status in _shop_market.ORDER_STATUSES:
+        query = query.filter(ShopOrder.status == status)
+    rows = query.order_by(ShopOrder.created_at.desc(), ShopOrder.order_id.desc()).limit(200).all()
+    names = _account_names(db, [r.account_id for r in rows] + [r.paid_by for r in rows])
+    month_start = _today().replace(day=1)
+    done = (db.query(func.coalesce(func.sum(ShopOrder.total), 0),
+                     func.coalesce(func.sum(ShopOrder.product_discount + ShopOrder.member_discount), 0), func.count(ShopOrder.order_id))
+              .filter(ShopOrder.status.in_(("PAID", "RECEIVED")), ShopOrder.paid_at >= datetime.combine(month_start, time.min)).first())
+    waiting = dict(db.query(ShopOrder.status, func.count(ShopOrder.order_id))
+                     .filter(ShopOrder.status.in_(_shop_market.OPEN_ORDER_STATUSES)).group_by(ShopOrder.status).all())
+    return {"orders": [_shop_order_out(r, names) for r in rows],
+            "summary": {"month_spent": int(done[0] or 0), "month_saved": int(done[1] or 0), "month_orders": int(done[2] or 0),
+                        "pending_approval": int(waiting.get("PENDING_APPROVAL", 0)),
+                        "pending_payment": int(waiting.get("PENDING_PAYMENT", 0)), "to_receive": int(waiting.get("PAID", 0))},
+            "payment_methods": _shop_market.PAYMENT_METHODS,
+            "definitions": {"month_spent": "이번 달 결제 완료(입고 포함) 주문의 결제 금액 합계",
+                            "month_saved": "같은 주문의 (정가 − 결제 단가) × 수량 합계 = 상품 할인 + 학원 회원가 할인"}}
+
+
+@app.get("/api/shop/orders/{order_id}")
+def get_shop_order(order_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    order = _shop_order_or_404(db, order_id)
+    return _shop_order_out(order, _account_names(db, [order.account_id, order.paid_by]))
+
+
+@app.post("/api/shop/orders/{order_id}/pay")
+def pay_shop_order(order_id: int, payload: ShopPayIn, db: Session = Depends(get_db),
+                   account: AdminAccount = Depends(owner_account)):
+    """모의 결제 — 실제 결제 대행사(PG)를 부르지 않고 승인 번호만 만듭니다. 실제 연동 시 이 함수가 PG 승인 콜백 자리입니다."""
+    if payload.method not in _shop_market.PAYMENT_METHODS:
+        raise HTTPException(400, "지원하지 않는 결제 수단입니다.")
+    order = _shop_order_or_404(db, order_id, lock=True)
+    if order.status not in ("PENDING_APPROVAL", "PENDING_PAYMENT"):
+        raise HTTPException(409, f"이미 {_shop_market.ORDER_STATUSES.get(order.status, order.status)} 상태인 주문입니다.")
+    if payload.expected_total != order.total:
+        raise HTTPException(409, f"결제 금액이 주문 금액({order.total:,}원)과 다릅니다. 주문서를 새로 고친 뒤 다시 결제하세요.")
+    order.status, order.payment_method = "PAID", payload.method
+    order.payment_tid = f"MOCK-{secrets.token_hex(6).upper()}"
+    order.paid_by, order.paid_at = account.account_id, _now()
+    # 재고 관리의 '구매 요청'이 걸려 있던 물품은 승인 처리 (결제 = 구매 결정)
+    inv_ids = {it.inventory_item_id for it in order.items if it.inventory_item_id}
+    if inv_ids:
+        for req in db.query(PurchaseRequest).filter(PurchaseRequest.item_id.in_(inv_ids), PurchaseRequest.status == "REQUESTED").all():
+            req.status, req.decided_by, req.decided_at = "APPROVED", account.account_id, _now()
+            req.decision_note = f"쇼핑몰 주문 {order.order_number} 결제"[:200]
+    if order.account_id != account.account_id:
+        user_id = _account_user_id(db, order.account_id)
+        if user_id:
+            db.add(Notification(user_id=user_id, audience="admin", kind="PURCHASE",
+                                title=f"쇼핑몰 주문 결제 완료: {order.order_number}",
+                                body=f"{order.total:,}원 · 물건이 도착하면 '입고 처리'를 눌러 재고에 반영하세요.", link="shop?tab=orders"))
+    _log(db, "admin", account.account_id, "shop.pay", "shop_order", order.order_id,
+         f"모의 결제 {order.total:,}원 ({_shop_market.PAYMENT_METHODS[payload.method]})")
+    db.commit()
+    db.refresh(order)
+    return _shop_order_out(order, _account_names(db, [order.account_id, order.paid_by]))
+
+
+@app.post("/api/shop/orders/{order_id}/receive")
+def receive_shop_order(order_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """입고 처리 — 연결된 재고 물품(담을 때 고른 물품, 또는 이 상품과 연결해 둔 물품)의 수량을 주문 수량만큼 늘림"""
+    order = _shop_order_or_404(db, order_id, lock=True)
+    if order.status != "PAID":
+        raise HTTPException(409, "결제가 끝난 주문만 입고 처리할 수 있습니다.")
+    product_ids = {it.product_id for it in order.items}
+    linked = {}
+    for inv in db.query(InventoryItem).filter(InventoryItem.active.is_(True), InventoryItem.shop_product_id.in_(product_ids or {-1})).all():
+        linked.setdefault(inv.shop_product_id, inv)
+    explicit_ids = {it.inventory_item_id for it in order.items if it.inventory_item_id}
+    explicit = {i.item_id: i for i in db.query(InventoryItem).filter(InventoryItem.item_id.in_(explicit_ids or {-1})).all()}
+    applied = []
+    for it in order.items:
+        inv = explicit.get(it.inventory_item_id) or linked.get(it.product_id)
+        if not inv or not inv.active:
+            continue
+        _change_stock(db, inv, it.quantity, "PURCHASE", f"쇼핑몰 주문 {order.order_number}", account.account_id)
+        applied.append({"item_id": inv.item_id, "name": inv.name, "added": it.quantity, "quantity": inv.quantity, "unit": inv.unit})
+        for req in db.query(PurchaseRequest).filter(PurchaseRequest.item_id == inv.item_id,
+                                                    PurchaseRequest.status.in_(("REQUESTED", "APPROVED"))).all():
+            req.status, req.received_at = "RECEIVED", _now()
+    order.status, order.received_at = "RECEIVED", _now()
+    _log(db, "admin", account.account_id, "shop.receive", "shop_order", order.order_id, f"입고 처리 · 재고 반영 {len(applied)}건")
+    db.commit()
+    db.refresh(order)
+    return {**_shop_order_out(order, _account_names(db, [order.account_id, order.paid_by])), "inventory_applied": applied}
+
+
+@app.post("/api/shop/orders/{order_id}/cancel")
+def cancel_shop_order(order_id: int, payload: ShopCancelIn, db: Session = Depends(get_db),
+                      account: AdminAccount = Depends(current_account)):
+    """취소 — 원장: 입고 전 모든 주문(결제 완료면 모의 환불) / 직원: 본인이 요청한 승인 대기 주문만"""
+    order = _shop_order_or_404(db, order_id, lock=True)
+    if order.status not in _shop_market.OPEN_ORDER_STATUSES:
+        raise HTTPException(409, "이미 입고되었거나 취소된 주문입니다.")
+    if _facility_role(account) != "owner" and not (order.status == "PENDING_APPROVAL" and order.account_id == account.account_id):
+        raise HTTPException(403, "결제된 주문이나 다른 사람의 주문은 원장만 취소할 수 있습니다.")
+    refunded = order.status == "PAID"
+    order.status, order.canceled_at = "CANCELED", _now()
+    order.cancel_reason = (payload.reason.strip() or ("모의 환불" if refunded else "주문 취소"))[:200]
+    _log(db, "admin", account.account_id, "shop.cancel", "shop_order", order.order_id,
+         f"주문 취소{' · 모의 환불 ' + format(order.total, ',') + '원' if refunded else ''}")
+    db.commit()
+    db.refresh(order)
+    return {**_shop_order_out(order, _account_names(db, [order.account_id, order.paid_by])), "refunded": refunded}
+
+
+# =====================================================================
+# v10 재고 관리 · 구매 확인 (/api/inventory/*) — 직원도 사용, 구매 승인·물품 삭제는 원장만
+#   지표 정의
+#     부족 = 현재 수량 ≤ 안전 재고(min_quantity, 0 이면 확인 안 함) / 품절 = 현재 수량 0
+#     권장 구매 수량 = 안전 재고 × 2 − 현재 수량 (안전 재고의 2배까지 채움, 최소 1)
+# =====================================================================
+INVENTORY_REASONS = {"IN": "입고", "OUT": "사용·출고", "ADJUST": "재고 조정", "PURCHASE": "구매 입고"}
+PURCHASE_STATUSES = {"REQUESTED": "승인 대기", "APPROVED": "승인(구매 진행)", "REJECTED": "반려",
+                     "RECEIVED": "입고 완료", "CANCELED": "취소"}
+OPEN_PURCHASE = ("REQUESTED", "APPROVED")
+
+
+class InventoryItemIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    category: str = Field("소모품", max_length=40)
+    unit: str = Field("개", min_length=1, max_length=20)
+    quantity: int = Field(0, ge=0, le=1_000_000)
+    min_quantity: int = Field(0, ge=0, le=1_000_000)
+    location: str = Field("", max_length=100)
+    note: str = Field("", max_length=300)
+    shop_product_id: Optional[int] = None
+    b2b_sku: Optional[str] = Field(None, max_length=40)
+    keyword: str = Field("", max_length=100)
+
+
+class InventoryUpdateIn(InventoryItemIn):
+    quantity: Optional[int] = Field(None, ge=0, le=1_000_000)   # 수량은 입출고로 바꾸는 것을 권장 (보내면 '재고 조정' 기록)
+
+
+class InventoryAdjustIn(BaseModel):
+    change: int = Field(ge=-1_000_000, le=1_000_000)
+    reason: str = Field("ADJUST", max_length=12)
+    note: str = Field("", max_length=200)
+
+
+class PurchaseRequestIn(BaseModel):
+    item_id: int
+    quantity: int = Field(ge=1, le=100_000)
+    note: str = Field("", max_length=300)
+
+
+class PurchaseDecisionIn(BaseModel):
+    decision: str = Field(max_length=10)          # APPROVED / REJECTED
+    note: str = Field("", max_length=200)
+
+
+class PurchaseReceiveIn(BaseModel):
+    quantity: Optional[int] = Field(None, ge=1, le=100_000)     # 비우면 요청 수량 그대로 입고
+    note: str = Field("", max_length=200)
+
+
+def _stock_status(item: InventoryItem) -> str:
+    if (item.quantity or 0) <= 0:
+        return "OUT"
+    if item.min_quantity and item.quantity <= item.min_quantity:
+        return "LOW"
+    return "OK"
+
+
+def _suggested_quantity(item: InventoryItem) -> int:
+    if not item.min_quantity and (item.quantity or 0) > 0:
+        return 0
+    return max(1, (item.min_quantity or 1) * 2 - (item.quantity or 0))
+
+
+def _open_requests(db: Session, item_ids: List[int]) -> dict:
+    rows = (db.query(PurchaseRequest).filter(PurchaseRequest.item_id.in_(item_ids or [-1]),
+                                            PurchaseRequest.status.in_(OPEN_PURCHASE))
+              .order_by(PurchaseRequest.created_at.desc()).all())
+    out: dict = {}
+    for r in rows:
+        out.setdefault(r.item_id, r)
+    return out
+
+
+def _purchase_out(r: PurchaseRequest, item_names: Optional[dict] = None, names: Optional[dict] = None) -> dict:
+    return {"request_id": r.request_id, "item_id": r.item_id, "item_name": (item_names or {}).get(r.item_id),
+            "quantity": r.quantity, "status": r.status, "status_label": PURCHASE_STATUSES.get(r.status, r.status),
+            "note": r.note, "decision_note": r.decision_note,
+            "requested_by": (names or {}).get(r.requested_by), "decided_by": (names or {}).get(r.decided_by),
+            "created_at": r.created_at.isoformat(timespec="minutes") if r.created_at else None,
+            "decided_at": r.decided_at.isoformat(timespec="minutes") if r.decided_at else None,
+            "received_at": r.received_at.isoformat(timespec="minutes") if r.received_at else None}
+
+
+def _item_out(item: InventoryItem, open_request: Optional[PurchaseRequest] = None, shop_names: Optional[dict] = None) -> dict:
+    status = _stock_status(item)
+    return {"item_id": item.item_id, "name": item.name, "category": item.category, "unit": item.unit,
+            "quantity": item.quantity, "min_quantity": item.min_quantity, "location": item.location, "note": item.note,
+            "shop_product_id": item.shop_product_id, "shop_product_name": (shop_names or {}).get(item.shop_product_id),
+            "b2b_sku": item.b2b_sku, "keyword": item.keyword,
+            "status": status, "status_label": {"OK": "충분", "LOW": "부족", "OUT": "품절"}[status],
+            "suggested_quantity": _suggested_quantity(item) if status != "OK" else 0,
+            "open_request": _purchase_out(open_request) if open_request else None,
+            "updated_at": item.updated_at.isoformat(timespec="minutes") if item.updated_at else None}
+
+
+def _inventory_item_or_404(db: Session, item_id: int) -> InventoryItem:
+    item = db.query(InventoryItem).filter(InventoryItem.item_id == item_id, InventoryItem.active.is_(True)).first()
+    if not item:
+        raise HTTPException(404, "재고 물품을 찾을 수 없습니다.")
+    return item
+
+
+def _validate_inventory_links(db: Session, payload: InventoryItemIn) -> None:
+    if payload.shop_product_id and not db.query(ShopProduct.product_id).filter(ShopProduct.product_id == payload.shop_product_id).first():
+        raise HTTPException(400, "연결할 쇼핑몰 상품을 찾을 수 없습니다.")
+    if payload.b2b_sku:
+        _ensure_b2b_products(db)
+    if payload.b2b_sku and not db.query(B2BProduct.product_id).filter(B2BProduct.sku == payload.b2b_sku.strip()).first():
+        raise HTTPException(400, "연결할 B2B 상품 코드(SKU)를 찾을 수 없습니다.")
+
+
+def _change_stock(db: Session, item: InventoryItem, change: int, reason: str, note: str, account_id: Optional[int]) -> None:
+    """재고 수량 변경 + 기록 + (부족 기준을 새로 넘으면) 원장 알림. 음수 재고는 허용하지 않음"""
+    before_status = _stock_status(item)
+    after = (item.quantity or 0) + change
+    if after < 0:
+        raise HTTPException(409, f"현재 재고({item.quantity}{item.unit})보다 많이 출고할 수 없습니다.")
+    item.quantity = after
+    item.updated_at = _now()
+    db.add(InventoryLog(item_id=item.item_id, change=change, quantity_after=after, reason=reason,
+                        note=(note or "")[:200], account_id=account_id))
+    after_status = _stock_status(item)
+    if after_status != "OK" and before_status == "OK":
+        _notify_admins(db, "INVENTORY", f"재고 {'품절' if after_status == 'OUT' else '부족'}: {item.name}",
+                       f"현재 {after}{item.unit} · 안전 재고 {item.min_quantity}{item.unit}. 구매 확인 화면에서 구매 여부를 정해 주세요.",
+                       "inventory?tab=check")
+
+
+def _account_user_id(db: Session, account_id: Optional[int]) -> Optional[int]:
+    if not account_id:
+        return None
+    return (db.query(AppUser.user_id).join(AdminAccount, func.lower(AdminAccount.email) == func.lower(AppUser.email))
+              .filter(AdminAccount.account_id == account_id).scalar())
+
+
+@app.get("/api/inventory")
+def list_inventory(q: str = Query("", max_length=50), category: str = Query("", max_length=40),
+                   status: str = Query("", max_length=5), db: Session = Depends(get_db),
+                   account: AdminAccount = Depends(current_account)):
+    query = db.query(InventoryItem).filter(InventoryItem.active.is_(True))
+    if category and category != "전체":
+        query = query.filter(InventoryItem.category == category)
+    if q.strip():
+        query = query.filter(or_(InventoryItem.name.like(_like_pattern(q), escape="\\"),
+                                 InventoryItem.location.like(_like_pattern(q), escape="\\")))
+    items = query.order_by(InventoryItem.category, InventoryItem.name).limit(500).all()
+    opened = _open_requests(db, [i.item_id for i in items])
+    shop_names = dict(db.query(ShopProduct.product_id, ShopProduct.name)
+                        .filter(ShopProduct.product_id.in_({i.shop_product_id for i in items if i.shop_product_id} or {-1})).all())
+    rows = [_item_out(i, opened.get(i.item_id), shop_names) for i in items]
+    if status in ("OK", "LOW", "OUT"):
+        rows = [r for r in rows if r["status"] == status]
+    all_items = db.query(InventoryItem).filter(InventoryItem.active.is_(True)).all()
+    states = [_stock_status(i) for i in all_items]
+    pending = db.query(func.count(PurchaseRequest.request_id)).filter(PurchaseRequest.status == "REQUESTED").scalar() or 0
+    return {"items": rows,
+            "summary": {"total": len(all_items), "low": states.count("LOW"), "out": states.count("OUT"),
+                        "pending_requests": int(pending)},
+            "categories": sorted({i.category for i in all_items}),
+            "definitions": {"low": "부족 = 현재 수량 ≤ 안전 재고", "out": "품절 = 현재 수량 0",
+                            "suggested": "권장 구매 수량 = 안전 재고 × 2 − 현재 수량"}}
+
+
+@app.post("/api/inventory", status_code=201)
+def create_inventory_item(payload: InventoryItemIn, request: Request, db: Session = Depends(get_db),
+                          account: AdminAccount = Depends(current_account)):
+    _validate_inventory_links(db, payload)
+    if db.query(func.count(InventoryItem.item_id)).filter(InventoryItem.active.is_(True)).scalar() >= 500:
+        raise HTTPException(400, "재고 물품은 500개까지 등록할 수 있습니다.")
+    item = InventoryItem(**{**payload.model_dump(exclude={"quantity"}), "name": payload.name.strip(),
+                            "b2b_sku": (payload.b2b_sku or "").strip() or None}, quantity=0)
+    db.add(item); db.flush()
+    if payload.quantity:
+        _change_stock(db, item, payload.quantity, "IN", "최초 등록", account.account_id)
+    _log(db, "admin", account.account_id, "inventory.create", "inventory", item.item_id, item.name[:100])
+    db.commit(); db.refresh(item)
+    return _item_out(item)
+
+
+@app.put("/api/inventory/{item_id}")
+def update_inventory_item(item_id: int, payload: InventoryUpdateIn, db: Session = Depends(get_db),
+                          account: AdminAccount = Depends(current_account)):
+    item = _inventory_item_or_404(db, item_id)
+    _validate_inventory_links(db, payload)
+    before = _stock_status(item)
+    for key, value in payload.model_dump(exclude={"quantity"}).items():
+        setattr(item, key, value.strip() if isinstance(value, str) else value)
+    item.b2b_sku = (payload.b2b_sku or "").strip() or None
+    if payload.quantity is not None and payload.quantity != item.quantity:
+        _change_stock(db, item, payload.quantity - (item.quantity or 0), "ADJUST", "수량 직접 수정", account.account_id)
+    elif before == "OK" and _stock_status(item) != "OK":      # 안전 재고를 올려 '부족'이 된 경우도 알림
+        _notify_admins(db, "INVENTORY", f"재고 부족: {item.name}",
+                       f"현재 {item.quantity}{item.unit} · 안전 재고 {item.min_quantity}{item.unit}", "inventory?tab=check")
+    db.commit(); db.refresh(item)
+    return _item_out(item, _open_requests(db, [item_id]).get(item_id))
+
+
+@app.delete("/api/inventory/{item_id}", status_code=204)
+def delete_inventory_item(item_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    """삭제 = 숨김(active=false). 입출고·구매 기록은 보존"""
+    item = _inventory_item_or_404(db, item_id)
+    item.active = False
+    db.query(PurchaseRequest).filter(PurchaseRequest.item_id == item_id, PurchaseRequest.status.in_(OPEN_PURCHASE)).update(
+        {"status": "CANCELED", "decided_at": _now(), "decided_by": account.account_id}, synchronize_session=False)
+    db.commit()
+
+
+@app.post("/api/inventory/{item_id}/adjust")
+def adjust_inventory(item_id: int, payload: InventoryAdjustIn, db: Session = Depends(get_db),
+                     account: AdminAccount = Depends(current_account)):
+    """입고(+)·사용(−)·조정. reason: IN / OUT / ADJUST"""
+    if payload.change == 0:
+        raise HTTPException(400, "변경할 수량을 입력하세요.")
+    if payload.reason not in ("IN", "OUT", "ADJUST"):
+        raise HTTPException(400, "사유는 IN(입고) / OUT(사용·출고) / ADJUST(조정) 중 하나여야 합니다.")
+    if (payload.reason == "IN" and payload.change < 0) or (payload.reason == "OUT" and payload.change > 0):
+        raise HTTPException(400, "입고는 + 수량, 사용·출고는 − 수량으로 입력하세요.")
+    item = _inventory_item_or_404(db, item_id)
+    _change_stock(db, item, payload.change, payload.reason, payload.note.strip(), account.account_id)
+    db.commit(); db.refresh(item)
+    return _item_out(item, _open_requests(db, [item_id]).get(item_id))
+
+
+@app.get("/api/inventory/{item_id}/logs")
+def inventory_logs(item_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    _inventory_item_or_404(db, item_id)
+    rows = (db.query(InventoryLog).filter(InventoryLog.item_id == item_id)
+              .order_by(InventoryLog.created_at.desc(), InventoryLog.log_id.desc()).limit(100).all())
+    names = dict(db.query(AdminAccount.account_id, AdminAccount.username)
+                   .filter(AdminAccount.account_id.in_({r.account_id for r in rows if r.account_id} or {-1})).all())
+    return [{"log_id": r.log_id, "change": r.change, "quantity_after": r.quantity_after, "reason": r.reason,
+             "reason_label": INVENTORY_REASONS.get(r.reason, r.reason), "note": r.note, "by": names.get(r.account_id),
+             "created_at": r.created_at.isoformat(timespec="minutes") if r.created_at else None} for r in rows]
+
+
+_SHOP_OPTION_KEYS = ("product_id", "name", "url", "price_label", "min_quantity", "price", "list_price", "discount_rate",
+                     "member_price", "unit", "mall", "purchasable", "external_link")
+
+
+def _purchase_options(db: Session, item: InventoryItem, quantity: int, account: AdminAccount, shop_rows: list,
+                      b2b_rows: list) -> List[dict]:
+    """부족한 물품을 살 수 있는 곳: 연결한 상품 → 이름·검색어로 찾은 쇼핑몰·B2B 상품 (최대 3개)"""
+    options = []
+    terms = _shop_terms(item.keyword or item.name)
+    if item.b2b_sku:
+        product = next((b for b in b2b_rows if b.sku == item.b2b_sku), None)
+        if product:
+            qty = max(quantity, product.minimum_quantity or 1)
+            unit_price = _b2b_unit_price(product, qty, account)
+            options.append({"type": "b2b", "label": "B2B 발주(연결된 상품)", "name": product.name, "sku": product.sku,
+                            "quantity": qty, "unit_price": unit_price, "estimated_total": unit_price * qty, "linked": True})
+    if item.shop_product_id:
+        product = next((p for p in shop_rows if p.product_id == item.shop_product_id), None)
+        if product:
+            options.append({"type": "shop", "label": "쇼핑몰(연결된 상품)", "linked": True,
+                            **{k: v for k, v in _shop_product_out(product, "inventory").items()
+                               if k in _SHOP_OPTION_KEYS}})
+    scored = []
+    for product in b2b_rows:
+        if product.sku == item.b2b_sku:
+            continue
+        hit = _shop_text_score(product, terms) if terms else None
+        if hit:
+            scored.append((hit[0], "b2b", product))
+    for product in shop_rows:
+        if product.product_id == item.shop_product_id:
+            continue
+        hit = _shop_text_score(product, terms) if terms else None
+        if hit:
+            scored.append((hit[0], "shop", product))
+    for _, kind, product in sorted(scored, key=lambda x: -x[0])[: max(0, 3 - len(options))]:
+        if kind == "b2b":
+            qty = max(quantity, product.minimum_quantity or 1)
+            unit_price = _b2b_unit_price(product, qty, account)
+            options.append({"type": "b2b", "label": "B2B 발주(이름으로 찾음)", "name": product.name, "sku": product.sku,
+                            "quantity": qty, "unit_price": unit_price, "estimated_total": unit_price * qty, "linked": False})
+        else:
+            options.append({"type": "shop", "label": "쇼핑몰(이름으로 찾음)", "linked": False,
+                            **{k: v for k, v in _shop_product_out(product, "inventory").items()
+                               if k in _SHOP_OPTION_KEYS}})
+    return options
+
+
+@app.get("/api/inventory/purchase-check")
+def purchase_check(db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    """구매 확인: 부족·품절 물품 + 권장 수량 + 살 수 있는 곳(쇼핑몰·B2B) + 진행 중인 구매 요청"""
+    _ensure_shop_products(db)
+    _ensure_b2b_products(db)
+    items = db.query(InventoryItem).filter(InventoryItem.active.is_(True)).all()
+    need = [i for i in items if _stock_status(i) != "OK"]
+    opened = _open_requests(db, [i.item_id for i in need])
+    shop_rows = db.query(ShopProduct).filter(ShopProduct.active.is_(True)).all()
+    b2b_rows = db.query(B2BProduct).filter(B2BProduct.active.is_(True)).all()
+    out = []
+    for item in sorted(need, key=lambda i: (_stock_status(i) != "OUT", i.name)):
+        qty = _suggested_quantity(item)
+        out.append({**_item_out(item, opened.get(item.item_id)), "options": _purchase_options(db, item, qty, account, shop_rows, b2b_rows)})
+    return {"items": out, "count": len(out),
+            "definition": "부족 = 현재 수량 ≤ 안전 재고, 권장 구매 수량 = 안전 재고 × 2 − 현재 수량"}
+
+
+@app.get("/api/inventory/requests")
+def list_purchase_requests(status: str = Query("", max_length=10), db: Session = Depends(get_db),
+                           account: AdminAccount = Depends(current_account)):
+    query = db.query(PurchaseRequest)
+    if status in PURCHASE_STATUSES:
+        query = query.filter(PurchaseRequest.status == status)
+    rows = query.order_by(PurchaseRequest.status != "REQUESTED", PurchaseRequest.created_at.desc()).limit(200).all()
+    item_names = dict(db.query(InventoryItem.item_id, InventoryItem.name)
+                        .filter(InventoryItem.item_id.in_({r.item_id for r in rows} or {-1})).all())
+    account_ids = {r.requested_by for r in rows if r.requested_by} | {r.decided_by for r in rows if r.decided_by}
+    names = dict(db.query(AdminAccount.account_id, AdminAccount.username).filter(AdminAccount.account_id.in_(account_ids or {-1})).all())
+    return [_purchase_out(r, item_names, names) for r in rows]
+
+
+@app.post("/api/inventory/requests", status_code=201)
+def create_purchase_request(payload: PurchaseRequestIn, db: Session = Depends(get_db),
+                            account: AdminAccount = Depends(current_account)):
+    """구매 요청 (직원·원장). 원장에게 '구매 확인' 알림 — 원장이 승인/반려로 구매 여부를 정함"""
+    item = _inventory_item_or_404(db, payload.item_id)
+    if _open_requests(db, [item.item_id]).get(item.item_id):
+        raise HTTPException(409, "이미 진행 중인 구매 요청이 있습니다. 요청 내역에서 확인하세요.")
+    row = PurchaseRequest(item_id=item.item_id, quantity=payload.quantity, note=payload.note.strip(),
+                          requested_by=account.account_id, status="REQUESTED")
+    db.add(row); db.flush()
+    _notify_admins(db, "PURCHASE", f"구매 확인 요청: {item.name} {payload.quantity}{item.unit}",
+                   f"현재 {item.quantity}{item.unit} · 요청 {account.username or '관리자'}" + (f" · {row.note[:80]}" if row.note else ""),
+                   "inventory?tab=requests")
+    _log(db, "admin", account.account_id, "inventory.request", "inventory", item.item_id, f"구매 요청 {payload.quantity}{item.unit}")
+    db.commit(); db.refresh(row)
+    return _purchase_out(row, {item.item_id: item.name}, {account.account_id: account.username})
+
+
+def _purchase_or_404(db: Session, request_id: int) -> PurchaseRequest:
+    row = db.query(PurchaseRequest).filter(PurchaseRequest.request_id == request_id).with_for_update().first()
+    if not row:
+        raise HTTPException(404, "구매 요청을 찾을 수 없습니다.")
+    return row
+
+
+@app.post("/api/inventory/requests/{request_id}/decide")
+def decide_purchase_request(request_id: int, payload: PurchaseDecisionIn, db: Session = Depends(get_db),
+                            account: AdminAccount = Depends(owner_account)):
+    """구매 여부 확인 (원장): APPROVED = 구매 진행 / REJECTED = 구매하지 않음"""
+    if payload.decision not in ("APPROVED", "REJECTED"):
+        raise HTTPException(400, "decision 은 APPROVED(구매) 또는 REJECTED(반려) 여야 합니다.")
+    row = _purchase_or_404(db, request_id)
+    if row.status != "REQUESTED":
+        raise HTTPException(409, "승인 대기 중인 요청만 처리할 수 있습니다.")
+    item = db.query(InventoryItem).filter(InventoryItem.item_id == row.item_id).first()
+    row.status, row.decided_by, row.decided_at = payload.decision, account.account_id, _now()
+    row.decision_note = payload.note.strip() or None
+    requester = _account_user_id(db, row.requested_by)
+    if requester and row.requested_by != account.account_id:
+        db.add(Notification(user_id=requester, audience="admin", kind="PURCHASE", link="inventory?tab=requests",
+                            title=f"구매 요청 {'승인' if payload.decision == 'APPROVED' else '반려'}: {item.name if item else ''}",
+                            body=row.decision_note or ("구매를 진행해 주세요. 물품이 도착하면 '입고 처리'를 눌러 주세요."
+                                                       if payload.decision == "APPROVED" else "")))
+    _log(db, "admin", account.account_id, f"inventory.{payload.decision.lower()}", "inventory", row.item_id,
+         f"구매 요청 #{row.request_id}")
+    db.commit()
+    return _purchase_out(row, {row.item_id: item.name if item else None})
+
+
+@app.post("/api/inventory/requests/{request_id}/receive")
+def receive_purchase_request(request_id: int, payload: PurchaseReceiveIn, db: Session = Depends(get_db),
+                             account: AdminAccount = Depends(current_account)):
+    """물품 도착 → 재고에 더하고 요청을 '입고 완료'로. 승인된 요청만"""
+    row = _purchase_or_404(db, request_id)
+    if row.status != "APPROVED":
+        raise HTTPException(409, "원장이 승인한 구매 요청만 입고 처리할 수 있습니다.")
+    item = _inventory_item_or_404(db, row.item_id)
+    qty = payload.quantity or row.quantity
+    _change_stock(db, item, qty, "PURCHASE", payload.note.strip() or f"구매 요청 #{row.request_id} 입고", account.account_id)
+    row.status, row.received_at = "RECEIVED", _now()
+    db.commit(); db.refresh(item)
+    return {"request": _purchase_out(row, {item.item_id: item.name}), "item": _item_out(item)}
+
+
+@app.post("/api/inventory/requests/{request_id}/cancel")
+def cancel_purchase_request(request_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    row = _purchase_or_404(db, request_id)
+    if row.status not in OPEN_PURCHASE:
+        raise HTTPException(409, "진행 중인 요청만 취소할 수 있습니다.")
+    if row.requested_by != account.account_id and _facility_role(account) != "owner":
+        raise HTTPException(403, "본인이 요청했거나 원장만 취소할 수 있습니다.")
+    row.status, row.decided_at = "CANCELED", _now()
+    db.commit()
+    return _purchase_out(row)
 
 
 # =====================================================================
@@ -7123,7 +8538,7 @@ def health():
             conn.execute(text("SELECT 1"))
             result["db_connected"] = True
             insp = inspect(conn)
-            result["tables_ready"] = all(insp.has_table(t) for t in ("app_users", "community_photos", "notifications", "facilities"))
+            result["tables_ready"] = all(insp.has_table(t) for t in ("app_users", "community_photos", "notifications", "facilities", "inventory_items", "board_attachments"))
     except Exception as exc:   # 원인 안내만 하고 예외 내용(호스트·사용자명)은 노출하지 않음
         logger.error("헬스 체크 DB 연결 실패: %s", exc)
         result["problem"] = _db_connection_hint(exc)
@@ -7166,7 +8581,7 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 #     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
 # ---------------------------------------------------------------------
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "11"
 
 
 def _tenant_tables() -> List[str]:
@@ -7194,13 +8609,45 @@ COLUMN_PATCHES = [
     ("community_comments", "author_role", "VARCHAR(10)", None),
     ("community_comments", "admin_user_id", "INTEGER", None),
     ("user_sessions", "facility_id", "INTEGER", None),
+    # v10: 서식 본문 · 바둑판 보기용 작은 사진
+    ("notices", "content_html", "TEXT", None),
+    ("community_posts", "content_html", "TEXT", None),
+    ("community_photos", "thumb", "TEXT", None),
+    # v11: 제휴몰 · 정가(할인 표시) · 단위
+    ("shop_products", "mall_code", "VARCHAR(30)", "ix_shop_products_mall_code"),
+    ("shop_products", "list_price", "INTEGER", None),
+    ("shop_products", "unit", "VARCHAR(20)", None),
 ]
-# 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼)
+# 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼 — 여러 개면 "a, b")
+#   v10 성능 점검에서 추가: 자주 쓰는 조회 조건(폴링·목록·집계)에 맞춘 인덱스. 모두 CREATE INDEX IF NOT EXISTS (비파괴)
 INDEX_PATCHES = [
     ("ix_attendances_member_id", "attendances", "member_id"),
     ("ix_enrollments_member_id", "enrollments", "member_id"),
     ("ix_enrollments_class_id", "enrollments", "class_id"),
+    # 알림함 폴링(7~30초마다): user_id + audience + is_read 로 안 읽은 개수
+    ("ix_notifications_user_audience_read", "notifications", "user_id, audience, is_read"),
+    # 출석 체크 화면: 날짜 + 수업
+    ("ix_attendances_date_class", "attendances", "attendance_date, class_id"),
+    # 게시판·공지 최신순 목록
+    ("ix_community_posts_created_at", "community_posts", "created_at"),
+    ("ix_notices_created_at", "notices", "created_at"),
+    # 미납 집계(학생 목록·대시보드)·결제 대기 무효화
+    ("ix_invoices_status", "invoices", "status"),
+    ("ix_payment_pending_invoice_id", "payment_pending", "invoice_id"),
+    ("ix_payments_member_id", "payments", "member_id"),
+    # 대시보드 '학부모 앱 활성'·최근 활동
+    ("ix_activity_logs_actor_created", "activity_logs", "actor_type, created_at"),
+    # v11 쇼핑몰 주문 목록(학원별·최신순)
+    ("ix_shop_orders_facility_created", "shop_orders", "facility_id, created_at"),
 ]
+
+
+def _apply_index_patches(conn) -> None:
+    tables = set(inspect(conn).get_table_names())
+    for index, table, columns in INDEX_PATCHES:
+        if table in tables:
+            cols = ", ".join(f'"{c.strip()}"' for c in columns.split(","))
+            conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ({cols})'))
 
 
 def _all_column_patches() -> list:
@@ -7218,9 +8665,6 @@ def _apply_column_patches(conn, existing: set) -> List[str]:
             conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
             added.append(f"{table}.{column}")
         if index:
-            conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ("{column}")'))
-    for index, table, column in INDEX_PATCHES:
-        if table in existing:
             conn.execute(text(f'CREATE INDEX IF NOT EXISTS {index} ON "{table}" ("{column}")'))
     if DB_DIALECT == "postgresql" and "classes" in existing:
         nullable = {c["name"]: c["nullable"] for c in insp.get_columns("classes")}
@@ -7258,8 +8702,8 @@ def _migrate_attendance_unique(conn, existing: set) -> None:
 
 
 def _migrate_to_facilities(conn) -> Optional[int]:
-    """v8(단일 시설) → v9(여러 시설): 시설이 하나도 없고 기존 데이터가 있으면
-    academy_settings 로 첫 시설을 만들고, 모든 기존 행·관리자·연결된 학부모를 그 시설에 배정합니다."""
+    """v8(단일 학원) → v9(여러 학원): 학원이 하나도 없고 기존 데이터가 있으면
+    academy_settings 로 첫 학원을 만들고, 모든 기존 행·관리자·연결된 학부모를 그 학원에 배정합니다."""
     if conn.execute(text("SELECT COUNT(*) FROM facilities")).scalar():
         return None
     legacy = sum(conn.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar() or 0
@@ -7271,7 +8715,7 @@ def _migrate_to_facilities(conn) -> Optional[int]:
     payment = {**DEFAULT_PAYMENT_SETTINGS, **settings.get("payment_settings", {})}
     values = {column: str(academy.get(akey) or "")[:Facility.__table__.c[column].type.length or 100000]
               for akey, column in _ACADEMY_COLUMN_MAP.items()}
-    values["name"] = values.get("name") or "우리 시설"
+    values["name"] = values.get("name") or "우리 학원"
     values["facility_type"] = values.get("facility_type") if values.get("facility_type") in FACILITY_TYPES else "학원"
     values["logo"] = values.get("logo") or None
     extra = {k: v for k, v in academy.items() if k not in _ACADEMY_COLUMN_MAP and k != "isPublic"}
@@ -7290,7 +8734,7 @@ def _migrate_to_facilities(conn) -> Optional[int]:
         nickname = f"{(name or '').strip()[:1]}** 학부모" if (name or "").strip() else "학부모"
         conn.execute(FacilityMember.__table__.insert().values(facility_id=facility_id, user_id=user_id,
                                                               nickname=nickname, status="ACTIVE"))
-    logger.info("v9 마이그레이션: 기존 데이터를 시설 #%s 로 배정 (관리자 %s명, 학부모 %s명)",
+    logger.info("v9 마이그레이션: 기존 데이터를 학원 #%s 로 배정 (관리자 %s명, 학부모 %s명)",
                 facility_id, conn.execute(text("SELECT COUNT(*) FROM facility_staff")).scalar(), len(parents))
     return facility_id
 
@@ -7323,6 +8767,7 @@ def init_db() -> List[str]:
                     conn.execute(text(f'ALTER TABLE "{table.name}" ENABLE ROW LEVEL SECURITY'))
         logger.info("테이블 생성: %s", ", ".join(t.name for t in missing))
     with engine.begin() as conn:
+        _apply_index_patches(conn)            # 새로 만든 테이블·기존 테이블 모두 (IF NOT EXISTS)
         _migrate_to_facilities(conn)
         updated = conn.execute(text("UPDATE app_meta SET meta_value = :v WHERE meta_key = 'schema_version'"),
                                {"v": SCHEMA_VERSION}).rowcount

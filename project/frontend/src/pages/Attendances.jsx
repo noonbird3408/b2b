@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
-  bulkAttendance, checkoutAttendance, deleteAttendance, errorText, fetchAttendances, fetchClasses, fetchMembers,
+  bulkAttendance, checkoutAttendance, deleteAttendance, errorText, fetchAdminSummary, fetchAttendances, fetchClasses, fetchMembers,
   localToday, markAttendance,
 } from "../api";
 import { STATUS_LABEL, useDataRefresh } from "../utils/sync";
@@ -21,7 +21,21 @@ const STYLES = `
 .att-card.clickable{cursor:pointer;}
 .att-card.clickable:hover{border-color:var(--border-strong);box-shadow:var(--shadow-sm);}
 .att-date{display:flex;gap:6px;align-items:center;}
+.att-bell{font-size:12px;line-height:1;flex-shrink:0;}
+.att-bell.off{opacity:.45;filter:grayscale(1);}
+.att-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:60;max-width:min(520px,calc(100vw - 32px));
+  background:var(--text);color:var(--surface);padding:11px 16px;border-radius:12px;font-size:13.5px;box-shadow:var(--shadow);}
+.att-toast.warn{background:var(--warning-soft);color:var(--warning-text);border:1px solid var(--warning);}
 `;
+
+const ACTION_LABEL = { PRESENT: "출석", LATE: "지각", ABSENT: "결석" };
+
+/** "14:00" + 분 → "14:10" */
+const addMinutes = (hhmm, minutes) => {
+  const [h, m] = (hhmm || "00:00").split(":").map(Number);
+  const total = h * 60 + m + minutes;
+  return `${String(Math.floor(total / 60) % 24).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+};
 
 const ageToGrade = (age) => {
   if (age == null) return "";
@@ -55,6 +69,20 @@ export default function Attendances() {
   const [pendingId, setPendingId] = useState(null);
   const [query, setQuery] = useState("");
   const [makeup, setMakeup] = useState(false);     // 보강: 이날 시간표에 없는 수업을 직접 고른 경우
+  const [grace, setGrace] = useState(10);          // 지각 기준(분) — 설정 → 기관 정보
+  const [toast, setToast] = useState(null);         // v10: 학부모 알림 결과 안내
+  const toastTimer = useRef(null);
+
+  // v10: 키오스크 대신 이 화면에서 출석을 누르면 학부모에게 즉시 알림 → 결과를 바로 보여 줌
+  const showToast = useCallback((text, tone = "") => {
+    setToast({ text, tone });
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 3500);
+  }, []);
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+  useEffect(() => {
+    fetchAdminSummary().then((s) => setGrace(Number(s?.brand?.lateGraceMinutes ?? 10))).catch(() => null);
+  }, []);
 
   const loadClasses = useCallback(() => fetchClasses()
     .then((data) => setClasses(Array.isArray(data) ? data : []))
@@ -111,14 +139,25 @@ export default function Attendances() {
   const selectedClass = classes.find((c) => c.class_id === selectedClassId);
   const selectedPeriod = periods.find((p) => p.cls.class_id === selectedClassId);
   const weekday = DAY_KO[new Date(`${targetDate}T00:00:00`).getDay()];
+  const lateFrom = selectedPeriod?.start ? addMinutes(selectedPeriod.start, grace) : null;
+  const pastLate = isToday && lateFrom && nowHHMM > lateFrom && nowHHMM <= (selectedPeriod?.end || "23:59");
+  const linkedCount = members.filter((m) => m.parent_linked).length;
 
   const setStatus = async (member, status) => {
     if (pendingId) return;
     setPendingId(member.member_id);
     try {
       const existing = attMap[member.member_id];
-      if (existing && existing.status === status) await deleteAttendance(existing.attendance_id);   // 같은 버튼 = 취소
-      else await markAttendance({ member_id: member.member_id, attendance_date: targetDate, status, class_id: selectedClassId });
+      if (existing && existing.status === status) {
+        await deleteAttendance(existing.attendance_id);   // 같은 버튼 = 취소
+        showToast(`${member.name} 학생 ${ACTION_LABEL[status]} 기록을 취소했습니다.`);
+      } else {
+        const saved = await markAttendance({ member_id: member.member_id, attendance_date: targetDate, status, class_id: selectedClassId });
+        if (!isToday) showToast(`${targetDate} ${member.name} 학생 ${ACTION_LABEL[status]}(으)로 수정했습니다. 지난 날짜는 학부모 알림을 보내지 않습니다.`);
+        else if (saved.parent_notified > 0) showToast(`🔔 ${member.name} 학생 ${ACTION_LABEL[status]} — 학부모 ${saved.parent_notified}명에게 알림을 보냈습니다.`);
+        else if (!saved.parent_linked) showToast(`${member.name} 학생은 학부모 계정이 연결되지 않아 알림을 보내지 못했습니다. (학부모 포털에서 자녀 연결 필요)`, "warn");
+        else showToast(`${member.name} 학생 ${ACTION_LABEL[status]} 저장`);
+      }
       await load();
     } catch (e) {
       alert(errorText(e));
@@ -132,7 +171,9 @@ export default function Attendances() {
     if (!existing || pendingId) return;
     setPendingId(member.member_id);
     try {
-      await checkoutAttendance(existing.attendance_id);
+      const saved = await checkoutAttendance(existing.attendance_id);
+      showToast(saved.parent_notified > 0 ? `🏠 ${member.name} 학생 하원 — 학부모 ${saved.parent_notified}명에게 알림을 보냈습니다.`
+        : `${member.name} 학생 하원 처리 (연결된 학부모 없음)`, saved.parent_notified > 0 ? "" : "warn");
       await load();
     } catch (e) {
       alert(errorText(e));
@@ -148,8 +189,9 @@ export default function Attendances() {
     if (!window.confirm(`${selectedClass?.name} 미체크 ${unchecked.length}명을 ${label} 처리할까요?`)) return;
     setPendingId("ALL");
     try {
-      await bulkAttendance({ attendance_date: targetDate, member_ids: unchecked.map((m) => m.member_id), status,
+      const res = await bulkAttendance({ attendance_date: targetDate, member_ids: unchecked.map((m) => m.member_id), status,
         only_unchecked: true, class_id: selectedClassId });
+      showToast(`${res.changed}명 ${label} 처리${res.parent_notified ? ` · 학부모 ${res.parent_notified}명에게 알림` : ""}`);
       await load();
     } catch (e) {
       alert(errorText(e, "일괄 처리하지 못했습니다."));
@@ -220,6 +262,10 @@ export default function Attendances() {
               </span>
             </div>
             <div className="progress"><div className="progress-fill" style={{ width: `${members.length ? (checked / members.length) * 100 : 0}%` }} /></div>
+            <div className="muted" style={{ fontSize: 12, marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <span>🔔 출석·지각·결석·하원을 누르면 학부모에게 바로 알림 (학부모 연결 {linkedCount}/{members.length}명)</span>
+              {pastLate && <span style={{ color: "var(--warning-text)", fontWeight: 600 }}>⏰ 지각 기준({lateFrom}) 지남 — 지금 오는 학생은 '지각'으로 체크하세요</span>}
+            </div>
           </div>
         )}
       </div>
@@ -230,7 +276,6 @@ export default function Attendances() {
             <div className="search-box" style={{ flex: "1 1 200px" }}>
               <input className="input" style={{ width: "100%" }} placeholder="이름으로 찾기" value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
-            <Link to="/kiosk" className="btn ghost ml-auto">📲 키오스크</Link>
           </div>
 
           {visibleMembers.length === 0 ? (
@@ -251,7 +296,11 @@ export default function Attendances() {
                         {m.photo_url ? <img src={m.photo_url} alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : m.name?.[0]}
                       </div>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div className="name" style={{ fontWeight: 700 }}>{m.name}</div>
+                        <div className="name" style={{ fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
+                          {m.name}
+                          <span className={`att-bell${m.parent_linked ? "" : " off"}`}
+                            title={m.parent_linked ? "학부모 알림 받음" : "학부모 계정 미연결 — 알림을 받을 수 없음"}>{m.parent_linked ? "🔔" : "🔕"}</span>
+                        </div>
                         <div className="sub">
                           {m.gender === "M" ? "남" : "여"}{ageToGrade(m.age) && ` · ${ageToGrade(m.age)}`}
                           {cur?.check_in_time && ` · ${cur.check_in_time.slice(0, 5)}`}
@@ -289,6 +338,7 @@ export default function Attendances() {
           </div>
         </>
       )}
+      {toast && <div className={`att-toast ${toast.tone}`} role="status" aria-live="polite">{toast.text}</div>}
     </>
   );
 }

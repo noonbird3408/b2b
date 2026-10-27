@@ -40,7 +40,7 @@ function basicReport(ins) {
   if ((ins.risk_students || []).length) todo.push(`이탈 위험 학생 ${ins.risk_students.length}명 — 대시보드의 '이탈 위험' 카드에서 사유 확인 후 보호자 상담`);
   if (b.overdue_members) todo.push(`연체 ${b.overdue_members}명 — 수납·청구 화면에서 학부모 알림 발송 또는 현장 수납`);
   if (lowClasses.length) todo.push(`출석률 80% 미만 반: ${lowClasses.map((c) => `${c.name}(${c.rate_30d}%)`).join(', ')}`);
-  if (a.today?.unchecked) todo.push(`오늘 미체크 ${a.today.unchecked}명 — 출석 체크 또는 키오스크 확인`);
+  if (a.today?.unchecked) todo.push(`오늘 미체크 ${a.today.unchecked}명 — 출석 체크 화면에서 확인`);
   lines.push('**오늘 할 일**', '', ...(todo.length ? todo.map((t) => `- ${t}`) : ['- 특별히 조치가 필요한 항목이 없습니다. 👍']));
   return lines.join('\n');
 }

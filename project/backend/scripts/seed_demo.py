@@ -19,7 +19,7 @@ def run(force: bool = False) -> None:
         owner = db.query(main.AdminAccount).filter(main.AdminAccount.role == "owner").first()
         result = demo_data.seed(db, main, account=owner, force=force)
         print(f"데모 데이터 입력 완료: 학생 {result['members']}명, 수업 {result['classes']}개")
-        print(f"  키오스크 체험: 보호자 번호 뒤 4자리 {result['kiosk_digits']}")
+        print(f"  출석 알림 체험: {result['attendance_demo']}")
         print(f"  학부모 체험: 자녀 이름 {result['parent_demo']['child_name']} / 연락처 {result['parent_demo']['phone']}")
     except ValueError as exc:
         print(f"{exc} (--force 로 강제 입력)")

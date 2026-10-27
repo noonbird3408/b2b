@@ -4,11 +4,14 @@ import {
   createFacility, deleteFacility, devSignIn, enterFacility, errorText, fetchFacilities, fetchGoogleAuthConfig, fetchMe,
   selectRole, signInWithGoogle, signOut, updateFacility,
 } from "../api";
+import { BRAND } from "../utils/brand";
+import { FACILITY_TYPES, facilityTypeLabel } from "../utils/constants";
+import SubjectPicker from "./SubjectPicker.jsx";
 import Brand from "./Brand.jsx";
 
 // =====================================================================
-// 메인(/) : 로그인 → 역할 선택(학부모/관리자) → 관리자는 시설 선택·생성·수정·삭제
-//   학부모는 /parentportal (시설 검색·입장) 으로 이동
+// 메인(/) : 로그인 → 역할 선택(학부모/관리자) → 관리자는 학원 선택·생성·수정·삭제
+//   학부모는 /parentportal (학원 검색·입장) 으로 이동
 // =====================================================================
 const STYLES = `
 .fm-root{min-height:100vh;background:linear-gradient(160deg, rgba(59,130,246,0.10) 0%, var(--bg) 42%);display:flex;flex-direction:column;color:var(--text);}
@@ -122,8 +125,8 @@ function LoginScreen({ config, error, busy, onCredential, onDevLogin }) {
   return (
     <div className="fm-body fm-center">
       <div className="fm-card">
-        <h1>facilink 시작하기</h1>
-        <p>학원·체육관·도장을 한곳에서 관리하고 소통합니다.</p>
+        <h1>{BRAND.logo} {BRAND.name} 시작하기</h1>
+        <p>{BRAND.tagline} — 출결·수납·소통·물품 구매까지 학원 운영을 한곳에서.</p>
         {error && <Banner>{error}</Banner>}
         <GoogleSignInButton config={config} disabled={busy} onCredential={onCredential} />
         {config?.dev_login && (
@@ -153,14 +156,14 @@ function RoleSelect({ me, error, busy, onParent, onAdmin }) {
             onClick={() => !busy && onParent()} onKeyDown={(e) => e.key === "Enter" && !busy && onParent()}>
             <div className="ico" style={{ background: "var(--primary-soft)" }}>👪</div>
             <h2>학부모</h2>
-            <p>시설을 찾아 가입 신청하고, 자녀 출결·수강료·커뮤니티를 이용합니다.</p>
+            <p>학원을 찾아 가입 신청하고, 자녀 출결·수강료·커뮤니티를 이용합니다.</p>
             <div className="go">학부모로 시작 →</div>
           </div>
           <div className="choice-card" role="button" tabIndex={0} aria-disabled={busy}
             onClick={() => !busy && onAdmin(inviteCode)} onKeyDown={(e) => e.key === "Enter" && !busy && onAdmin(inviteCode)}>
             <div className="ico" style={{ background: "var(--warning-soft)" }}>🔐</div>
             <h2>관리자</h2>
-            <p>내 시설을 만들거나 선택해 학생·수업·출결·수납·커뮤니티를 관리합니다.</p>
+            <p>내 학원을 만들거나 선택해 학생·수업·출결·수납·커뮤니티를 관리합니다.</p>
             <div className="go">{me.can_admin ? "관리자로 시작 →" : "초대 코드로 등록 →"}</div>
             {showInvite ? (
               <div className="invite" onClick={(e) => e.stopPropagation()}>
@@ -179,7 +182,7 @@ function RoleSelect({ me, error, busy, onParent, onAdmin }) {
 }
 
 const EMPTY_FACILITY = { name: "", facility_type: "학원", branch: "", region: "", address: "", phone: "", description: "",
-  principal: "", base_tuition_fee: "", is_public: true };
+  principal: "", base_tuition_fee: "", is_public: true, subjects: [] };
 
 function FacilityForm({ initial, onClose, onSaved }) {
   const [form, setForm] = useState(() => ({ ...EMPTY_FACILITY, ...(initial || {}),
@@ -197,7 +200,7 @@ function FacilityForm({ initial, onClose, onSaved }) {
       const saved = initial?.facility_id ? await updateFacility(initial.facility_id, payload) : await createFacility(payload);
       onSaved(saved);
     } catch (err) {
-      setError(errorText(err, "시설 정보를 저장하지 못했습니다."));
+      setError(errorText(err, "학원 정보를 저장하지 못했습니다."));
     } finally {
       setSaving(false);
     }
@@ -206,14 +209,14 @@ function FacilityForm({ initial, onClose, onSaved }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <form className="modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
-        <h3>{initial?.facility_id ? "시설 정보 수정" : "새 시설 만들기"}</h3>
+        <h3>{initial?.facility_id ? "학원 정보 수정" : "새 학원 만들기"}</h3>
         {error && <Banner>{error}</Banner>}
         <div className="fm-form-grid">
-          <div className="form-row full"><label>시설 이름 *</label>
-            <input className="input" required maxLength={100} value={form.name} onChange={set("name")} placeholder="예: 한빛 태권도장" /></div>
-          <div className="form-row"><label>시설 유형</label>
+          <div className="form-row full"><label>학원 이름 *</label>
+            <input className="input" required maxLength={100} value={form.name} onChange={set("name")} placeholder="예: 쑥쑥 수학학원" /></div>
+          <div className="form-row"><label>학원 종류</label>
             <select className="select" value={form.facility_type} onChange={set("facility_type")}>
-              {["학원", "체육관", "도장", "기타"].map((t) => <option key={t}>{t}</option>)}
+              {FACILITY_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             </select></div>
           <div className="form-row"><label>지점</label>
             <input className="input" maxLength={100} value={form.branch} onChange={set("branch")} placeholder="예: 용인 본관" /></div>
@@ -227,6 +230,8 @@ function FacilityForm({ initial, onClose, onSaved }) {
             <input className="input" maxLength={50} value={form.principal} onChange={set("principal")} /></div>
           <div className="form-row"><label>기본 월 수강료 (원)</label>
             <input className="input" type="number" min="0" value={form.base_tuition_fee} onChange={set("base_tuition_fee")} /></div>
+          <div className="form-row full"><label>주요 과목 <small style={{ color: "var(--text-3)", fontWeight: 400 }}>— 쇼핑몰 교재·교구 추천에 사용 (개설한 수업에서도 자동으로 찾아요)</small></label>
+            <SubjectPicker value={form.subjects} onChange={(subjects) => setForm((f) => ({ ...f, subjects }))} /></div>
           <div className="form-row full"><label>소개</label>
             <textarea maxLength={1000} value={form.description} onChange={set("description")} placeholder="학부모 검색 화면에 보이는 소개" /></div>
           <label className="fm-check full"><input type="checkbox" checked={form.is_public} onChange={set("is_public")} /> 학부모 검색에 노출</label>
@@ -249,16 +254,16 @@ function DeleteFacility({ facility, onClose, onDeleted }) {
       await deleteFacility(facility.facility_id, name);
       onDeleted();
     } catch (err) {
-      setError(errorText(err, "시설을 삭제하지 못했습니다."));
+      setError(errorText(err, "학원을 삭제하지 못했습니다."));
     }
   };
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <form className="modal" onClick={(e) => e.stopPropagation()} onSubmit={submit}>
-        <h3>시설 삭제</h3>
+        <h3>학원 삭제</h3>
         <p style={{ fontSize: 13, color: "var(--text-2)", marginTop: 0 }}>
-          <b>{facility.name}</b> 을(를) 목록에서 삭제합니다. 학생·결제 기록은 보관되며 학부모는 더 이상 이 시설에 들어올 수 없습니다.
-          확인을 위해 시설 이름을 입력하세요.
+          <b>{facility.name}</b> 을(를) 목록에서 삭제합니다. 학생·결제 기록은 보관되며 학부모는 더 이상 이 학원에 들어올 수 없습니다.
+          확인을 위해 학원 이름을 입력하세요.
         </p>
         {error && <Banner>{error}</Banner>}
         <input className="input" style={{ width: "100%" }} value={name} onChange={(e) => setName(e.target.value)} placeholder={facility.name} autoFocus />
@@ -274,12 +279,12 @@ function DeleteFacility({ facility, onClose, onDeleted }) {
 function FacilityPicker({ me, onEntered }) {
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState(null);     // {} = 새 시설
+  const [editing, setEditing] = useState(null);     // {} = 새 학원
   const [deleting, setDeleting] = useState(null);
   const [busyId, setBusyId] = useState(null);
 
   const load = useCallback(() => {
-    fetchFacilities().then(setItems).catch((err) => { setItems([]); setError(errorText(err, "시설 목록을 불러오지 못했습니다.")); });
+    fetchFacilities().then(setItems).catch((err) => { setItems([]); setError(errorText(err, "학원 목록을 불러오지 못했습니다.")); });
   }, []);
   useEffect(load, [load]);
 
@@ -290,7 +295,7 @@ function FacilityPicker({ me, onEntered }) {
       const current = await enterFacility(facility.facility_id);
       onEntered(current);
     } catch (err) {
-      setError(errorText(err, "시설에 들어가지 못했습니다."));
+      setError(errorText(err, "학원에 들어가지 못했습니다."));
       setBusyId(null);
     }
   };
@@ -300,11 +305,11 @@ function FacilityPicker({ me, onEntered }) {
       <div className="fac-wrap">
         <div className="fac-head">
           <div>
-            <h1>내 시설</h1>
-            <p>관리할 시설을 선택하세요.</p>
+            <h1>내 학원</h1>
+            <p>관리할 학원을 선택하세요.</p>
           </div>
           {me.can_create_facility && (
-            <button type="button" className="btn" style={{ marginLeft: "auto" }} onClick={() => setEditing({})}>+ 새 시설</button>
+            <button type="button" className="btn" style={{ marginLeft: "auto" }} onClick={() => setEditing({})}>+ 새 학원</button>
           )}
         </div>
         {error && <Banner>{error}</Banner>}
@@ -319,7 +324,7 @@ function FacilityPicker({ me, onEntered }) {
                   <div className="logo">{f.logo ? <img src={f.logo} alt="" /> : f.name.charAt(0)}</div>
                   <div style={{ minWidth: 0 }}>
                     <h3>{f.name}</h3>
-                    <div className="meta">{[f.facility_type, f.branch, f.region].filter(Boolean).join(" · ")}</div>
+                    <div className="meta">{[facilityTypeLabel(f.facility_type), f.branch, f.region].filter(Boolean).join(" · ")}</div>
                   </div>
                 </div>
                 <div className="fac-stats">
@@ -341,11 +346,11 @@ function FacilityPicker({ me, onEntered }) {
             ))}
             {me.can_create_facility && (
               <button type="button" className="fac-card fac-new" onClick={() => setEditing({})}>
-                <span className="plus">＋</span>새 시설 만들기
+                <span className="plus">＋</span>새 학원 만들기
               </button>
             )}
             {!items.length && !me.can_create_facility && (
-              <div className="empty" style={{ gridColumn: "1/-1" }}>초대받은 시설이 없습니다. 원장에게 이 Google 계정을 직원으로 등록해 달라고 요청하세요.</div>
+              <div className="empty" style={{ gridColumn: "1/-1" }}>초대받은 학원이 없습니다. 원장에게 이 Google 계정을 직원으로 등록해 달라고 요청하세요.</div>
             )}
           </div>
         )}

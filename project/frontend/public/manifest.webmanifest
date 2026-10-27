@@ -1,7 +1,7 @@
 {
-  "name": "facilink",
-  "short_name": "facilink",
-  "description": "학원·체육관·도장 통합 관리 — 출석 키오스크, 학부모 포털",
+  "name": "쑥쑥 · 학원 운영 도우미",
+  "short_name": "쑥쑥",
+  "description": "학원 운영 도우미 — 출결 알림, 수납, 학부모 소통, 재고·물품 구매",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0f172a",

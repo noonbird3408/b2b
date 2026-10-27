@@ -2,10 +2,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
-  createComment, createCommunityPost, createNotice, deleteComment, deleteCommunityPost, deleteNotice, downloadModerationDataset,
-  errorText, fetchClasses, fetchCommunityBoard, fetchCommunityMembers, fetchCommunityPost, fetchComments, fetchModerationPosts,
-  fetchModerationQueue, fetchModerationStats, likeCommunityPost, moderateComment, moderatePost, sanctionCommunityMember,
-  updateCommunityPost, updateNotice,
+  createComment, createCommunityPost, createNotice, deleteAttachment, deleteComment, deleteCommunityPost, deleteNotice,
+  downloadModerationDataset, draftNotice, errorText, fetchClasses, fetchCommunityBoard, fetchCommunityMembers, fetchCommunityPost,
+  fetchComments, fetchModerationPosts, fetchModerationQueue, fetchModerationStats, likeCommunityPost, moderateComment, moderatePost,
+  sanctionCommunityMember, updateCommunityPost, updateNotice, uploadNoticeAttachment, uploadPostAttachment,
 } from "../api";
 import Board from "../components/Board.jsx";
 import { relativeTime } from "../utils/constants";
@@ -25,6 +25,11 @@ const ADMIN_API = {
   updateNotice,
   deleteNotice,
   moderatePost,
+  // v10: 첨부파일 · 공지 자동 작성
+  uploadPostAttachment,
+  uploadNoticeAttachment,
+  deleteAttachment,
+  draftNotice,
 };
 
 const DECISION_LABEL = { APPROVED: "공개됨", HIDDEN: "숨김" };
@@ -185,7 +190,7 @@ function ModerationTab() {
 }
 
 // ---------------------------------------------------------------------
-// 멤버 — 시설에 입장한 학부모 계정. 경고 · 글쓰기 제한(기간) · 강퇴/해제
+// 멤버 — 학원에 입장한 학부모 계정. 경고 · 글쓰기 제한(기간) · 강퇴/해제
 // ---------------------------------------------------------------------
 function MembersTab() {
   const [rows, setRows] = useState(null);
@@ -256,7 +261,7 @@ function SanctionModal({ member, onClose, onDone }) {
   const [err, setErr] = useState("");
 
   const act = async (action) => {
-    if (action === "ban" && !window.confirm(`${member.nickname} 님을 강퇴할까요? 이 시설의 학부모 화면을 더 이상 이용할 수 없습니다.`)) return;
+    if (action === "ban" && !window.confirm(`${member.nickname} 님을 강퇴할까요? 이 학원의 학부모 화면을 더 이상 이용할 수 없습니다.`)) return;
     setBusy(true); setErr("");
     try {
       await sanctionCommunityMember(member.membership_id, { action, days: Number(days), reason });

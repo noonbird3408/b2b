@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateIndex, CreateTable  # noqa: E402
 import main  # noqa: E402
 
 HEADER = """-- =====================================================================
--- 시설 통합 관리 시스템 — Supabase 테이블 생성 스크립트 (setup.sql)
+-- 학원 통합 관리 시스템 — Supabase 테이블 생성 스크립트 (setup.sql)
 --
 -- 사용법: Supabase 대시보드 → 왼쪽 메뉴 SQL Editor → New query
 --         → 이 파일 내용을 전부 복사해 붙여넣기 → Run (Ctrl+Enter)
@@ -29,7 +29,11 @@ HEADER = """-- =================================================================
 """
 
 FOOTER = """
--- v9(여러 시설): 기존(단일 시설) 데이터의 facility_id 채우기·첫 시설 생성은 백엔드가 처음 시작될 때
+-- v10: 서식 본문(content_html) · 공지 사진(notice_photos) · 첨부파일(board_attachments) · 재고(inventory_*)·구매 요청 테이블과
+--      성능 점검 인덱스가 추가되었습니다. 모두 새 테이블·NULL 허용 컬럼·인덱스라 기존 데이터에 영향이 없습니다.
+-- v11: 학원 쇼핑몰 — 제휴몰 연결(shop_mall_links) · 주문(shop_orders, shop_order_items) 테이블과
+--      shop_products 의 mall_code·list_price·unit 컬럼이 추가되었습니다(역시 비파괴).
+-- v9(여러 학원): 기존(단일 학원) 데이터의 facility_id 채우기·첫 학원 생성은 백엔드가 처음 시작될 때
 -- 자동으로 한 번 실행합니다(app_meta.schema_version 기록). 이 스크립트는 테이블·컬럼·인덱스만 준비합니다.
 -- Supabase 는 public 스키마의 테이블을 Data API(anon 키)로 노출합니다.
 -- RLS(행 수준 보안)를 켜 두면 브라우저에서 테이블에 직접 접근할 수 없습니다.

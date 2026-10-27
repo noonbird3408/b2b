@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   FACILITY_REQUIRED_EVENT, applyToFacility, assignmentFileUrl, cancelParentApplication, createChildProfile, createParentComment,
-  createParentPost, deleteChildProfile, deleteParentComment, deleteParentPost, enterParentFacility, errorText, exitParentFacility,
+  createParentPost, deleteChildProfile, deleteParentAttachment, deleteParentComment, deleteParentPost, enterParentFacility, errorText,
+  exitParentFacility, uploadParentAttachment,
   fetchChildProfiles, fetchFacilityDetail, fetchMe, fetchMyFacilities, fetchParentApplications, fetchParentAssignments,
   fetchParentAttendances, fetchParentBoard, fetchParentChildren, fetchParentComments, fetchParentNotifications, fetchParentPost,
   fetchParentSummary, leaveParentFacility, likeParentPost, linkParentChild, markParentNoticesRead, markParentNotificationsRead,
@@ -10,15 +11,15 @@ import {
 } from "../api";
 import Brand from "../components/Brand.jsx";
 import Board from "../components/Board.jsx";
-import { NOTIFICATION_META, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
+import { FACILITY_TYPES, NOTIFICATION_META, facilityTypeLabel, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import { DAY_LABELS, STATUS_LABEL, STATUS_TONE, announceDataChanged, won } from "../utils/sync";
 import Checkout from "./Checkout";
 
 /* =====================================================================
    학부모 포털
-   - 시설 밖(허브): 내 시설 · 시설 찾기(가입 신청) · 내 자녀 정보 · 신청 현황
-   - 시설 안: 우리 아이(출결·과제) · 결제 · 커뮤니티(공지+게시판) · 시설 정보
-   모든 데이터는 /api/parent/* 에서 "이 계정 + 입장한 시설" 기준으로만 내려옵니다.
+   - 학원 밖(허브): 내 학원 · 학원 찾기(가입 신청) · 내 자녀 정보 · 신청 현황
+   - 학원 안: 우리 아이(출결·과제) · 결제 · 커뮤니티(공지+게시판) · 학원 정보
+   모든 데이터는 /api/parent/* 에서 "이 계정 + 입장한 학원" 기준으로만 내려옵니다.
 ===================================================================== */
 const CSS = `
 .pp{min-height:100vh;background:var(--bg);display:flex;flex-direction:column;color:var(--text);}
@@ -94,6 +95,9 @@ const PARENT_API = {
   createComment: createParentComment,
   deleteComment: deleteParentComment,
   markNoticeRead: markParentNoticesRead,
+  // v10: 본인 글 첨부파일
+  uploadPostAttachment: uploadParentAttachment,
+  deleteAttachment: deleteParentAttachment,
 };
 
 const scheduleText = (schedules = []) => schedules.map((s) => `${DAY_LABELS[s.day] || s.day} ${s.start || ""}${s.end ? `~${s.end}` : ""}`).join(" · ");
@@ -113,7 +117,7 @@ export default function ParentPortal() {
 
   useEffect(() => { reloadMe(); }, [reloadMe]);
   useEffect(() => {
-    const onRequired = () => reloadMe();       // 강퇴·시설 삭제 등으로 시설 접근이 끊기면 허브로
+    const onRequired = () => reloadMe();       // 강퇴·학원 삭제 등으로 학원 접근이 끊기면 허브로
     window.addEventListener(FACILITY_REQUIRED_EVENT, onRequired);
     return () => window.removeEventListener(FACILITY_REQUIRED_EVENT, onRequired);
   }, [reloadMe]);
@@ -144,7 +148,7 @@ function HeaderMenu({ onLogout }) {
 }
 
 // =====================================================================
-// 허브 — 시설 선택 전
+// 허브 — 학원 선택 전
 // =====================================================================
 function Hub({ me, onEntered, onLogout }) {
   const [tab, setTab] = useState("mine");
@@ -155,7 +159,7 @@ function Hub({ me, onEntered, onLogout }) {
   const [error, setError] = useState("");
 
   const load = useCallback(() => {
-    fetchMyFacilities().then(setMine).catch((e) => { setMine([]); setError(errorText(e, "시설 목록을 불러오지 못했습니다.")); });
+    fetchMyFacilities().then(setMine).catch((e) => { setMine([]); setError(errorText(e, "학원 목록을 불러오지 못했습니다.")); });
     fetchParentApplications().then(setApplications).catch(() => setApplications([]));
     fetchChildProfiles().then(setChildren).catch(() => setChildren([]));
   }, []);
@@ -167,12 +171,12 @@ function Hub({ me, onEntered, onLogout }) {
     try {
       onEntered(await enterParentFacility(facilityId));
     } catch (e) {
-      setError(errorText(e, "시설에 들어가지 못했습니다."));
+      setError(errorText(e, "학원에 들어가지 못했습니다."));
     }
   };
 
   const pendingCount = applications.filter((a) => a.status === "PENDING").length;
-  const tabs = [["mine", "내 시설"], ["search", "시설 찾기"], ["children", "자녀 정보"], ["apps", `신청 현황${pendingCount ? ` ${pendingCount}` : ""}`]];
+  const tabs = [["mine", "내 학원"], ["search", "학원 찾기"], ["children", "자녀 정보"], ["apps", `신청 현황${pendingCount ? ` ${pendingCount}` : ""}`]];
 
   return (
     <>
@@ -189,10 +193,10 @@ function Hub({ me, onEntered, onLogout }) {
           <>
             <div className="pp-hero">
               <h2>{me.user.name ? `${me.user.name} 님, 반가워요` : "반가워요"}</h2>
-              <div className="muted">이용할 시설을 선택하세요.</div>
+              <div className="muted">이용할 학원을 선택하세요.</div>
             </div>
             {mine === null ? <div className="fl-skeleton" style={{ height: 140 }} /> : mine.length === 0 ? (
-              <div className="empty">아직 입장한 시설이 없습니다. <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setTab("search")}>시설 찾기</button></div>
+              <div className="empty">아직 입장한 학원이 없습니다. <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setTab("search")}>학원 찾기</button></div>
             ) : (
               <div className="fac-cards">
                 {mine.map((f) => (
@@ -201,7 +205,7 @@ function Hub({ me, onEntered, onLogout }) {
                       <div className="lg">{f.logo ? <img src={f.logo} alt="" /> : f.name[0]}</div>
                       <div style={{ minWidth: 0 }}>
                         <b>{f.name}</b>
-                        <div className="m">{[f.facility_type, f.branch, f.region].filter(Boolean).join(" · ")}</div>
+                        <div className="m">{[facilityTypeLabel(f.facility_type), f.branch, f.region].filter(Boolean).join(" · ")}</div>
                       </div>
                       {f.unread > 0 && <span className="badge danger no-dot" style={{ marginLeft: "auto" }}>알림 {f.unread}</span>}
                     </div>
@@ -246,13 +250,13 @@ function FacilitySearch({ onOpen }) {
 
   return (
     <div className="pp-card">
-      <h3>시설 찾기</h3>
+      <h3>학원 찾기</h3>
       <p className="sub">이름·지역으로 찾고, 수업을 골라 가입을 신청하세요.</p>
       <form className="search-row" onSubmit={search}>
-        <input className="input" value={q} onChange={(e) => setQ(e.target.value)} placeholder="시설 이름 (예: 태권도)" />
+        <input className="input" value={q} onChange={(e) => setQ(e.target.value)} placeholder="학원 이름 (예: 태권도)" />
         <input className="input" value={region} onChange={(e) => setRegion(e.target.value)} placeholder="지역 (예: 용인)" style={{ flex: "0 1 140px" }} />
-        <select className="select" value={type} onChange={(e) => setType(e.target.value)} aria-label="시설 유형">
-          <option value="">전체 유형</option>{["학원", "체육관", "도장", "기타"].map((t) => <option key={t}>{t}</option>)}
+        <select className="select" value={type} onChange={(e) => setType(e.target.value)} aria-label="학원 종류">
+          <option value="">전체 종류</option>{FACILITY_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
         <button className="btn" type="submit">검색</button>
       </form>
@@ -265,13 +269,13 @@ function FacilitySearch({ onOpen }) {
                 <div className="lg">{f.logo ? <img src={f.logo} alt="" /> : f.name[0]}</div>
                 <div style={{ minWidth: 0 }}>
                   <b>{f.name}</b>
-                  <div className="m">{[f.facility_type, f.branch, f.region].filter(Boolean).join(" · ")}</div>
+                  <div className="m">{[facilityTypeLabel(f.facility_type), f.branch, f.region].filter(Boolean).join(" · ")}</div>
                 </div>
               </div>
               {f.description && <div className="m" style={{ color: "var(--text-2)" }}>{f.description.slice(0, 70)}{f.description.length > 70 ? "…" : ""}</div>}
               <div className="status-line">
                 <span className="badge gray no-dot">수업 {f.class_count}</span>
-                {f.joined && <span className="badge primary no-dot">입장한 시설</span>}
+                {f.joined && <span className="badge primary no-dot">입장한 학원</span>}
               </div>
             </button>
           ))}
@@ -291,7 +295,7 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
   const [addingChild, setAddingChild] = useState(false);
 
   useEffect(() => {
-    fetchFacilityDetail(facilityId).then(setF).catch((e) => setError(errorText(e, "시설 정보를 불러오지 못했습니다.")));
+    fetchFacilityDetail(facilityId).then(setF).catch((e) => setError(errorText(e, "학원 정보를 불러오지 못했습니다.")));
   }, [facilityId]);
   useEffect(() => { if (!childId && childrenList.length) setChildId(String(childrenList[0].child_id)); }, [childrenList, childId]);
 
@@ -305,7 +309,7 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
     setError("");
     try {
       const res = await applyToFacility(facilityId, { child_id: Number(childId), class_ids: [...picked], message });
-      alert(`가입 신청을 보냈습니다.\n예상 월 비용 ${won(res.estimated_fee)} · 시설에서 승인하면 알림으로 알려 드립니다.`);
+      alert(`가입 신청을 보냈습니다.\n예상 월 비용 ${won(res.estimated_fee)} · 학원에서 승인하면 알림으로 알려 드립니다.`);
       onApplied?.();
     } catch (e) {
       setError(errorText(e, "신청하지 못했습니다."));
@@ -321,7 +325,7 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
           <>
             <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
               <h3 style={{ margin: 0 }}>{f.name}</h3>
-              <span className="badge gray no-dot">{f.facility_type}</span>
+              <span className="badge gray no-dot">{facilityTypeLabel(f.facility_type)}</span>
               <button className="btn ghost sm" style={{ marginLeft: "auto" }} onClick={onClose} aria-label="닫기">✕</button>
             </div>
             <div className="muted" style={{ margin: "6px 0 10px" }}>
@@ -332,7 +336,7 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
 
             <div className="form-row">
               <label>수강할 수업 선택</label>
-              {f.classes.length === 0 ? <div className="muted">공개된 수업이 없습니다. 시설에 문의하세요.</div> : (
+              {f.classes.length === 0 ? <div className="muted">공개된 수업이 없습니다. 학원에 문의하세요.</div> : (
                 <div className="cls-pick">
                   {f.classes.map((c) => (
                     <label key={c.class_id} className={picked.has(c.class_id) ? "on" : ""}>
@@ -433,7 +437,7 @@ function ChildForm({ initial, onClose, onSaved }) {
 function ChildProfiles({ childrenList, onChanged }) {
   const [editing, setEditing] = useState(null);
   const remove = async (c) => {
-    if (!window.confirm(`${c.name} 정보를 삭제할까요? (이미 시설에 등록된 학생 기록은 그대로입니다)`)) return;
+    if (!window.confirm(`${c.name} 정보를 삭제할까요? (이미 학원에 등록된 학생 기록은 그대로입니다)`)) return;
     try { await deleteChildProfile(c.child_id); onChanged(); } catch (e) { alert(errorText(e, "삭제하지 못했습니다.")); }
   };
   return (
@@ -467,7 +471,7 @@ function ApplicationList({ applications, onChanged, onEnter }) {
   return (
     <div className="pp-card">
       <h3>가입 신청 현황</h3>
-      <p className="sub">시설에서 승인하면 학생으로 등록되고 알림이 옵니다.</p>
+      <p className="sub">학원에서 승인하면 학생으로 등록되고 알림이 옵니다.</p>
       {applications.length === 0 ? <div className="empty">신청 내역이 없습니다.</div> : applications.map((a) => {
         const [tone, label] = APP_STATUS[a.status] || ["gray", a.status];
         return (
@@ -490,7 +494,7 @@ function ApplicationList({ applications, onChanged, onEnter }) {
 }
 
 // =====================================================================
-// 시설 안
+// 학원 안
 // =====================================================================
 function FacilityHome({ me, onExit, onLogout, onReload }) {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -573,14 +577,14 @@ function FacilityHome({ me, onExit, onLogout, onReload }) {
 
   const facility = summary?.facility || me.facility;
   const unread = summary?.unread_notifications || 0;
-  const tabs = [["kids", "우리 아이"], ["pay", "결제"], ["feed", "커뮤니티"], ["info", "시설 정보"]];
+  const tabs = [["kids", "우리 아이"], ["pay", "결제"], ["feed", "커뮤니티"], ["info", "학원 정보"]];
 
   return (
     <>
       <header className="pp-head" style={{ position: "sticky" }}>
         <Brand to="/parentportal" sub={facility?.name} />
         <div className="right">
-          <button className="btn ghost sm" onClick={onExit} title="다른 시설로">시설 전환</button>
+          <button className="btn ghost sm" onClick={onExit} title="다른 학원으로">학원 전환</button>
           <button className="bell" onClick={openPanel} aria-label={`알림 ${unread}건`}>
             🔔{unread > 0 && <span className="dot">{unread > 99 ? "99+" : unread}</span>}
           </button>
@@ -735,9 +739,23 @@ function KidsTab({ kids, onChanged, onGoPay, onApply }) {
     await unlinkParentChild(child.member_id).catch(() => null);
     onChanged();
   };
+  // v10: 출석 키오스크 대신 선생님이 '출석 체크'를 누르면 알림 → 브라우저 알림 권한을 직접 켤 수 있게 안내
+  const [notifyPerm, setNotifyPerm] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
+  const enableNotify = async () => {
+    try { setNotifyPerm(await Notification.requestPermission()); } catch { setNotifyPerm("denied"); }
+  };
 
   return (
     <>
+      {kids.length > 0 && notifyPerm === "default" && (
+        <div className="fl-banner" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <span>🔔 선생님이 출석·하원을 체크하면 바로 알려 드려요. 이 기기에서 알림을 받으려면 알림을 켜 주세요.</span>
+          <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={enableNotify}>알림 켜기</button>
+        </div>
+      )}
+      {kids.length > 0 && notifyPerm === "denied" && (
+        <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>브라우저 알림이 꺼져 있어 화면 안의 알림(🔔)으로만 알려 드립니다. 브라우저 설정에서 이 사이트 알림을 허용할 수 있습니다.</div>
+      )}
       {kids.length === 0 && (
         <div className="pp-hero">
           <h2>아직 연결된 자녀가 없어요</h2>
@@ -782,7 +800,7 @@ function KidsTab({ kids, onChanged, onGoPay, onApply }) {
       {linkOpen && (
         <form className="pp-card" onSubmit={link}>
           <h3>기존 학생 연결</h3>
-          <p className="sub">시설에 등록된 자녀 이름과 보호자 연락처가 일치해야 연결됩니다.</p>
+          <p className="sub">학원에 등록된 자녀 이름과 보호자 연락처가 일치해야 연결됩니다.</p>
           {error && <div className="fl-banner danger">{error}</div>}
           <div className="grid2">
             <div className="form-row"><label>자녀 이름</label><input className="input" value={name} onChange={(e) => setName(e.target.value)} required /></div>
@@ -837,8 +855,8 @@ function FacilityInfo({ facility, membership, onChanged, onLeft, onApply }) {
         {msg && <div className="muted" style={{ marginTop: 8 }}>{msg}</div>}
       </form>
       <div className="pp-card">
-        <h3>시설 나가기</h3>
-        <p className="sub">이 시설의 자녀 연결과 커뮤니티 멤버십을 해제합니다.</p>
+        <h3>학원 나가기</h3>
+        <p className="sub">이 학원의 자녀 연결과 커뮤니티 멤버십을 해제합니다.</p>
         <button className="btn danger" onClick={leave}>나가기</button>
       </div>
     </>

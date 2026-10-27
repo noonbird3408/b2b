@@ -1,4 +1,4 @@
-"""v8.1 기능 테스트 — 알림·키오스크·반 공지·과제·수납·모니터링·인사이트·데모 데이터"""
+"""v8.1 기능 테스트 — 알림·출석 알림·반 공지·과제·수납·모니터링·인사이트·데모 데이터 (v10: 키오스크 삭제 반영)"""
 import io
 from datetime import date, datetime, timedelta
 
@@ -74,47 +74,45 @@ def test_bulk_attendance_only_unchecked(owner):
     day = (main._today() - timedelta(days=1)).isoformat()
     owner.post("/api/attendances/mark", json={"member_id": a, "attendance_date": day, "status": "LATE"})
     res = owner.post("/api/attendances/bulk", json={"attendance_date": day, "member_ids": [a, b], "status": "ABSENT"})
-    assert res.json() == {"changed": 1, "skipped": 1}
+    assert res.json() == {"changed": 1, "skipped": 1, "parent_notified": 0}   # 지난 날짜는 알림 없음
     rows = {r["member_id"]: r["status"] for r in owner.get(f"/api/attendances?target_date={day}").json()}
     assert rows[a] == "LATE" and rows[b] == "ABSENT"
 
 
-def test_kiosk_check_in_out_with_masked_names(owner):
-    member_id = _member(owner, "키오스크", "010-5555-7788")
-    parent = _linked_parent("kiosk-parent@example.com", "키오스크", "010-5555-7788")
-    found = owner.get("/api/kiosk/lookup?digits=7788").json()
-    me = next(f for f in found if f["member_id"] == member_id)
-    assert me["masked_name"] == "키**스" or me["masked_name"].startswith("키") and "*" in me["masked_name"]
-    assert "name" not in me and me["next_action"] == "in"
-    res = owner.post("/api/kiosk/check", json={"member_id": member_id, "action": "in"})
-    assert res.status_code == 200 and res.json()["today_status"] in ("PRESENT", "LATE") and res.json()["parent_notified"]
-    assert owner.post("/api/kiosk/check", json={"member_id": member_id, "action": "in"}).status_code == 409
-    assert owner.post("/api/kiosk/check", json={"member_id": member_id, "action": "out"}).json()["next_action"] == "done"
+def test_kiosk_api_removed_attendance_screen_notifies_instead(owner):
+    """v10: 출석 키오스크 삭제 — 출석 체크 화면에서 출석/하원을 누르면 학부모에게 바로 알림"""
+    member_id = _member(owner, "출석알림", "010-5555-7788")
+    parent = _linked_parent("attend-parent@example.com", "출석알림", "010-5555-7788")
+    assert owner.get("/api/kiosk/lookup?digits=7788").status_code == 404
+    assert owner.post("/api/kiosk/check", json={"member_id": member_id, "action": "in"}).status_code == 404
+    today = main._today().isoformat()
+    res = owner.post("/api/attendances/mark", json={"member_id": member_id, "attendance_date": today, "status": "PRESENT"})
+    assert res.status_code == 200 and res.json()["parent_notified"] == 1 and res.json()["parent_linked"] is True
+    again = owner.post("/api/attendances/mark", json={"member_id": member_id, "attendance_date": today, "status": "PRESENT"})
+    assert again.json()["parent_notified"] == 0                       # 같은 상태 → 중복 알림 없음
+    out = owner.post(f"/api/attendances/{res.json()['attendance_id']}/checkout")
+    assert out.status_code == 200 and out.json()["parent_notified"] == 1
     kinds = {n["kind"] for n in _unread(parent)}
     assert {"CHECK_IN", "CHECK_OUT"} <= kinds
-    assert owner.get("/api/kiosk/today").json()["checked_out"] >= 1
-    assert owner.get("/api/kiosk/lookup?digits=12a4").status_code == 400
+    lonely = _member(owner, "미연결학생", "010-5555-0000")
+    res = owner.post("/api/attendances/mark", json={"member_id": lonely, "attendance_date": today, "status": "PRESENT"})
+    assert res.json()["parent_notified"] == 0 and res.json()["parent_linked"] is False
 
 
 def test_late_detection_uses_class_schedule(owner):
     member_id = _member(owner, "지각판정", "010-4444-0001")
     today = main._today()
     code = main.WEEKDAY_CODES[today.weekday()]
+    other = "SUN" if code == "SAT" else "SAT"            # 오늘이 토요일이면 두 시간이 같은 요일이 되어 순서가 바뀜 → 다른 요일
     cls = owner.post("/api/classes", json={"name": "시간표반", "teacher": "강사", "start_date": (today - timedelta(days=1)).isoformat(),
                                            "end_date": (today + timedelta(days=30)).isoformat(),
                                            "schedules": [{"day": code, "start": "14:00", "end": "15:00"},
-                                                         {"day": "SAT", "start": "10:00", "end": "11:00"}]}).json()
-    assert [s["start"] for s in cls["schedules"]] == ["14:00", "10:00"]                # 요일별 시간 저장
+                                                         {"day": other, "start": "10:00", "end": "11:00"}]}).json()
+    assert sorted(s["start"] for s in cls["schedules"]) == ["10:00", "14:00"]                # 요일별 시간 저장
     owner.post(f"/api/classes/{cls['class_id']}/members/{member_id}")
-    db = main.SessionLocal()
-    db.info["facility_id"] = FACILITY["id"]          # 요청 밖에서 직접 호출할 때는 시설 문맥을 지정
-    try:
-        at = lambda h, m: datetime.combine(today, datetime.min.time()).replace(hour=h, minute=m)  # noqa: E731
-        assert main._auto_check_in_status(db, member_id, at(13, 50)) == "PRESENT"
-        assert main._auto_check_in_status(db, member_id, at(14, 10)) == "PRESENT"   # 유예 10분
-        assert main._auto_check_in_status(db, member_id, at(14, 25)) == "LATE"
-    finally:
-        db.close()
+    overview = owner.get("/api/members", params={"class_id": cls["class_id"]}).json()
+    mine = next(m for m in overview if m["member_id"] == member_id)
+    assert any(c["class_id"] == cls["class_id"] and c["scheduled_today"] and c["time"] == "14:00~15:00" for c in mine["classes"])
     bad = owner.put(f"/api/classes/{cls['class_id']}", json={"name": "시간표반", "teacher": "강사",
                                                              "start_date": today.isoformat(), "end_date": today.isoformat(),
                                                              "schedules": [{"day": "MON", "start": "15:00", "end": "14:00"}]})
@@ -259,17 +257,18 @@ def test_demo_data_requires_force_when_members_exist(owner):
     assert owner.post("/api/admin/demo-data", json={}).status_code == 409
     res = owner.post("/api/admin/demo-data", json={"force": True})
     assert res.status_code == 201, res.text
-    assert owner.get("/api/kiosk/lookup?digits=1000").json()
+    assert any(m["mother_phone"] == "010-0000-1000" for m in owner.get("/api/members").json())
     data = owner.get("/api/dashboard/insights").json()
     assert data["revenue"]["months"][-2]["amount"] > 0 and data["risk_students"]
     assert owner.get("/api/community/moderation/stats").json()["auto_flagged"] >= 2
 
 
-def test_staff_can_use_kiosk_but_not_member_admin(owner):
+def test_staff_can_use_attendance_and_inventory_but_not_member_admin(owner):
     owner.post("/api/admin/accounts", json={"email": "front-desk@example.com", "role": "staff"})
     staff = login("front-desk@example.com", "admin")
     assert staff.post(f"/api/facilities/{FACILITY['id']}/enter").status_code == 200
-    assert staff.get("/api/kiosk/today").status_code == 200
+    assert staff.get("/api/attendances").status_code == 200
+    assert staff.get("/api/inventory").status_code == 200
     assert staff.get("/api/admin/summary").status_code == 200
     assert staff.get("/api/todos").status_code == 403
     assert staff.get("/api/dashboard/insights").status_code == 403
@@ -296,4 +295,4 @@ def test_demo_data_seeds_admin_notifications_and_activity(owner):
     kinds = {n["kind"] for n in owner.get("/api/notifications").json()["items"]}
     assert {"MODERATION", "PAYMENT"} <= kinds
     with main.SessionLocal() as db:   # 다른 테스트의 최신 로그에 밀릴 수 있어 DB 에서 직접 확인
-        assert db.query(main.ActivityLog).filter(main.ActivityLog.actor_type == "kiosk").count() >= 3
+        assert db.query(main.ActivityLog).filter(main.ActivityLog.action.like("attendance.%")).count() >= 3

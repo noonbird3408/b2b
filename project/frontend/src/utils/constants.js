@@ -24,6 +24,8 @@ export const NOTIFICATION_META = {
   APPLICATION: { icon: "📝", admin: "/members?tab=applications", parent: "children" },
   POST: { icon: "🗒️", admin: "/community", parent: "feed" },
   SANCTION: { icon: "⛔", admin: "/community?tab=members", parent: "feed" },
+  INVENTORY: { icon: "📦", admin: "/inventory?tab=check", parent: "feed" },
+  PURCHASE: { icon: "🛒", admin: "/inventory?tab=requests", parent: "feed" },
 };
 
 /** "2026-11-04T14:05:00" → "3분 전" */
@@ -54,3 +56,12 @@ export function showBrowserNotification(title, body) {
     new Notification(title, { body, icon: "/favicon.svg" });
   } catch { /* 일부 브라우저(iOS 등)는 지원하지 않음 */ }
 }
+
+// v11 학원 종류 (값은 서버 FACILITY_TYPES 와 같아야 함) — "학원" 은 교과(보습·입시) 학원
+export const FACILITY_TYPES = [
+  ["학원", "교과 (보습·입시)"], ["어학원", "어학"], ["예체능", "예체능 (미술·음악)"], ["코딩·과학", "코딩·과학"],
+  ["체육관", "체육관"], ["도장", "태권도·무도"], ["기타", "기타"],
+];
+export const facilityTypeLabel = (value) => (FACILITY_TYPES.find(([v]) => v === value) || [value, value])[1];
+// 주요 과목 (서버 shop_market.SUBJECTS 와 같아야 함) — 쇼핑몰 교재·교구 추천에 사용
+export const SUBJECTS = ["수학", "영어", "국어", "과학", "코딩", "미술", "음악", "태권도", "체육"];

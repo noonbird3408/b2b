@@ -77,6 +77,14 @@ function B2BShopLive() {
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
     const payment = query.get("payment");
+    // v10: 재고 관리 → '구매 확인'에서 넘어온 경우 해당 상품을 권장 수량만큼 바구니에 담아 둠
+    const sku = query.get("sku");
+    const qty = Math.max(1, Math.min(10000, Number(query.get("qty")) || 1));
+    if (sku && /^[A-Za-z0-9-]{1,40}$/.test(sku)) {
+      setCart({ [sku]: qty });
+      setNotice(`재고 관리에서 요청한 상품(${sku}) ${qty}개를 바구니에 담았습니다.`);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
     if (payment) {
       setNotice(payment === "success" ? `카카오페이 결제가 완료되었습니다. ${query.get("order_no") || ""}` : `결제가 ${payment === "cancel" ? "취소" : "완료되지 않았습니다"}.`);
       window.history.replaceState({}, "", window.location.pathname);
@@ -101,7 +109,8 @@ function B2BShopLive() {
         else setError("계정 정보를 확인할 수 없습니다. 서버 연결을 확인하세요.");
       })
       .finally(() => setAuthLoading(false));
-    const savedTheme = localStorage.getItem("app_theme") || "light";
+    let savedTheme = "light";
+    try { savedTheme = localStorage.getItem("app_theme") || "light"; } catch { /* 저장소가 막힌 브라우저 */ }
     document.body.className = savedTheme === "dark" ? "theme-dark" : "theme-light";
   }, [navigate]);
 

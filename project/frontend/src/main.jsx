@@ -17,7 +17,7 @@ const AdminCheckout = lazy(() => import("./pages/AdminCheckout.jsx"));
 const Shop = lazy(() => import("./pages/Shop.jsx"));
 const B2BShop = lazy(() => import("./pages/B2BShopLive.jsx"));
 const ParentPortal = lazy(() => import("./pages/ParentPortal.jsx"));
-const Kiosk = lazy(() => import("./pages/Kiosk.jsx"));
+const Inventory = lazy(() => import("./pages/Inventory.jsx"));
 
 const Loading = () => <div className="auth-loading">화면을 불러오는 중입니다.</div>;
 
@@ -25,15 +25,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(
   <BrowserRouter>
       <Suspense fallback={<Loading />}>
         <Routes>
-          {/* 1) Google 로그인 → 2) 학부모/관리자 선택 → 3) 관리자는 시설 관리/쇼핑몰 선택 */}
+          {/* 1) Google 로그인 → 2) 학부모/관리자 선택 → 3) 관리자는 학원 관리/쇼핑몰 선택 */}
           <Route path="/" element={<FacilityManagerUI />} />
           {/* 학부모 (카카오페이 결과는 /checkout?kakao=... 로 돌아옴) */}
           <Route path="/parentportal" element={<ParentPortal />} />
           <Route path="/checkout" element={<ParentPortal />} />
           {/* 관리자 */}
           <Route path="/b2b-shop" element={<B2BShop />} />
-          {/* 출석 키오스크 (관리자·직원 세션으로 연 태블릿 — 전체 화면이라 Layout 밖) */}
-          <Route path="/kiosk" element={<Kiosk />} />
+          {/* v10: 출석 키오스크 삭제 — 예전 주소로 들어오면 출석 체크 화면으로 */}
+          <Route path="/kiosk" element={<Navigate to="/attendances" replace />} />
           <Route element={<Layout />}>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/members" element={<Members />} />
@@ -43,6 +43,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
             <Route path="/community" element={<Community />} />
             <Route path="/admin-checkout" element={<AdminCheckout />} />
             <Route path="/shop" element={<Shop />} />
+            <Route path="/inventory" element={<Inventory />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

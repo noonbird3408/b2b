@@ -81,7 +81,7 @@ def test_parent_comment_author_is_server_side(owner):
 def test_staff_limited_to_shop(owner):
     assert owner.post("/api/admin/accounts", json={"email": "staff@example.com", "role": "staff"}).status_code == 201
     staff = login("staff@example.com", "admin")                      # 사전 등록 → 초대 코드 불필요
-    assert staff.get("/api/shop/products").status_code == 428          # 시설 선택 전
+    assert staff.get("/api/shop/products").status_code == 428          # 학원 선택 전
     facilities = staff.get("/api/facilities").json()
     assert [f["facility_id"] for f in facilities] == [owner.facility_id]
     assert staff.post(f"/api/facilities/{owner.facility_id}/enter").status_code == 200
@@ -89,7 +89,7 @@ def test_staff_limited_to_shop(owner):
     assert staff.get("/api/members").status_code == 200                # 직원: 학생·수업 조회 가능
     assert staff.post("/api/members", json={"name": "x", "gender": "M", "age": 1,
                                            "enrollment_date": date.today().isoformat()}).status_code == 403
-    assert staff.post("/api/facilities", json={"name": "직원 시설"}).status_code == 403
+    assert staff.post("/api/facilities", json={"name": "직원 학원"}).status_code == 403
 
 
 def test_shop_recommendations_use_facility_signals(owner):
@@ -99,12 +99,16 @@ def test_shop_recommendations_use_facility_signals(owner):
     owner.post("/api/notices", json={"title": "11월 품새 대회 안내", "content": "대회 참가 신청을 받습니다."})
 
     data = owner.get("/api/shop/recommendations").json()
-    assert data["strategy"] == "rule_based_v1"
+    assert data["strategy"] == "rule_based_v2"
     assert any(e["keyword"] == "대회" for e in data["context"]["events"])
     by_name = {item["name"]: item for item in data["items"]}
     assert "태권도 용품" in by_name and any("도장" in r for r in by_name["태권도 용품"]["reasons"])
-    assert all("utm_source=facility_manager" in item["url"] for item in data["items"])
-    assert all(item["url"].startswith(main.SHOP_BASE_URL) for item in data["items"])
+    # 외부 쇼핑몰(DDM) 링크에만 유입 분석 파라미터, 가상 제휴몰 상품은 앱 안 주소
+    for item in data["items"]:
+        if item["external_link"]:
+            assert "utm_source=facility_manager" in item["url"] and item["url"].startswith(main.SHOP_BASE_URL)
+        else:
+            assert item["url"].startswith("/shop")
 
     product_id = data["items"][0]["product_id"]
     assert owner.post(f"/api/shop/products/{product_id}/click", json={"context": "recommendation"}).status_code == 201
