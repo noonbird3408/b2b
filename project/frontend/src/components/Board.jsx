@@ -4,7 +4,7 @@
 //   v10: 목록 / 바둑판(사진 미리보기) 보기 · 서식 본문(글꼴·굵기·색) · 공지 사진 · 첨부파일 · 공지 자동 작성
 //   데이터 호출은 페이지가 넘겨주는 api 객체로만 (관리자/학부모 경로가 다름)
 // =====================================================================
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { errorText } from "../api";
 import { resizePhotoWithThumb } from "../utils/image";
@@ -14,7 +14,10 @@ import { useDataRefresh } from "../utils/sync";
 import Lightbox from "./Lightbox.jsx";
 import RichEditor from "./RichEditor.jsx";
 
-export const CATEGORY_LABEL = { ALL: "전체", NOTICE: "공지", FREE: "자유", QUESTION: "질문", PHOTO: "활동·사진", INFO: "정보·후기" };
+export const CATEGORY_LABEL = { ALL: "전체", HOT: "🔥 HOT", NOTICE: "공지", FREE: "자유", QUESTION: "질문", PHOTO: "활동·사진", INFO: "정보·후기" };
+const WRITE_CATEGORIES = ["NOTICE", "FREE", "QUESTION", "PHOTO", "INFO"];   // 글쓰기 말머리 (HOT·전체 제외)
+const ANON_KEY = "board_comment_anon";
+const DRAFT_KEY = "board_post_draft_v1";
 const CATEGORY_TONE = { NOTICE: "danger", FREE: "gray", QUESTION: "warning", PHOTO: "success", INFO: "primary" };
 const SEARCH_FIELDS = [["title_content", "제목+내용"], ["title", "제목"], ["content", "내용"], ["author", "작성자"]];
 const NOTICE_KIND = { GENERAL: "일반", EVENT: "행사", URGENT: "긴급" };
@@ -76,12 +79,42 @@ const STYLES = `
 .bd-file:hover{border-color:var(--primary);}
 .bd-file .sz{margin-left:auto;color:var(--text-3);font-size:12px;white-space:nowrap;}
 .bd-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:10px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);}
-.bd-comment{padding:10px 0;border-bottom:1px solid var(--border);font-size:13.5px;}
-.bd-comment .who{font-weight:700;font-size:13px;display:flex;gap:6px;align-items:center;}
-.bd-comment .txt{white-space:pre-wrap;margin-top:3px;word-break:break-word;}
-.bd-comment-form{display:flex;gap:6px;margin-top:12px;}
-.bd-comment-form textarea{flex:1;min-height:44px;max-height:140px;resize:vertical;border:1px solid var(--border);border-radius:8px;padding:9px 10px;font-size:13.5px;}
-.bd-editor{max-height:94dvh;overflow-y:auto;}
+.bd-comment{padding:11px 0;border-bottom:1px solid var(--border);font-size:13.5px;}
+.bd-comment .who{font-weight:700;font-size:13px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.bd-comment .who .writer{color:var(--primary-text);font-size:11px;font-weight:700;border:1px solid var(--primary);border-radius:4px;padding:0 4px;}
+.bd-comment .txt{white-space:pre-wrap;margin-top:4px;word-break:break-word;line-height:1.6;}
+.bd-comment .txt.gone{color:var(--text-3);font-style:italic;}
+.bd-comment .tools{display:flex;gap:2px;margin-left:auto;}
+.bd-comment .tools button{border:0;background:transparent;color:var(--text-3);font-size:12px;padding:3px 7px;border-radius:6px;cursor:pointer;min-height:0;}
+.bd-comment .tools button:hover{background:var(--surface-2);color:var(--text);}
+.bd-comment .tools button.on{color:#DC2626;font-weight:700;}
+.bd-comment .likes{color:#DC2626;font-size:12px;margin-top:3px;}
+.bd-replies{margin:0 0 0 18px;border-left:2px solid var(--border);}
+.bd-reply{padding:9px 0 9px 12px;border-bottom:1px dashed var(--border);background:var(--surface-2);border-radius:0 8px 8px 0;margin:6px 0;}
+.bd-reply:last-child{border-bottom:0;}
+.bd-reply .who:before{content:"↳";color:var(--text-3);font-weight:400;margin-right:2px;}
+.bd-comment.replying{background:var(--primary-soft);border-radius:8px;}
+.bd-comment-form{position:sticky;bottom:-20px;background:var(--surface);padding:10px 0 4px;margin-top:8px;border-top:1px solid var(--border);}
+.bd-comment-form .to{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--primary-text);margin-bottom:6px;}
+.bd-comment-form .row{display:flex;gap:6px;align-items:flex-end;}
+.bd-comment-form textarea{flex:1;min-height:42px;max-height:140px;resize:none;border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:13.5px;background:var(--surface);color:var(--text);}
+.bd-comment-form .anon{display:flex;align-items:center;gap:4px;font-size:12.5px;white-space:nowrap;color:var(--text-2);user-select:none;}
+.bd-hot{color:#DC2626;font-size:12px;font-weight:800;flex-shrink:0;}
+.bd-editor{max-height:94dvh;overflow-y:auto;padding-top:0 !important;}
+.bd-ed-head{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:8px;padding:12px 0;margin-bottom:6px;background:var(--surface);border-bottom:1px solid var(--border);}
+.bd-ed-head h3{margin:0;font-size:16px;flex:1;text-align:center;}
+.bd-ed-cats{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 4px;}
+.bd-ed-title{width:100%;border:0;border-bottom:1px solid var(--border);background:transparent;color:var(--text);font-size:19px;font-weight:700;padding:12px 2px;outline:none;}
+.bd-ed-title:focus{border-bottom-color:var(--primary);}
+.bd-ed-body{margin:12px 0;}
+.bd-ed-body .rte{border:0;border-radius:0;box-shadow:none !important;}
+.bd-ed-body .rte-area{min-height:240px;max-height:none;padding:8px 2px;}
+.bd-ed-body .rte-bar{border-radius:10px;border:1px solid var(--border);position:sticky;top:58px;z-index:2;}
+.bd-ed-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:10px 0;border-top:1px solid var(--border);}
+.bd-ed-tools .tool{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:99px;padding:6px 12px;font-size:13px;cursor:pointer;}
+.bd-ed-tools .tool.on{border-color:var(--primary);background:var(--primary-soft);color:var(--primary-text);font-weight:600;}
+.bd-ed-note{font-size:12px;color:var(--text-3);}
+@media(max-width:700px){.bd-editor{width:100% !important;max-height:100dvh;height:100dvh;border-radius:0 !important;}}
 .bd-editor .photos{display:flex;gap:6px;flex-wrap:wrap;}
 .bd-editor .ph{position:relative;width:72px;height:72px;}
 .bd-editor .ph img{width:100%;height:100%;object-fit:cover;border-radius:8px;}
@@ -194,6 +227,7 @@ export default function Board({ mode, api, membership, classes = [], authorName 
         {item.photos?.length > 0 && <span title={`사진 ${item.photos.length}장`}>📷</span>}
         {item.attachments?.length > 0 && <span title={`첨부 ${item.attachments.length}개`}>📎</span>}
         {item.comment_count > 0 && <span className="cm">[{item.comment_count}]</span>}
+        {item.is_hot && <span className="bd-hot">HOT</span>}
         {item.status === "PENDING" && <span className="badge warning no-dot">검토 중</span>}
         {item.status === "HIDDEN" && <span className="badge gray no-dot">숨김</span>}
         {item.class_name && <span className="badge gray no-dot">{item.class_name}</span>}
@@ -259,7 +293,7 @@ export default function Board({ mode, api, membership, classes = [], authorName 
         </div>
         {canWrite && (
           <button className="btn" type="button"
-            onClick={() => setEditor({ category: category === "ALL" ? (isAdmin ? "NOTICE" : "FREE") : category })}>✏️ 글쓰기</button>
+            onClick={() => setEditor({ category: WRITE_CATEGORIES.includes(category) ? category : (isAdmin ? "NOTICE" : "FREE") })}>✏️ 글쓰기</button>
         )}
       </form>
 
@@ -271,7 +305,7 @@ export default function Board({ mode, api, membership, classes = [], authorName 
               {data.pinned.map((i) => row(i, true))}
               {data.items.map((i) => row(i, false))}
               {!data.items.length && !data.pinned.length && (
-                <div className="empty" style={{ border: 0, borderRadius: 0 }}>{q ? `“${q}” 검색 결과가 없습니다.` : "아직 글이 없습니다."}</div>
+                <div className="empty" style={{ border: 0, borderRadius: 0 }}>{q ? `“${q}” 검색 결과가 없습니다.` : category === "HOT" ? `공감 ${data.hot_likes || 3}개 이상 받은 글이 여기에 모여요.` : "아직 글이 없습니다."}</div>
               )}
             </div>
           ) : (
@@ -344,6 +378,10 @@ function PostDetail({ itemKey, item: listItem, mode, api, canWrite, onClose, onC
   const [item, setItem] = useState(listItem || null);
   const [comments, setComments] = useState([]);
   const [draft, setDraft] = useState("");
+  const [replyTo, setReplyTo] = useState(null);          // 답글 대상 댓글
+  const [anon, setAnon] = useState(() => { try { return localStorage.getItem(ANON_KEY) !== "0"; } catch { return true; } });
+  const setAnonPersist = (v) => { setAnon(v); try { localStorage.setItem(ANON_KEY, v ? "1" : "0"); } catch { /* 무시 */ } };
+  const inputRef = useRef(null);
   const [busy, setBusy] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [error, setError] = useState("");
@@ -386,16 +424,31 @@ function PostDetail({ itemKey, item: listItem, mode, api, canWrite, onClose, onC
     e.preventDefault();
     if (!draft.trim()) return;
     run(async () => {
-      const c = await api.createComment(id, draft.trim());
+      await api.createComment(id, draft.trim(), { parent_comment_id: replyTo?.comment_id, ...(isAdmin ? {} : { is_anonymous: anon }) });
       setDraft("");
-      setComments((prev) => [...prev, c]);
+      setReplyTo(null);
+      loadComments();
       onChanged();
     }, "댓글을 등록하지 못했습니다.");
   };
   const removeComment = (c) => {
     if (!window.confirm("댓글을 삭제할까요?")) return;
-    run(async () => { await api.deleteComment(c.comment_id); setComments((prev) => prev.filter((x) => x.comment_id !== c.comment_id)); onChanged(); }, "댓글을 삭제하지 못했습니다.");
+    run(async () => { await api.deleteComment(c.comment_id); loadComments(); onChanged(); }, "댓글을 삭제하지 못했습니다.");
   };
+  const likeComment = (c) => {
+    if (!api.likeComment) return;
+    run(async () => {
+      const res = await api.likeComment(c.comment_id);
+      setComments((prev) => prev.map((x) => (x.comment_id === c.comment_id ? { ...x, like_count: res.like_count, liked: res.liked } : x)));
+    }, "공감하지 못했습니다.");
+  };
+  const startReply = (c) => { setReplyTo(c); window.setTimeout(() => inputRef.current?.focus(), 0); };
+  // 댓글 묶기 — 원 댓글 아래에 답글 (원 댓글이 숨겨졌으면 답글만 따로)
+  const threads = useMemo(() => {
+    const roots = comments.filter((c) => !c.parent_comment_id || !comments.some((p) => p.comment_id === c.parent_comment_id));
+    return roots.map((r) => ({ root: r, replies: comments.filter((c) => c.parent_comment_id === r.comment_id) }));
+  }, [comments]);
+  const visibleCount = comments.filter((c) => !c.deleted).length;
   const remove = () => {
     if (!window.confirm("이 글을 삭제할까요?")) return;
     run(async () => {
@@ -462,9 +515,9 @@ function PostDetail({ itemKey, item: listItem, mode, api, canWrite, onClose, onC
 
         <div className="bd-actions">
           {!isNotice && (
-            <button className={`btn sm ${item.liked ? "" : "ghost"}`} onClick={like} disabled={busy}>♥ {item.like_count || 0}</button>
+            <button className={`btn sm ${item.liked ? "" : "ghost"}`} onClick={like} disabled={busy}>♥ 공감 {item.like_count || 0}</button>
           )}
-          {!isNotice && <span className="muted">댓글 {comments.length}</span>}
+          {!isNotice && <span className="muted">💬 {visibleCount}</span>}
           <span style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap" }}>
             {isAdmin && <button className="btn ghost sm" onClick={togglePin} disabled={busy}>{item.is_pinned ? "고정 해제" : "📌 고정"}</button>}
             {isAdmin && !isNotice && item.author_role === "parent" && item.status !== "HIDDEN" && (
@@ -480,33 +533,74 @@ function PostDetail({ itemKey, item: listItem, mode, api, canWrite, onClose, onC
 
         {!isNotice && (
           <section aria-label="댓글">
-            {comments.map((c) => (
-              <div key={c.comment_id} className="bd-comment">
-                <div className="who">
-                  {c.author}
-                  {c.author_role === "admin" && <span className="badge primary no-dot" style={{ fontSize: 10 }}>운영자</span>}
-                  {c.pending_review && <span className="badge warning no-dot" style={{ fontSize: 10 }}>검토 중</span>}
-                  {isAdmin && c.review?.decision === "HIDDEN" && <span className="badge gray no-dot" style={{ fontSize: 10 }}>숨김</span>}
-                  <span className="muted" style={{ fontWeight: 400 }}>{relativeTime(c.created_at)}</span>
-                  {(c.mine || isAdmin) && (
-                    <button className="btn ghost sm" style={{ marginLeft: "auto", minHeight: 0, padding: "0 6px" }} onClick={() => removeComment(c)}>삭제</button>
-                  )}
-                </div>
-                <div className="txt">{c.content}</div>
+            {threads.map(({ root, replies }) => (
+              <div key={root.comment_id}>
+                <Comment c={root} isAdmin={isAdmin} busy={busy} active={replyTo?.comment_id === root.comment_id}
+                  canReply={canWrite && item.status !== "HIDDEN" && !root.deleted} canLike={Boolean(api.likeComment)}
+                  onReply={startReply} onLike={likeComment} onDelete={removeComment} />
+                {replies.length > 0 && (
+                  <div className="bd-replies">
+                    {replies.map((c) => (
+                      <Comment key={c.comment_id} c={c} reply isAdmin={isAdmin} busy={busy} canLike={Boolean(api.likeComment)}
+                        canReply={canWrite && item.status !== "HIDDEN" && !root.deleted} onReply={() => startReply(root)}
+                        onLike={likeComment} onDelete={removeComment} />
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
             {!comments.length && <div className="muted" style={{ padding: "12px 0" }}>첫 댓글을 남겨 보세요.</div>}
             {canWrite && item.status !== "HIDDEN" && (
               <form className="bd-comment-form" onSubmit={addComment}>
-                <textarea value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={1000} placeholder="댓글 입력"
-                  onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) addComment(e); }} />
-                <button className="btn" type="submit" disabled={busy || !draft.trim()}>등록</button>
+                {replyTo && (
+                  <div className="to">↳ <b>{replyTo.author}</b>님에게 답글
+                    <button type="button" className="btn ghost sm" style={{ minHeight: 0, padding: "0 6px" }} onClick={() => setReplyTo(null)} aria-label="답글 취소">✕</button>
+                  </div>
+                )}
+                <div className="row">
+                  {!isAdmin && (
+                    <label className="anon"><input type="checkbox" checked={anon} onChange={(e) => setAnonPersist(e.target.checked)} /> 익명</label>
+                  )}
+                  <textarea ref={inputRef} value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={1000} rows={1}
+                    placeholder={replyTo ? "답글을 입력하세요" : "댓글을 입력하세요"}
+                    onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) addComment(e); }} />
+                  <button className="btn" type="submit" disabled={busy || !draft.trim()}>등록</button>
+                </div>
               </form>
             )}
           </section>
         )}
         {lightbox !== null && <Lightbox photos={item.photos} startIndex={lightbox} onClose={() => setLightbox(null)} />}
       </article>
+    </div>
+  );
+}
+
+function Comment({ c, reply = false, isAdmin, busy, active, canReply, canLike, onReply, onLike, onDelete }) {
+  if (c.deleted) {
+    return (
+      <div className={`bd-comment${reply ? " bd-reply" : ""}`}>
+        <div className="txt gone">삭제된 댓글입니다.</div>
+      </div>
+    );
+  }
+  return (
+    <div className={`bd-comment${reply ? " bd-reply" : ""}${active ? " replying" : ""}`}>
+      <div className="who">
+        <span>{c.author}</span>
+        {c.is_writer && <span className="writer">글쓴이</span>}
+        {c.author_role === "admin" && <span className="badge primary no-dot" style={{ fontSize: 10 }}>운영자</span>}
+        {c.pending_review && <span className="badge warning no-dot" style={{ fontSize: 10 }}>검토 중</span>}
+        {isAdmin && c.review?.decision === "HIDDEN" && <span className="badge gray no-dot" style={{ fontSize: 10 }}>숨김</span>}
+        <span className="muted" style={{ fontWeight: 400, fontSize: 12 }}>{relativeTime(c.created_at)}</span>
+        <span className="tools">
+          {canReply && !reply && <button type="button" onClick={() => onReply(c)} disabled={busy}>답글</button>}
+          {canLike && <button type="button" className={c.liked ? "on" : ""} onClick={() => onLike(c)} disabled={busy} aria-pressed={c.liked}>♥ 공감</button>}
+          {(c.mine || isAdmin) && <button type="button" onClick={() => onDelete(c)} disabled={busy}>삭제</button>}
+        </span>
+      </div>
+      <div className="txt">{c.content}</div>
+      {c.like_count > 0 && <div className="likes">♥ {c.like_count}</div>}
     </div>
   );
 }
@@ -576,6 +670,12 @@ function Editor({ mode, api, initial, classes, authorName, onClose, onSaved }) {
   const isAdmin = mode === "admin";
   const isEdit = Boolean(initial.key);
   const editingNotice = initial.kind === "notice";
+  // 새 글은 임시 저장본(이 브라우저)을 이어서 쓸 수 있음 — 사진·첨부는 용량 때문에 저장하지 않음
+  const savedDraft = useMemo(() => {
+    if (isEdit) return null;
+    try { const d = JSON.parse(localStorage.getItem(`${DRAFT_KEY}:${mode}`) || "null"); return d && (d.title || !isBlankHtml(d.html)) ? d : null; }
+    catch { return null; }
+  }, [isEdit, mode]);
   const [form, setForm] = useState(() => ({
     category: editingNotice ? "NOTICE" : initial.category || "FREE",
     title: initial.title || "",
@@ -583,14 +683,28 @@ function Editor({ mode, api, initial, classes, authorName, onClose, onSaved }) {
     photos: initial.photos || [],
     is_pinned: Boolean(initial.is_pinned), notice_category: initial.notice_category || "GENERAL",
     class_id: initial.class_id || "", notify: true,
+    is_anonymous: Boolean(initial.is_anonymous),
   }));
+  const [draftOffer, setDraftOffer] = useState(Boolean(savedDraft));
+  const initialRef = useRef(JSON.stringify([form.title, form.html, form.photos.length]));
+  const dirty = JSON.stringify([form.title, form.html, form.photos.length]) !== initialRef.current;
+  useEffect(() => {
+    if (isEdit || !dirty) return undefined;
+    const t = window.setTimeout(() => {
+      try { localStorage.setItem(`${DRAFT_KEY}:${mode}`, JSON.stringify({ title: form.title, html: form.html, category: form.category, at: Date.now() })); }
+      catch { /* 저장 불가 브라우저 */ }
+    }, 600);
+    return () => window.clearTimeout(t);
+  }, [isEdit, dirty, form.title, form.html, form.category, mode]);
+  const clearDraft = () => { try { localStorage.removeItem(`${DRAFT_KEY}:${mode}`); } catch { /* 무시 */ } };
+  const close = () => { if (dirty && !window.confirm("작성 중인 글이 있어요. 닫을까요? (새 글은 임시 저장됩니다)")) return; onClose(); };
   const [files, setFiles] = useState(initial.attachments || []);     // 이미 올린 첨부
   const [newFiles, setNewFiles] = useState([]);                      // 저장 후 올릴 파일
   const [removedFiles, setRemovedFiles] = useState([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const isNotice = form.category === "NOTICE";
-  const categories = Object.keys(CATEGORY_LABEL).filter((k) => k !== "ALL" && (isAdmin || k !== "NOTICE"));
+  const categories = WRITE_CATEGORIES.filter((k) => isAdmin || k !== "NOTICE");
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
   const canAttach = isNotice ? Boolean(api.uploadNoticeAttachment) : Boolean(api.uploadPostAttachment);
 
@@ -645,7 +759,7 @@ function Editor({ mode, api, initial, classes, authorName, onClose, onSaved }) {
         ownerId = saved.notice_id;
       } else {
         const payload = { title: form.title.trim(), content: "", content_html: form.html, category: form.category, photos,
-          ...(isAdmin ? { is_pinned: form.is_pinned } : {}) };
+          ...(isAdmin ? { is_pinned: form.is_pinned } : { is_anonymous: form.is_anonymous }) };
         const saved = isEdit ? await api.updatePost(initial.post_id, payload) : await api.createPost(payload);
         key = `p${saved.post_id}`;
         ownerId = saved.post_id;
@@ -662,6 +776,7 @@ function Editor({ mode, api, initial, classes, authorName, onClose, onSaved }) {
         }
       }
       if (failed.length) alert(`글은 저장했지만 일부 첨부파일을 처리하지 못했습니다.\n${failed.join("\n")}`);
+      if (!isEdit) clearDraft();
       onSaved(key);
     } catch (error) {
       setErr(errorText(error, "저장하지 못했습니다."));
@@ -671,77 +786,98 @@ function Editor({ mode, api, initial, classes, authorName, onClose, onSaved }) {
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={close}>
       <form className="modal bd-editor" style={{ width: "min(760px,100%)" }} onClick={(e) => e.stopPropagation()} onSubmit={submit}>
-        <h3>{isEdit ? "글 수정" : "글쓰기"}</h3>
-        {err && <div className="fl-banner danger">{err}</div>}
-        <div style={{ display: "grid", gridTemplateColumns: "130px 1fr", gap: 10 }}>
-          <div className="form-row"><label>말머리</label>
-            <select className="select" value={form.category} onChange={set("category")} disabled={isEdit && (editingNotice || isNotice)}>
-              {categories.map((k) => <option key={k} value={k}>{CATEGORY_LABEL[k]}</option>)}
-            </select></div>
-          <div className="form-row"><label>제목</label>
-            <input className="input" value={form.title} onChange={set("title")} maxLength={200} autoFocus /></div>
+        <div className="bd-ed-head">
+          <button type="button" className="btn ghost sm" onClick={close} aria-label="닫기">✕</button>
+          <h3>{isEdit ? "글 수정" : isNotice ? "공지 쓰기" : "글쓰기"}</h3>
+          <button type="submit" className="btn sm" disabled={busy}>{busy ? "저장 중…" : "완료"}</button>
         </div>
+        {err && <div className="fl-banner danger">{err}</div>}
+        {draftOffer && (
+          <div className="fl-banner" style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            임시 저장된 글이 있어요{savedDraft.title ? `: “${savedDraft.title.slice(0, 30)}”` : ""}
+            <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+              <button type="button" className="btn sm" onClick={() => {
+                setForm((f) => ({ ...f, title: savedDraft.title || "", html: savedDraft.html || "",
+                  category: categories.includes(savedDraft.category) ? savedDraft.category : f.category }));
+                setDraftOffer(false);
+              }}>이어 쓰기</button>
+              <button type="button" className="btn ghost sm" onClick={() => { clearDraft(); setDraftOffer(false); }}>삭제</button>
+            </span>
+          </div>
+        )}
+        {!(isEdit && (editingNotice || isNotice)) && (
+          <div className="bd-ed-cats" role="radiogroup" aria-label="말머리">
+            {categories.map((k) => (
+              <button key={k} type="button" role="radio" aria-checked={form.category === k}
+                className={`chip${form.category === k ? " active" : ""}`} onClick={() => setForm((f) => ({ ...f, category: k }))}>{CATEGORY_LABEL[k]}</button>
+            ))}
+          </div>
+        )}
         {isNotice && (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            <div className="form-row"><label>공지 종류</label>
-              <select className="select" value={form.notice_category} onChange={set("notice_category")}>
-                {Object.entries(NOTICE_KIND).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
-              </select></div>
-            <div className="form-row"><label>대상</label>
-              <select className="select" value={form.class_id} onChange={set("class_id")}>
-                <option value="">전체 학부모</option>
-                {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name} 학부모</option>)}
-              </select></div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 8 }}>
+            <select className="select" value={form.notice_category} onChange={set("notice_category")} aria-label="공지 종류">
+              {Object.entries(NOTICE_KIND).map(([k, v]) => <option key={k} value={k}>{v} 공지</option>)}
+            </select>
+            <select className="select" value={form.class_id} onChange={set("class_id")} aria-label="대상">
+              <option value="">전체 학부모</option>
+              {classes.map((c) => <option key={c.class_id} value={c.class_id}>{c.name} 학부모</option>)}
+            </select>
           </div>
         )}
         {isNotice && isAdmin && api.draftNotice && !isEdit && <NoticeDraftBox api={api} classId={form.class_id} onApply={applyDraft} />}
-        <div className="form-row"><label>내용</label>
-          <RichEditor value={form.html} onChange={(html) => setForm((f) => ({ ...f, html }))} maxLength={isNotice ? 20000 : 10000} /></div>
-        <div className="form-row">
-          <label>사진 ({form.photos.length}/{MAX_PHOTOS})</label>
-          <div className="photos">
+        <input className="bd-ed-title" value={form.title} onChange={set("title")} maxLength={200} placeholder="제목" aria-label="제목" autoFocus />
+        <div className="bd-ed-body">
+          <RichEditor value={form.html} onChange={(html) => setForm((f) => ({ ...f, html }))} maxLength={isNotice ? 20000 : 10000}
+            placeholder={isNotice ? "공지 내용을 입력하세요" : "내용을 입력하세요"} />
+        </div>
+        {form.photos.length > 0 && (
+          <div className="photos" style={{ marginBottom: 10 }}>
             {form.photos.map((p, i) => (
               <div className="ph" key={`${i}-${photoSrc(p).slice(-24)}`}>
                 <img src={photoSrc(p)} alt="" />
                 <button type="button" onClick={() => setForm((f) => ({ ...f, photos: f.photos.filter((_, j) => j !== i) }))} aria-label="사진 빼기">×</button>
               </div>
             ))}
-            {form.photos.length < MAX_PHOTOS && (
-              <label className="add">＋<input type="file" accept="image/*" multiple onChange={addPhotos} style={{ display: "none" }} /></label>
-            )}
-          </div>
-        </div>
-        {canAttach && (
-          <div className="form-row">
-            <label>첨부파일 ({files.length + newFiles.length}/{MAX_FILES}) · 파일당 4MB</label>
-            <div style={{ display: "grid", gap: 6 }}>
-              {files.map((f) => (
-                <div className="filerow" key={f.attachment_id}>📎 {f.file_name} <span className="muted">{fileSize(f.size_bytes)}</span>
-                  <button type="button" className="btn ghost sm" onClick={() => { setFiles((p) => p.filter((x) => x.attachment_id !== f.attachment_id)); setRemovedFiles((p) => [...p, f.attachment_id]); }}>빼기</button>
-                </div>
-              ))}
-              {newFiles.map((f, i) => (
-                <div className="filerow" key={`${f.name}-${i}`}>🆕 {f.name} <span className="muted">{fileSize(f.size)}</span>
-                  <button type="button" className="btn ghost sm" onClick={() => setNewFiles((p) => p.filter((_, j) => j !== i))}>빼기</button>
-                </div>
-              ))}
-              {files.length + newFiles.length < MAX_FILES && (
-                <label className="btn ghost sm" style={{ justifySelf: "start" }}>＋ 파일 추가
-                  <input type="file" multiple onChange={addFiles} style={{ display: "none" }} accept={FILE_EXTENSIONS.map((x) => `.${x}`).join(",")} />
-                </label>
-              )}
-            </div>
           </div>
         )}
-        <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 13, marginBottom: 8 }}>
-          {isAdmin && <label style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={form.is_pinned} onChange={set("is_pinned")} /> 상단 고정</label>}
-          {isNotice && !isEdit && <label style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={form.notify} onChange={set("notify")} /> 학부모 알림 보내기</label>}
-        </div>
-        <div className="modal-actions">
-          <button type="button" className="btn ghost" onClick={onClose}>취소</button>
-          <button type="submit" className="btn" disabled={busy}>{busy ? "저장 중…" : isEdit ? "수정" : "등록"}</button>
+        {(files.length > 0 || newFiles.length > 0) && (
+          <div style={{ display: "grid", gap: 6, marginBottom: 10 }}>
+            {files.map((f) => (
+              <div className="filerow" key={f.attachment_id}>📎 {f.file_name} <span className="muted">{fileSize(f.size_bytes)}</span>
+                <button type="button" className="btn ghost sm" onClick={() => { setFiles((p) => p.filter((x) => x.attachment_id !== f.attachment_id)); setRemovedFiles((p) => [...p, f.attachment_id]); }}>빼기</button>
+              </div>
+            ))}
+            {newFiles.map((f, i) => (
+              <div className="filerow" key={`${f.name}-${i}`}>📎 {f.name} <span className="muted">{fileSize(f.size)}</span>
+                <button type="button" className="btn ghost sm" onClick={() => setNewFiles((p) => p.filter((_, j) => j !== i))}>빼기</button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="bd-ed-tools">
+          {form.photos.length < MAX_PHOTOS && (
+            <label className="tool">📷 사진 {form.photos.length ? `${form.photos.length}/${MAX_PHOTOS}` : ""}
+              <input type="file" accept="image/*" multiple onChange={addPhotos} style={{ display: "none" }} /></label>
+          )}
+          {canAttach && files.length + newFiles.length < MAX_FILES && (
+            <label className="tool">📎 파일
+              <input type="file" multiple onChange={addFiles} style={{ display: "none" }} accept={FILE_EXTENSIONS.map((x) => `.${x}`).join(",")} /></label>
+          )}
+          {!isAdmin && !isNotice && (
+            <button type="button" className={`tool${form.is_anonymous ? " on" : ""}`} aria-pressed={form.is_anonymous}
+              onClick={() => setForm((f) => ({ ...f, is_anonymous: !f.is_anonymous }))}>{form.is_anonymous ? "☑" : "☐"} 익명</button>
+          )}
+          {isAdmin && (
+            <button type="button" className={`tool${form.is_pinned ? " on" : ""}`} aria-pressed={form.is_pinned}
+              onClick={() => setForm((f) => ({ ...f, is_pinned: !f.is_pinned }))}>📌 상단 고정</button>
+          )}
+          {isNotice && !isEdit && (
+            <button type="button" className={`tool${form.notify ? " on" : ""}`} aria-pressed={form.notify}
+              onClick={() => setForm((f) => ({ ...f, notify: !f.notify }))}>🔔 학부모 알림</button>
+          )}
+          {!isEdit && dirty && <span className="bd-ed-note" style={{ marginLeft: "auto" }}>임시 저장됨</span>}
         </div>
       </form>
     </div>

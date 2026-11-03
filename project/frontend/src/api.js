@@ -43,7 +43,20 @@ export const localToday = () => {
 export const fetchGoogleAuthConfig = () => API.get("/api/auth/google/config").then(data);
 export const signInWithGoogle = (credential) => API.post("/api/auth/google", { credential }).then(data);
 export const devSignIn = (email, name) => API.post("/api/auth/dev-login", { email, name }).then(data);
-export const fetchMe = () => API.get("/api/auth/me").then(data);
+/** 세션 확인. 서버리스 콜드 스타트·일시적 네트워크 오류로 로그인이 풀린 것처럼 보이지 않도록
+ *  401/403 이 아닌 실패는 짧게 두 번까지 다시 시도합니다(실제 로그아웃·만료만 로그인 화면으로). */
+export const fetchMe = async (retries = 2) => {
+  try {
+    return (await API.get("/api/auth/me")).data;
+  } catch (error) {
+    const status = error?.response?.status;
+    if (retries > 0 && (!status || status >= 500)) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      return fetchMe(retries - 1);
+    }
+    throw error;
+  }
+};
 /** role: "parent" | "admin" — 관리자 권한은 서버가 판정 */
 export const selectRole = (role, inviteCode = "") => API.post("/api/auth/role", { role, invite_code: inviteCode }).then(data);
 export const signOut = () => API.post("/api/auth/logout").then(data);
@@ -60,6 +73,9 @@ export const updateFacility = (id, payload) => API.put(`/api/facilities/${id}`, 
 export const deleteFacility = (id, confirmName) => API.delete(`/api/facilities/${id}`, { params: { confirm_name: confirmName } });
 export const enterFacility = (id) => API.post(`/api/facilities/${id}/enter`).then(data);
 export const exitFacility = () => API.post("/api/facilities/exit").then(data);
+/** 메인(학원 선택) 화면 알림함 — 내가 관리하는 모든 학원의 알림 (facility_id·facility_name 포함) */
+export const fetchAllFacilityNotifications = (params) => API.get("/api/facilities/notifications", { params }).then(data);
+export const markAllFacilityNotificationsRead = (payload) => API.post("/api/facilities/notifications/read", payload).then(data);
 /** 가벼운 동기화 확인 — {data_version} */
 export const fetchSyncVersion = () => API.get("/api/sync").then(data);
 
@@ -218,6 +234,7 @@ export const deleteCommunityPost = (id) => API.delete(`/api/community/posts/${id
 export const fetchComments = (postId) => API.get(`/api/community/posts/${postId}/comments`).then(data);
 export const createComment = (postId, payload) => API.post(`/api/community/posts/${postId}/comments`, payload).then(data);
 export const deleteComment = (commentId) => API.delete(`/api/community/comments/${commentId}`);
+export const likeCommunityComment = (commentId) => API.post(`/api/community/comments/${commentId}/like`).then(data);
 // ----- 커뮤니티 AI 모니터링 -----
 export const fetchModerationQueue = (status = "pending") => API.get("/api/community/moderation", { params: { status } }).then(data);
 export const moderateComment = (commentId, decision) => API.post(`/api/community/comments/${commentId}/moderate`, { decision }).then(data);
@@ -259,8 +276,9 @@ export const deleteParentComment = (commentId) => API.delete(`/api/parent/commun
 export const updateParentMembership = (nickname) => API.put("/api/parent/membership", { nickname }).then(data);
 export const likeParentPost = (id) => API.post(`/api/parent/community/posts/${id}/like`).then(data);
 export const fetchParentComments = (postId) => API.get(`/api/parent/community/posts/${postId}/comments`).then(data);
-export const createParentComment = (postId, content) =>
-  API.post(`/api/parent/community/posts/${postId}/comments`, { content }).then(data);
+export const createParentComment = (postId, content, opts = {}) =>
+  API.post(`/api/parent/community/posts/${postId}/comments`, { content, ...opts }).then(data);   // opts: {parent_comment_id, is_anonymous}
+export const likeParentComment = (commentId) => API.post(`/api/parent/community/comments/${commentId}/like`).then(data);
 export const markParentNoticesRead = (noticeIds) => API.post("/api/parent/notices/read", { notice_ids: noticeIds }).then(data);
 export const fetchParentSummary = () => API.get("/api/parent/summary").then(data);
 export const fetchParentNotifications = (params) => API.get("/api/parent/notifications", { params }).then(data);
@@ -288,6 +306,8 @@ export const fetchDashboardStats = () => API.get("/api/dashboard/stats").then(da
 export const fetchUnpaidMembers = () => API.get("/api/dashboard/unpaid").then(data);
 /** 운영 인사이트 (출석률·수납률·매출 추이·반별·이탈 위험·지표 정의) — 서버에서 집계 */
 export const fetchDashboardInsights = () => API.get("/api/dashboard/insights").then(data);
+/** 최근 활동 전체 이력 — {total, items} (limit·offset 페이지) */
+export const fetchDashboardActivity = (params) => API.get("/api/dashboard/activity", { params }).then(data);
 
 // ----- 과제 -----
 export const fetchAssignments = (classId) => API.get(`/api/classes/${classId}/assignments`).then(data);

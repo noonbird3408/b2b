@@ -1275,12 +1275,6 @@ body {
 
 @media (max-width: 900px) {
   .app-shell.app-shell-responsive { display: flex; flex-direction: column; min-height: 100dvh; }
-  .app-shell-responsive .sidebar { position: static; width: 100%; height: auto; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--border); }
-  .app-shell-responsive .sidebar-brand { padding: 4px 6px 8px; margin: 0 0 6px; }
-  .app-shell-responsive .sidebar-section-label,
-  .app-shell-responsive .sidebar-foot { display: none; }
-  .app-shell-responsive .sidebar nav { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: thin; }
-  .app-shell-responsive .sidebar nav .nav-link { flex: 0 0 auto; margin: 0; padding: 8px 10px; }
   .app-shell-responsive .topbar { padding: 10px 16px; }
   .app-shell-responsive .topbar-search { width: min(360px, 55vw); }
   .app-shell-responsive .page { max-width: none; padding: 20px 18px 32px; flex: 1; }
@@ -1470,9 +1464,6 @@ textarea { font-family: inherit; }
 .row-click { cursor: pointer; }
 
 @media (max-width: 900px) {
-  .app-shell-responsive .sidebar { display: flex; flex-direction: row; align-items: center; gap: 8px; position: sticky; top: 0; z-index: 20; }
-  .app-shell-responsive .sidebar-brand { border: 0; padding: 0; margin: 0; flex-shrink: 0; }
-  .app-shell-responsive .sidebar nav { flex: 1; min-width: 0; }
   .app-shell-responsive .topbar-search { display: none; }
   .fl-brand-text small { display: none; }
 }
@@ -1488,3 +1479,53 @@ textarea { font-family: inherit; }
 .toolbar > .select, .bd-search > .select, .search-row > .select, .segmented + .select { width: auto; max-width: 100%; flex: 0 1 auto; }
 .att-date .input { width: auto; }
 textarea.input { height: auto; padding: 10px 12px; }
+
+/* =====================================================================
+   메뉴 아래 설정 버튼 · 모바일 메뉴 서랍 (v13)
+   - 데스크톱: 왼쪽 사이드바 그대로, 메뉴 목록 바로 밑에 '설정'
+   - 900px 이하(세로로 긴 화면): 사이드바를 숨기고 상단 오른쪽 ☰ 버튼 → 오른쪽에서 서랍이 열림
+   ===================================================================== */
+.nav-link.nav-settings { width: 100%; border: 0; background: transparent; text-align: left; cursor: pointer;
+  margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border); border-radius: 0 0 8px 8px; }
+.nav-link.nav-settings:hover { border-radius: 8px; }
+.sidebar nav { overflow-y: auto; min-height: 0; }
+.sidebar-close { display: none; }
+.topbar-menu-btn { display: none; }
+.sidebar-backdrop { display: none; }
+.fac-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+
+@media (max-width: 900px) {
+  .app-shell-responsive .sidebar {
+    position: fixed; top: 0; right: 0; left: auto; z-index: 2100;
+    width: min(300px, 86vw); height: 100dvh; padding: 14px 12px calc(14px + env(safe-area-inset-bottom));
+    border-right: 0; border-left: 1px solid var(--border); box-shadow: var(--shadow-lg);
+    display: flex; flex-direction: column;
+    transform: translateX(105%); visibility: hidden;
+    transition: transform .22s ease, visibility 0s linear .22s;
+  }
+  .app-shell-responsive .sidebar.open { transform: translateX(0); visibility: visible; transition: transform .22s ease; }
+  .app-shell-responsive .sidebar-brand { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 2px 4px 12px; margin-bottom: 10px; }
+  .app-shell-responsive .sidebar-close { display: grid; place-items: center; width: 34px; height: 34px; flex-shrink: 0;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-2); font-size: 14px; }
+  .app-shell-responsive .sidebar nav { display: block; flex: 1; }
+  .app-shell-responsive .sidebar nav .nav-link { padding: 11px 12px; font-size: 14.5px; cursor: pointer; }
+  .app-shell-responsive .sidebar-section-label,
+  .app-shell-responsive .sidebar-foot { display: flex; }
+  .app-shell-responsive .sidebar-foot .sidebar-foot-gear { display: none; }   /* 서랍에서는 메뉴 밑 '설정' 하나만 */
+  .app-shell-responsive .sidebar-backdrop { display: block; position: fixed; inset: 0; z-index: 2090;
+    background: rgba(15, 23, 42, .42); animation: fade-in .18s ease; }
+  .app-shell-responsive .topbar { position: sticky; top: 0; z-index: 30; }
+  .app-shell-responsive .topbar-menu-btn {
+    display: inline-flex; flex-direction: column; justify-content: center; align-items: center; gap: 4px; position: relative;
+    width: 38px; height: 38px; padding: 0; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
+  }
+  .app-shell-responsive .topbar-menu-btn > span { display: block; width: 16px; height: 2px; border-radius: 2px; background: var(--text-2); }
+  .app-shell-responsive .topbar-menu-dot { position: absolute; top: 6px; right: 6px; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--danger); border: 1.5px solid var(--surface); }
+  .app-shell-responsive .notification-dropdown { position: fixed; top: 58px; left: 8px; right: 8px; width: auto; max-height: 70dvh; }
+}
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .app-shell-responsive .sidebar, .app-shell-responsive .sidebar.open { transition: none; }
+}

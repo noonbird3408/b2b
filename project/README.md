@@ -277,9 +277,11 @@ Vercel → 프로젝트 → **Settings → Environment Variables** 에서 관리
 | `KAKAO_SECRET_KEY` | | [카카오페이 개발자센터](https://developers.kakaopay.com) | 테스트 결제(Secret key dev). 없으면 결제 버튼만 꺼짐 |
 | `KAKAO_CID` | | | 기본 `TC0ONETIME`(테스트용 가맹점) |
 | `SHOP_BASE_URL` / `SHOP_NAME` | | | 연결할 쇼핑몰. 기본 `https://ddmmall77.com` / `DDM` |
+| `AUTH_SESSION_DAYS` | | | 로그인 유지 기간(일), 기본 30. **마지막 접속 시점부터** 다시 계산(슬라이딩)하므로 로그아웃하지 않으면 계속 로그인 상태가 유지됩니다 |
 | `APP_TIMEZONE` | | | '오늘' 계산 기준. 기본 `Asia/Seoul` (Vercel 서버는 UTC) |
 | `GEMINI_MODELS` | | | 사용할 모델 순서, 기본 `gemini-2.5-flash-lite,gemini-2.5-flash` |
 | `MODERATION_AI` | | | `true` 면 규칙 점수가 애매한(20~59점) 학부모 댓글만 Gemini 로 한 번 더 확인 (`GEMINI_API_KEY` 필요). 기본은 규칙 기반만 사용 |
+| `COMMUNITY_HOT_LIKES` | | | 커뮤니티 HOT 게시판에 올라가는 공감 수 (기본 3) |
 | `PLATFORM_ADMIN_EMAILS` | | | 플랫폼 운영자 이메일(쉼표로 구분). B2B 계약 등급 변경과 **쇼핑몰 상품 카탈로그 관리**(모든 학원 공용)를 이 계정만 할 수 있음. 비우면 아무도 못 바꿈 |
 | `APP_NAME` | | | API 문서 제목에 쓰는 서비스 이름, 기본 `쑥쑥` (화면 이름은 `frontend/src/utils/brand.js`) |
 | `MAX_UPLOAD_MB` | | | 과제 첨부 파일 최대 크기(MB), 기본 4. Vercel 요청 한도(4.5MB) 때문에 화면에서는 3MB 까지만 받습니다 |

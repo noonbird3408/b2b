@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   createComment, createCommunityPost, createNotice, deleteAttachment, deleteComment, deleteCommunityPost, deleteNotice,
-  downloadModerationDataset, draftNotice, errorText, fetchClasses, fetchCommunityBoard, fetchCommunityMembers, fetchCommunityPost,
+  downloadModerationDataset, draftNotice, errorText, fetchClasses, likeCommunityComment, fetchCommunityBoard, fetchCommunityMembers, fetchCommunityPost,
   fetchComments, fetchModerationPosts, fetchModerationQueue, fetchModerationStats, likeCommunityPost, moderateComment, moderatePost,
   sanctionCommunityMember, updateCommunityPost, updateNotice, uploadNoticeAttachment, uploadPostAttachment,
 } from "../api";
@@ -19,7 +19,8 @@ const ADMIN_API = {
   deletePost: deleteCommunityPost,
   like: likeCommunityPost,
   comments: fetchComments,
-  createComment: (postId, content) => createComment(postId, { content }),
+  createComment: (postId, content, opts = {}) => createComment(postId, { content, parent_comment_id: opts.parent_comment_id }),
+  likeComment: likeCommunityComment,
   deleteComment,
   createNotice,
   updateNotice,
@@ -50,7 +51,6 @@ export default function Community() {
   return (
     <>
       <h2 className="page-title">커뮤니티</h2>
-      <p className="page-subtitle">공지와 학부모 게시판을 함께 운영합니다.</p>
       <div className="tabs">
         {TABS.map(([k, v]) => <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{v}</button>)}
       </div>
@@ -118,7 +118,7 @@ function ModerationTab() {
         <div className="card-head" style={{ flexWrap: "wrap", gap: 8 }}>
           <div>
             <h3 className="card-title">검토 대기 글 {posts.length}건</h3>
-            <div className="card-sub">자동 모니터링이 의심한 학부모 글 — 공개 전까지 작성자에게만 보입니다.</div>
+            
           </div>
         </div>
         {posts.length === 0 ? <div className="muted">대기 중인 글이 없습니다.</div> : posts.map((p) => (

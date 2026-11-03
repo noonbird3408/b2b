@@ -394,7 +394,7 @@ function B2BShopLive() {
         <div className="b2b-layout">
           <main className="b2b-main">
             <section className="b2b-recommend">
-              <div className="b2b-recommend-copy"><span>기관 맞춤 추천 · {recommendations[0]?.reason?.includes("DB 주문 이력") ? "구매 이력 기반" : "시작 카탈로그"}</span><strong>{activeClassData ? `${activeClassData.name} · ${classQuantity}권/세트` : "수업 인원과 기관 구매 패턴에 맞춘 준비"}</strong><small>주문 이력 집계와 수강 인원으로 상품을 골라보세요.</small></div>
+              <div className="b2b-recommend-copy"><span>기관 맞춤 추천 · {recommendations[0]?.reason?.includes("DB 주문 이력") ? "구매 이력 기반" : "시작 카탈로그"}</span><strong>{activeClassData ? `${activeClassData.name} · ${classQuantity}권/세트` : "반을 고르면 수량을 맞춰 드려요"}</strong></div>
               <div className="b2b-class-picker">
                 {classError && <div className="b2b-class-error" role="status"><span>{classError}</span><button type="button" onClick={() => setClassRetry((retry) => retry + 1)}>다시 시도</button></div>}
                 {manualClassMode ? (
@@ -409,11 +409,11 @@ function B2BShopLive() {
               </div>
             </section>
             <section className="b2b-seasonal">
-              <div><strong>구매 이력 추천</strong><span>주문 완료 데이터에서 자주 함께 구매하는 품목을 계산합니다.</span></div>
-              <span className="b2b-refill-badge">{recommendations.length}개 추천 상품</span>
+              <div><strong>추천 상품</strong></div>
+              <span className="b2b-refill-badge">{recommendations.length}개</span>
             </section>
             <div className="b2b-recommend-list">
-              {recommendations.map((product) => <button type="button" key={product.sku} onClick={() => addToCart(product)}><strong>{product.name}</strong><span>{recommendationSource === "purchase_history" ? product.reason : "주문 이력이 쌓이면 구매 패턴에 맞춘 추천으로 바뀝니다."}</span></button>)}
+              {recommendations.map((product) => <button type="button" key={product.sku} onClick={() => addToCart(product)}><strong>{product.name}</strong>{recommendationSource === "purchase_history" && product.reason ? <span>{product.reason}</span> : null}</button>)}
             </div>
             <div className="b2b-catalog-head" id="b2b-catalog">
               <div><h2>기관 전용 상품</h2></div>
@@ -437,7 +437,6 @@ function B2BShopLive() {
               })}
               {!loading && !products.length && <div className="b2b-empty">검색 조건에 맞는 상품이 없습니다.</div>}
             </div>
-            <div className="b2b-peer-note"><span className="b2b-peer-dot" /><div><strong>유사 기관 인기 품목</strong><span>추천은 데이터베이스의 결제 완료/정산 주문 상품 집계로 산출합니다.</span></div></div>
           </main>
 
           <aside className="b2b-cart">

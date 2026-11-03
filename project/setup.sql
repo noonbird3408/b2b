@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS community_posts (
 	status VARCHAR(10), 
 	updated_at TIMESTAMP WITHOUT TIME ZONE, 
 	content_html TEXT, 
+	is_anonymous BOOLEAN, 
 	facility_id INTEGER, 
 	PRIMARY KEY (post_id)
 );
@@ -146,6 +147,7 @@ ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS view_count INTEGER;  -- 이
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS status VARCHAR(10);  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS content_html TEXT;  -- 이전 버전 보완
+ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN;  -- 이전 버전 보완
 ALTER TABLE community_posts ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
 CREATE INDEX IF NOT EXISTS ix_community_posts_created_at ON community_posts (created_at);
 CREATE INDEX IF NOT EXISTS ix_community_posts_facility_id ON community_posts (facility_id);
@@ -427,6 +429,10 @@ CREATE TABLE IF NOT EXISTS community_comments (
 	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
 	author_role VARCHAR(10), 
 	admin_user_id INTEGER, 
+	parent_comment_id INTEGER, 
+	is_anonymous BOOLEAN, 
+	like_count INTEGER, 
+	deleted_at TIMESTAMP WITHOUT TIME ZONE, 
 	facility_id INTEGER, 
 	PRIMARY KEY (comment_id), 
 	FOREIGN KEY(post_id) REFERENCES community_posts (post_id)
@@ -434,10 +440,30 @@ CREATE TABLE IF NOT EXISTS community_comments (
 ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS user_id INTEGER;  -- 이전 버전 보완
 ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS author_role VARCHAR(10);  -- 이전 버전 보완
 ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS admin_user_id INTEGER;  -- 이전 버전 보완
+ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS parent_comment_id INTEGER;  -- 이전 버전 보완
+ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN;  -- 이전 버전 보완
+ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS like_count INTEGER;  -- 이전 버전 보완
+ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;  -- 이전 버전 보완
 ALTER TABLE community_comments ADD COLUMN IF NOT EXISTS facility_id INTEGER;  -- 이전 버전 보완
 CREATE INDEX IF NOT EXISTS ix_community_comments_facility_id ON community_comments (facility_id);
 CREATE INDEX IF NOT EXISTS ix_community_comments_post_id ON community_comments (post_id);
 CREATE INDEX IF NOT EXISTS ix_community_comments_user_id ON community_comments (user_id);
+CREATE INDEX IF NOT EXISTS ix_community_comments_parent_comment_id ON community_comments (parent_comment_id);
+
+CREATE TABLE IF NOT EXISTS community_comment_likes (
+	like_id SERIAL NOT NULL, 
+	comment_id INTEGER NOT NULL, 
+	user_id INTEGER NOT NULL, 
+	created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now(), 
+	facility_id INTEGER, 
+	PRIMARY KEY (like_id), 
+	CONSTRAINT uq_community_comment_like UNIQUE (comment_id, user_id), 
+	FOREIGN KEY(comment_id) REFERENCES community_comments (comment_id) ON DELETE CASCADE, 
+	FOREIGN KEY(user_id) REFERENCES app_users (user_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_community_comment_likes_comment_id ON community_comment_likes (comment_id);
+CREATE INDEX IF NOT EXISTS ix_community_comment_likes_facility_id ON community_comment_likes (facility_id);
+CREATE INDEX IF NOT EXISTS ix_community_comment_likes_user_id ON community_comment_likes (user_id);
 
 CREATE TABLE IF NOT EXISTS community_likes (
 	like_id SERIAL NOT NULL, 
@@ -898,6 +924,8 @@ CREATE INDEX IF NOT EXISTS ix_shop_orders_facility_created ON shop_orders (facil
 --      성능 점검 인덱스가 추가되었습니다. 모두 새 테이블·NULL 허용 컬럼·인덱스라 기존 데이터에 영향이 없습니다.
 -- v11: 학원 쇼핑몰 — 제휴몰 연결(shop_mall_links) · 주문(shop_orders, shop_order_items) 테이블과
 --      shop_products 의 mall_code·list_price·unit 컬럼이 추가되었습니다(역시 비파괴).
+-- v12: 커뮤니티 대댓글·익명·댓글 공감 — community_comment_likes 테이블과
+--      community_comments(parent_comment_id·is_anonymous·like_count·deleted_at), community_posts.is_anonymous 컬럼(비파괴).
 -- v9(여러 학원): 기존(단일 학원) 데이터의 facility_id 채우기·첫 학원 생성은 백엔드가 처음 시작될 때
 -- 자동으로 한 번 실행합니다(app_meta.schema_version 기록). 이 스크립트는 테이블·컬럼·인덱스만 준비합니다.
 -- Supabase 는 public 스키마의 테이블을 Data API(anon 키)로 노출합니다.
@@ -925,6 +953,7 @@ ALTER TABLE b2b_sample_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE board_attachments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE child_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE community_comments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE community_comment_likes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE community_likes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE community_photos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE enrollment_applications ENABLE ROW LEVEL SECURITY;
@@ -951,4 +980,4 @@ ALTER TABLE comment_reviews ENABLE ROW LEVEL SECURITY;
 ALTER TABLE inventory_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE purchase_requests ENABLE ROW LEVEL SECURITY;
 
-SELECT 'setup 완료 — 테이블 47개 준비됨' AS result;
+SELECT 'setup 완료 — 테이블 48개 준비됨' AS result;

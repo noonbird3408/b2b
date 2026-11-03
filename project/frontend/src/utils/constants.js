@@ -65,3 +65,8 @@ export const FACILITY_TYPES = [
 export const facilityTypeLabel = (value) => (FACILITY_TYPES.find(([v]) => v === value) || [value, value])[1];
 // 주요 과목 (서버 shop_market.SUBJECTS 와 같아야 함) — 쇼핑몰 교재·교구 추천에 사용
 export const SUBJECTS = ["수학", "영어", "국어", "과학", "코딩", "미술", "음악", "태권도", "체육"];
+
+// 메인 화면 알림의 학원 구분색 — 학원 카드 왼쪽 띠와 알림 배지가 같은 색을 써서 한눈에 짝지어 보이게 함.
+// facility_id 로 정해지므로 기기·새로고침과 무관하게 항상 같은 색 (색만으로 구분하지 않도록 이름도 함께 표시)
+export const FACILITY_COLORS = ["#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#EF4444", "#06B6D4", "#EC4899", "#84CC16"];
+export const facilityColor = (facilityId) => FACILITY_COLORS[Math.abs(Number(facilityId) || 0) % FACILITY_COLORS.length];

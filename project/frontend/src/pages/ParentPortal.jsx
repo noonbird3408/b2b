@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  FACILITY_REQUIRED_EVENT, applyToFacility, assignmentFileUrl, cancelParentApplication, createChildProfile, createParentComment,
+  FACILITY_REQUIRED_EVENT, applyToFacility, assignmentFileUrl, cancelParentApplication, createChildProfile, createParentComment, likeParentComment,
   createParentPost, deleteChildProfile, deleteParentAttachment, deleteParentComment, deleteParentPost, enterParentFacility, errorText,
   exitParentFacility, uploadParentAttachment,
   fetchChildProfiles, fetchFacilityDetail, fetchMe, fetchMyFacilities, fetchParentApplications, fetchParentAssignments,
@@ -93,6 +93,7 @@ const PARENT_API = {
   like: likeParentPost,
   comments: fetchParentComments,
   createComment: createParentComment,
+  likeComment: likeParentComment,
   deleteComment: deleteParentComment,
   markNoticeRead: markParentNoticesRead,
   // v10: 본인 글 첨부파일

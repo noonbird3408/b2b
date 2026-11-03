@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   cancelShopOrder, connectShopMall, createShopOrder, createShopProduct, deactivateShopProduct, disconnectShopMall, errorText,
@@ -89,6 +89,33 @@ const SHOP_CSS = `
 .pay-mock{font-size:12px;text-align:center;color:var(--warning-text);background:var(--warning-soft);border-radius:8px;padding:6px 8px;}
 .pay-spin{width:42px;height:42px;border-radius:50%;border:4px solid var(--primary-soft);border-top-color:var(--primary);margin:18px auto;animation:payspin 0.9s linear infinite;}
 @keyframes payspin{to{transform:rotate(360deg)}}
+.shop-card{cursor:pointer;}
+.shop-card .shop-desc{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.shop-rail-wrap{position:relative;}
+.shop-rail{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(210px,230px);gap:12px;overflow-x:auto;scroll-snap-type:x proximity;padding:2px 2px 8px;scrollbar-width:thin;}
+.shop-rail>*{scroll-snap-align:start;}
+.shop-rail-nav{position:absolute;top:40%;width:34px;height:34px;border-radius:50%;border:1px solid var(--border);background:var(--surface);box-shadow:var(--shadow);cursor:pointer;color:var(--text);font-size:16px;z-index:2;}
+.shop-rail-nav.l{left:-10px;}.shop-rail-nav.r{right:-10px;}
+.shop-rail-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:22px 0 10px;}
+.shop-rail-head .shop-section-title{margin:0;}
+.pd-modal{width:min(560px,100%);max-height:90dvh;overflow-y:auto;padding:0 !important;}
+.pd-hero{position:relative;height:200px;display:flex;align-items:center;justify-content:center;font-size:72px;}
+.pd-hero img{width:100%;height:100%;object-fit:cover;}
+.pd-close{position:absolute;top:10px;right:10px;width:34px;height:34px;border-radius:50%;border:0;background:rgba(0,0,0,.45);color:#fff;font-size:16px;cursor:pointer;}
+.pd-body{padding:18px 20px;display:grid;gap:10px;}
+.pd-body h3{margin:0;font-size:19px;line-height:1.35;}
+.pd-desc{font-size:14px;line-height:1.7;color:var(--text);white-space:pre-wrap;margin:0;}
+.pd-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px;}
+.pd-meta dt{color:var(--text-3);}
+.pd-meta dd{margin:0;}
+.pd-tags{display:flex;flex-wrap:wrap;gap:6px;}
+.pd-buy{position:sticky;bottom:0;display:flex;align-items:center;gap:10px;padding:12px 20px;border-top:1px solid var(--border);background:var(--surface);}
+.cart-fab{position:fixed;z-index:900;width:58px;height:58px;border-radius:50%;border:0;background:var(--primary);color:#fff;font-size:24px;
+  box-shadow:0 8px 24px rgba(0,0,0,.22);cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;transition:transform .15s;}
+.cart-fab.drag{transform:scale(1.12);box-shadow:0 14px 34px rgba(0,0,0,.32);cursor:grabbing;transition:none;}
+.cart-fab .n{position:absolute;top:-2px;right:-2px;min-width:22px;height:22px;padding:0 6px;border-radius:11px;background:#DC2626;color:#fff;font-size:12px;font-weight:800;display:grid;place-items:center;border:2px solid var(--surface);}
+.cart-fab.bump{animation:fabbump .35s;}
+@keyframes fabbump{50%{transform:scale(1.18)}}
 .shop-admin{margin-top:26px;}
 .shop-admin table{width:100%;border-collapse:collapse;font-size:12px;}
 .shop-admin th,.shop-admin td{text-align:left;padding:8px;border-bottom:1px solid var(--border);vertical-align:top;}
@@ -96,13 +123,13 @@ const SHOP_CSS = `
 .shop-form .wide{grid-column:1/-1;}
 .shop-form label{display:grid;gap:4px;font-size:12px;color:var(--text-2);}
 @media(max-width:980px){.shop-why{grid-template-columns:1fr 1fr;}.cart-layout{grid-template-columns:1fr;}.cart-sum{position:static;}}
-@media(max-width:640px){.shop-why{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;padding-bottom:4px;}
-  .shop-why div{flex:0 0 72%;scroll-snap-align:start;}
+@media(max-width:640px){.shop-rail{grid-auto-columns:68%;}.shop-rail-nav{display:none;}
   .shop-form{grid-template-columns:1fr;}.shop-admin table{display:block;overflow-x:auto;}.shop-filters{grid-template-columns:1fr 1fr;}
   .cart-line{grid-template-columns:minmax(0,1fr) auto;}.cart-line .hide-sm{display:none;}}
 `;
 
-const TABS = [["home", "추천·검색"], ["malls", "제휴몰"], ["cart", "장바구니"], ["orders", "주문 내역"]];
+const TABS = [["home", "쇼핑"], ["malls", "제휴몰"], ["cart", "장바구니"], ["orders", "주문 내역"]];
+const NAV_TABS = TABS.filter(([k]) => k !== "cart");   // 장바구니는 오른쪽 아래 버튼으로 이동
 const ICONS = { "교재": "📘", "문구·사무": "✏️", "수업 교구": "🧩", "미술·음악": "🎨", "체육·무도 용품": "🥋", "상장·기념품": "🏅", "단체복·굿즈": "🧥" };
 const ORDER_TONE = { PENDING_APPROVAL: "warning", PENDING_PAYMENT: "primary", PAID: "primary", RECEIVED: "success", CANCELED: "gray" };
 const MATCH_LABEL = { name: "상품명", tags: "태그", category: "분류", description: "설명" };
@@ -111,13 +138,6 @@ const EMPTY_FILTER = { min_price: "", max_price: "", quantity: "", fit: false, i
   discount_only: false, purchasable_only: false };
 const EMPTY_FORM = { name: "", category: "교재", url: "", description: "", price: "", list_price: "", unit: "개", mall_code: "",
   image_url: "", tags: "", facility_types: "", min_quantity: 1, active: true };
-const WHY = [
-  ["수업에 맞춰 추천", "개설한 수업·학원 소개에서 과목을 찾아 그 과목 교재·교구를 먼저 보여 줘요."],
-  ["재고와 연결", "안전 재고 아래로 떨어진 물품을 사는 곳을 바로 찾고, 받으면 재고에 자동 반영."],
-  ["거래처 여러 곳, 결제 한 번", "서점·문구점·체육사를 따로 주문하지 않고 한 장바구니에서."],
-  ["학원 회원가", "연결한 제휴몰은 추가 할인 · 일정 금액 이상 무료배송."],
-  ["원장 승인", "직원은 결제 요청만, 돈이 나가는 결정은 원장이."],
-];
 
 function PriceBlock({ product }) {
   return (
@@ -140,41 +160,160 @@ function QtyInput({ value, onChange, min = 1 }) {
   );
 }
 
-function ProductCard({ product, context, onAdd, onOpen }) {
-  const [qty, setQty] = useState(product.min_quantity || 1);
+function ProductCard({ product, context, onAdd, onDetail }) {
   const color = product.mall?.color || "#64748B";
+  const open = () => onDetail(product, context);
   return (
-    <article className="shop-card">
+    <article className="shop-card" role="button" tabIndex={0} onClick={open}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } }} aria-label={`${product.name} 상세 보기`}>
       <div className="shop-thumb" style={{ background: `linear-gradient(135deg, ${color}22, var(--surface-2))` }}>
         {product.image_url ? <img src={product.image_url} alt="" loading="lazy" /> : <span aria-hidden="true">{ICONS[product.category] || "🛍️"}</span>}
         {product.discount_rate > 0 && <span className="shop-off">-{product.discount_rate}%</span>}
         {product.mall && <span className="shop-mall">{product.mall.logo} {product.mall.name}</span>}
       </div>
       <div className="shop-body">
-        <span className="shop-cat">{product.category}{product.min_quantity > 1 ? ` · 최소 ${product.min_quantity}${product.unit}` : ""}</span>
+        <span className="shop-cat">{product.category}</span>
         <h3 className="shop-name">{product.name}</h3>
-        <p className="shop-desc">{product.description}</p>
-        {product.reasons?.length > 0 && (
-          <ul className="shop-reasons" aria-label="추천 이유">
-            {product.reasons.slice(0, 3).map((reason) => <li key={reason}>{reason}</li>)}
-          </ul>
-        )}
-        {product.matched_in?.length > 0 && <span className="muted" style={{ fontSize: 11 }}>일치: {product.matched_in.map((m) => MATCH_LABEL[m] || m).join("·")}</span>}
+        {product.description && <p className="shop-desc">{product.description}</p>}
       </div>
       <div className="shop-foot">
         <PriceBlock product={product} />
-        {product.purchasable ? (
-          <div style={{ display: "grid", gap: 6, justifyItems: "end" }}>
-            <QtyInput value={qty} onChange={setQty} min={product.min_quantity || 1} />
-            <button className="btn sm" type="button" onClick={() => onAdd(product, qty, context)}>담기</button>
-          </div>
-        ) : (
-          <a className="btn ghost sm" href={product.url} target="_blank" rel="noopener noreferrer" onClick={() => onOpen(product, context)}>
-            {product.price ? "쇼핑몰에서 보기 ↗" : "견적 문의 ↗"}
-          </a>
+        {product.purchasable && (
+          <button className="btn sm" type="button" aria-label={`${product.name} 담기`}
+            onClick={(e) => { e.stopPropagation(); onAdd(product, product.min_quantity || 1, context); }}>담기</button>
         )}
       </div>
     </article>
+  );
+}
+
+function ProductDetail({ product, context, onAdd, onOpen, onClose }) {
+  const [qty, setQty] = useState(product.min_quantity || 1);
+  const color = product.mall?.color || "#64748B";
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal pd-modal" role="dialog" aria-label={product.name} onClick={(e) => e.stopPropagation()}>
+        <div className="pd-hero" style={{ background: `linear-gradient(135deg, ${color}33, var(--surface-2))` }}>
+          {product.image_url ? <img src={product.image_url} alt="" /> : <span aria-hidden="true">{ICONS[product.category] || "🛍️"}</span>}
+          {product.discount_rate > 0 && <span className="shop-off">-{product.discount_rate}%</span>}
+          <button type="button" className="pd-close" aria-label="닫기" onClick={onClose}>✕</button>
+        </div>
+        <div className="pd-body">
+          <span className="shop-cat">{product.mall ? `${product.mall.logo} ${product.mall.name} · ` : ""}{product.category}</span>
+          <h3>{product.name}</h3>
+          <PriceBlock product={product} />
+          {product.description ? <p className="pd-desc">{product.description}</p> : <p className="pd-desc muted">상품 설명이 없습니다.</p>}
+          <dl className="pd-meta">
+            <dt>단위</dt><dd>{product.unit}{product.min_quantity > 1 ? ` · 최소 ${product.min_quantity}${product.unit}` : ""}</dd>
+            {product.mall && <><dt>판매처</dt><dd>{product.mall.name}</dd></>}
+            {product.facility_types?.length > 0 && <><dt>추천 대상</dt><dd>{product.facility_types.join(", ")}</dd></>}
+          </dl>
+          {product.reasons?.length > 0 && (
+            <ul className="shop-reasons" aria-label="추천 이유">{product.reasons.slice(0, 4).map((r) => <li key={r}>{r}</li>)}</ul>
+          )}
+          {product.tags?.length > 0 && <div className="pd-tags">{product.tags.slice(0, 10).map((t) => <span key={t} className="shop-chip">#{t}</span>)}</div>}
+        </div>
+        <div className="pd-buy">
+          {product.purchasable ? (
+            <>
+              <QtyInput value={qty} onChange={setQty} min={product.min_quantity || 1} />
+              <button className="btn" style={{ flex: 1 }} type="button" onClick={() => { onAdd(product, qty, context); onClose(); }}>장바구니 담기</button>
+            </>
+          ) : (
+            <a className="btn" style={{ flex: 1, textAlign: "center" }} href={product.url} target="_blank" rel="noopener noreferrer"
+              onClick={() => onOpen(product, context)}>{product.price ? "쇼핑몰에서 보기 ↗" : "견적 문의 ↗"}</a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* 오른쪽 아래 장바구니 버튼 — 누르면 장바구니로, 꾹 누르고(0.4초) 끌면 위치 이동(이 브라우저에 저장) */
+const FAB_KEY = "shop_cart_fab_pos";
+const FAB_SIZE = 58;
+function readFabPos() {
+  try { const p = JSON.parse(localStorage.getItem(FAB_KEY) || "null"); return p && Number.isFinite(p.x) && Number.isFinite(p.y) ? p : null; }
+  catch { return null; }
+}
+function clampFab(p) {
+  const m = 8;
+  return { x: Math.min(Math.max(m, p.x), window.innerWidth - FAB_SIZE - m), y: Math.min(Math.max(m, p.y), window.innerHeight - FAB_SIZE - m) };
+}
+function defaultFab() {
+  const bottom = window.innerWidth <= 760 ? 88 : 28;
+  return { x: window.innerWidth - FAB_SIZE - 24, y: window.innerHeight - FAB_SIZE - bottom };
+}
+
+function CartFab({ count, onOpen }) {
+  const [pos, setPos] = useState(() => clampFab(readFabPos() || defaultFab()));
+  const [dragging, setDragging] = useState(false);
+  const [bump, setBump] = useState(false);
+  const ref = useRef({ timer: 0, start: null, origin: null, moved: false, drag: false });
+
+  useEffect(() => {
+    const onResize = () => setPos((p) => clampFab(p));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const prevCount = useRef(count);
+  useEffect(() => {
+    if (count > prevCount.current) { setBump(true); const t = window.setTimeout(() => setBump(false), 400); prevCount.current = count; return () => window.clearTimeout(t); }
+    prevCount.current = count;
+    return undefined;
+  }, [count]);
+
+  const down = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    const st = ref.current;
+    st.start = { x: e.clientX, y: e.clientY }; st.origin = pos; st.moved = false; st.drag = false;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    window.clearTimeout(st.timer);
+    st.timer = window.setTimeout(() => { st.drag = true; setDragging(true); navigator.vibrate?.(15); }, 400);
+  };
+  const move = (e) => {
+    const st = ref.current;
+    if (!st.start) return;
+    const dx = e.clientX - st.start.x; const dy = e.clientY - st.start.y;
+    if (!st.drag) { if (Math.hypot(dx, dy) > 8) { st.moved = true; window.clearTimeout(st.timer); } return; }
+    setPos(clampFab({ x: st.origin.x + dx, y: st.origin.y + dy }));
+  };
+  const up = () => {
+    const st = ref.current;
+    window.clearTimeout(st.timer);
+    if (st.drag) {
+      setDragging(false);
+      setPos((p) => { try { localStorage.setItem(FAB_KEY, JSON.stringify(p)); } catch { /* 무시 */ } return p; });
+    } else if (st.start && !st.moved) {
+      onOpen();
+    }
+    st.start = null; st.drag = false;
+  };
+  return (
+    <button type="button" className={`cart-fab${dragging ? " drag" : ""}${bump ? " bump" : ""}`} style={{ left: pos.x, top: pos.y }}
+      aria-label={`장바구니 ${count}개`} title="장바구니 (꾹 눌러 위치 이동)"
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
+      onContextMenu={(e) => e.preventDefault()}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } }}>
+      🛒{count > 0 && <span className="n">{count > 99 ? "99+" : count}</span>}
+    </button>
+  );
+}
+
+function Rail({ children }) {
+  const ref = useRef(null);
+  const scroll = (dir) => ref.current?.scrollBy({ left: dir * ref.current.clientWidth * 0.8, behavior: "smooth" });
+  return (
+    <div className="shop-rail-wrap">
+      <button type="button" className="shop-rail-nav l" aria-label="이전" onClick={() => scroll(-1)}>‹</button>
+      <div className="shop-rail" ref={ref}>{children}</div>
+      <button type="button" className="shop-rail-nav r" aria-label="다음" onClick={() => scroll(1)}>›</button>
+    </div>
   );
 }
 
@@ -199,7 +338,7 @@ export default function Shop() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [cartCount, setCartCount] = useState(0);
-  const [showWhy, setShowWhy] = useState(() => { try { return localStorage.getItem("shop_why_hidden") !== "1"; } catch { return true; } });
+  const [detail, setDetail] = useState(null);       // { product, context }
   const isOwner = me?.facility?.my_role === "owner";
   const facilityId = me?.facility?.facility_id;
 
@@ -247,9 +386,10 @@ export default function Shop() {
     if (!facilityId) return;
     addToCart(facilityId, { product_id: product.product_id, name: product.name, quantity: qty, min_quantity: product.min_quantity });
     logShopClick(product.product_id, context);
-    flash(`장바구니에 담았습니다: ${product.name} ${qty}${product.unit}`);
+    flash(`🛒 ${product.name} ${qty}${product.unit} 담음`);
   };
   const handleOpen = (product, context) => { logShopClick(product.product_id, context); };
+  const handleDetail = (product, context) => { logShopClick(product.product_id, context); setDetail({ product, context }); };
   const toggleMall = async (m) => {
     try {
       if (m.connected) {
@@ -265,7 +405,6 @@ export default function Shop() {
       setError(errorText(e, "제휴몰 연결을 바꾸지 못했습니다."));
     }
   };
-  const hideWhy = () => { setShowWhy(false); try { localStorage.setItem("shop_why_hidden", "1"); } catch { /* 무시 */ } };
 
   const ctx = recs?.context;
   const categories = ["전체", ...(info.categories || [])];
@@ -275,69 +414,48 @@ export default function Shop() {
     <div>
       <style>{SHOP_CSS}</style>
       <div className="shop-head">
-        <div>
-          <h1 className="page-title">학원 쇼핑몰</h1>
-          <p className="page-subtitle" style={{ margin: 0 }}>수업·재고에 맞춘 교재·소모품을 제휴몰 여러 곳에서 한 번에. <span className="badge warning no-dot">결제는 모의 결제</span></p>
-        </div>
+        <h1 className="page-title" style={{ margin: 0 }}>학원 쇼핑몰</h1>
         <div className="actions">
-          <button className="btn ghost sm" onClick={() => setTab("cart")}>🛒 장바구니 {cartCount ? <b>{cartCount}</b> : ""}</button>
-          <button className="btn ghost sm" onClick={() => navigate("/b2b-shop")}>B2B 교재·물품 발주</button>
-          {!showWhy && <button className="btn ghost sm" onClick={() => setShowWhy(true)}>왜 여기서 사나요?</button>}
+          <button className="btn ghost sm" onClick={() => navigate("/b2b-shop")}>B2B 발주</button>
         </div>
       </div>
-
-      {showWhy && (
-        <div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <b style={{ fontSize: 13 }}>왜 학원 관리 프로그램 안에서 사나요?</b>
-            <button className="btn ghost sm" onClick={hideWhy} aria-label="설명 접기">접기</button>
-          </div>
-          <div className="shop-why" aria-label="학원 쇼핑몰을 쓰는 이유">
-            {WHY.map(([t, d]) => <div key={t}><b>{t}</b>{d}</div>)}
-          </div>
-        </div>
-      )}
 
       {notice && <div className="fl-banner success" role="status" onClick={() => setNotice("")}>{notice}</div>}
       {error && <div className="fl-banner danger" onClick={() => setError("")}>{error}</div>}
 
       <div className="tabs">
-        {TABS.map(([k, v]) => (
-          <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>
-            {v}{k === "cart" && cartCount > 0 && <span className="count">{cartCount}</span>}
-          </button>
+        {NAV_TABS.map(([k, v]) => (
+          <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{v}</button>
         ))}
       </div>
 
       {tab === "home" && (
         <>
-          <h2 className="shop-section-title">우리 학원 맞춤 추천</h2>
-          {ctx && (
-            <div className="shop-context" aria-label="추천에 사용한 학원 정보">
-              {ctx.subjects.map((s) => <span className="shop-chip subject" key={s.subject} title={`과목 점수 ${s.score}`}>📘 {s.subject} · {s.evidence}</span>)}
-              {!ctx.subjects.length && <span className="shop-chip">과목을 찾지 못했어요 — 수업을 등록하거나 설정에서 주요 과목을 고르세요</span>}
-              {ctx.low_stock.slice(0, 4).map((i) => <span className="shop-chip low" key={i.item_id}>📦 재고 {i.status === "OUT" ? "품절" : "부족"} · {i.name}</span>)}
-              {ctx.events.map((e) => <span className="shop-chip event" key={e.label}>{e.label} · {e.source}</span>)}
-              <span className="shop-chip">활성 회원 {ctx.active_members}명</span>
+          <div className="shop-rail-head">
+            <h2 className="shop-section-title">맞춤 추천</h2>
+          </div>
+          {ctx && (ctx.subjects.length > 0 || ctx.low_stock.length > 0 || ctx.events.length > 0) && (
+            <div className="shop-context" aria-label="추천 기준">
+              {ctx.subjects.slice(0, 4).map((s) => <span className="shop-chip subject" key={s.subject} title={s.evidence}>📘 {s.subject}</span>)}
+              {ctx.low_stock.slice(0, 3).map((i) => <span className="shop-chip low" key={i.item_id}>📦 {i.name}</span>)}
+              {ctx.events.slice(0, 2).map((e) => <span className="shop-chip event" key={e.label}>{e.label}</span>)}
             </div>
           )}
-          <div className="shop-grid">
-            {recs === null && <div className="fl-skeleton" style={{ height: 260, gridColumn: "1/-1" }} />}
-            {recs?.items.map((p) => <ProductCard key={p.product_id} product={p} context="recommendation" onAdd={handleAdd} onOpen={handleOpen} />)}
-            {recs && !recs.items.length && <div className="empty">추천할 상품이 없습니다.</div>}
-          </div>
-          {recs?.definition && <p className="shop-section-sub" style={{ marginTop: 8 }}>ⓘ 추천 점수: {recs.definition}</p>}
+          {recs === null ? <div className="fl-skeleton" style={{ height: 240 }} /> : recs.items.length ? (
+            <Rail>
+              {recs.items.map((p) => <ProductCard key={p.product_id} product={p} context="recommendation" onAdd={handleAdd} onDetail={handleDetail} />)}
+            </Rail>
+          ) : <div className="empty">추천할 상품이 없습니다.</div>}
 
           <h2 className="shop-section-title">상품 검색</h2>
-          <p className="shop-section-sub">여러 단어는 모두 포함된 상품만 찾고(예: “수학 초등”), 비슷한 말도 함께 찾습니다(도복→태권도, 메달→매달).</p>
           <form className="shop-searchbar" role="search" onSubmit={(e) => { e.preventDefault(); setDebounced(query.trim()); }}>
-            <input className="input" placeholder="상품명·과목·용도 검색 (예: 파닉스, 복사지, 대회 메달)" value={query} maxLength={100}
+            <input className="input" placeholder="상품 검색" value={query} maxLength={100}
               onChange={(e) => setQuery(e.target.value)} aria-label="상품 검색" />
             <button type="button" className={`shop-toggle${personalize ? " on" : ""}`} aria-pressed={personalize} onClick={() => setPersonalize((v) => !v)}
-              title="우리 학원 과목·재고·공지 행사·연결한 제휴몰·최근 조회로 순서를 맞춥니다">🎯 맞춤 검색</button>
+>🎯 맞춤</button>
             <button type="button" className={`shop-toggle${filter.discount_only ? " on" : ""}`} aria-pressed={filter.discount_only}
-              onClick={() => setFilter((f) => ({ ...f, discount_only: !f.discount_only }))}>🏷 할인 상품만</button>
-            <button type="button" className={`shop-toggle${filtersOpen ? " on" : ""}`} aria-expanded={filtersOpen} onClick={() => setFiltersOpen((v) => !v)}>⚙ 상세 조건</button>
+              onClick={() => setFilter((f) => ({ ...f, discount_only: !f.discount_only }))}>🏷 할인</button>
+            <button type="button" className={`shop-toggle${filtersOpen ? " on" : ""}`} aria-expanded={filtersOpen} onClick={() => setFiltersOpen((v) => !v)}>⚙ 필터</button>
           </form>
           {filtersOpen && (
             <div className="shop-filters">
@@ -367,13 +485,13 @@ export default function Shop() {
           </div>
           {results?.suggestions?.length > 0 && (
             <div className="shop-suggest" aria-label="추천 검색어">
-              추천 검색어 {results.suggestions.slice(0, 8).map((w) => <button key={w} type="button" onClick={() => { setQuery(w); setDebounced(w); }}>{w}</button>)}
+              {results.suggestions.slice(0, 8).map((w) => <button key={w} type="button" onClick={() => { setQuery(w); setDebounced(w); }}>{w}</button>)}
             </div>
           )}
-          <p className="shop-section-sub">{searching ? "검색 중…" : results ? `${results.total}개 상품${debounced ? ` · “${debounced}”` : ""}` : ""}</p>
+          <p className="shop-section-sub">{searching ? "검색 중…" : results ? `${results.total}개` : ""}</p>
           <div className="shop-grid">
-            {(results?.items || []).map((p) => <ProductCard key={p.product_id} product={p} context="search" onAdd={handleAdd} onOpen={handleOpen} />)}
-            {results && !results.items.length && <div className="empty">조건에 맞는 상품이 없습니다. 검색어나 조건을 바꿔 보세요.</div>}
+            {(results?.items || []).map((p) => <ProductCard key={p.product_id} product={p} context="search" onAdd={handleAdd} onDetail={handleDetail} />)}
+            {results && !results.items.length && <div className="empty">검색 결과가 없습니다.</div>}
           </div>
           {me?.is_platform_admin && <AdminProducts info={info} onChanged={() => { loadRecommendations(); runSearch(); }} setError={setError} flash={flash} />}
         </>
@@ -388,6 +506,8 @@ export default function Shop() {
           onOrdered={() => setTab("orders")} onBrowse={() => setTab("home")} />
       )}
       {tab === "orders" && <OrdersTab isOwner={isOwner} setError={setError} flash={flash} />}
+      {detail && <ProductDetail product={detail.product} context={detail.context} onAdd={handleAdd} onOpen={handleOpen} onClose={() => setDetail(null)} />}
+      {tab !== "cart" && facilityId && <CartFab count={cartCount} onOpen={() => setTab("cart")} />}
     </div>
   );
 }
@@ -397,10 +517,7 @@ function MallsTab({ data, isOwner, onToggle, onBrowse }) {
   const ext = data.external;
   return (
     <>
-      <p className="shop-section-sub" style={{ marginTop: 14 }}>
-        우리 학원 과목: {data.subjects.length ? data.subjects.map((s) => <b key={s.subject} title={s.evidence}>{s.subject} </b>) : "아직 없음"} · {data.definition}.
-        {isOwner ? " ‘연결’하면 학원 회원가가 추가로 적용됩니다." : " 제휴몰 연결은 원장이 합니다."}
-      </p>
+      <div style={{ height: 14 }} />
       <div className="mall-grid">
         {data.malls.map((m) => (
           <div key={m.code} className={`mall-card${m.connected ? " connected" : ""}`}>
@@ -439,7 +556,6 @@ function MallsTab({ data, isOwner, onToggle, onBrowse }) {
               <div><b style={{ fontSize: 15 }}>{ext.name}</b> <span className="badge gray no-dot">외부 쇼핑몰</span>
                 <div className="muted" style={{ fontSize: 12 }}>{ext.tagline}</div></div>
             </div>
-            <div className="muted" style={{ fontSize: 12 }}>주문 제작 상품이라 견적·주문은 해당 사이트에서 진행합니다.</div>
             <div style={{ display: "flex", gap: 6 }}>
               <button className="btn ghost sm" onClick={() => onBrowse(ext.code)}>상품 보기</button>
               <a className="btn ghost sm" href={ext.url} target="_blank" rel="noopener noreferrer" style={{ marginLeft: "auto" }}>사이트 열기 ↗</a>
@@ -476,7 +592,6 @@ function CartTab({ facilityId, isOwner, setError, flash, onOrdered, onBrowse }) 
 
   const setQty = (productId, quantity) => writeCart(facilityId, items.map((i) => (i.product_id === productId ? { ...i, quantity } : i)));
   const remove = (productId) => writeCart(facilityId, items.filter((i) => i.product_id !== productId));
-  const inventoryOf = (productId) => items.find((i) => i.product_id === productId)?.inventory_item_id;
 
   const order = async () => {
     if (!quote || busy) return;
@@ -495,19 +610,20 @@ function CartTab({ facilityId, isOwner, setError, flash, onOrdered, onBrowse }) 
   };
 
   if (!items.length && !paying) {
-    return <div className="empty" style={{ marginTop: 16 }}>장바구니가 비어 있습니다. <button className="btn ghost sm" onClick={onBrowse}>상품 보러 가기</button></div>;
+    return <div className="empty" style={{ marginTop: 16 }}>장바구니가 비어 있습니다. <button className="btn ghost sm" onClick={onBrowse}>쇼핑하러 가기</button></div>;
   }
   return (
     <div className="cart-layout" style={{ marginTop: 14 }}>
       <div>
+        <button className="btn ghost sm" style={{ marginBottom: 10 }} onClick={onBrowse}>← 쇼핑 계속하기</button>
         {quoteError && <div className="fl-banner danger">{quoteError} <button className="btn ghost sm" onClick={() => clearCart(facilityId)}>장바구니 비우기</button></div>}
         {quote?.groups.map((g) => (
           <div key={g.mall.code} className="cart-group">
             <div className="cart-group-head">
               <b>{g.mall.logo} {g.mall.name}</b>
-              {g.connected ? <span className="badge success no-dot">학원 회원가 -{Math.round(g.member_rate * 100)}%</span> : <span className="muted">연결하면 회원가 할인</span>}
+              {g.connected ? <span className="badge success no-dot">학원 회원가 -{Math.round(g.member_rate * 100)}%</span> : null}
               <span className="muted" style={{ marginLeft: "auto" }}>
-                {g.shipping_fee ? `배송비 ${won(g.shipping_fee)} · ${won(g.free_shipping_left)} 더 담으면 무료배송` : "무료배송"}
+                {g.shipping_fee ? `배송비 ${won(g.shipping_fee)}` : "무료배송"}
               </span>
             </div>
             {g.items.map((it) => (
@@ -517,7 +633,6 @@ function CartTab({ facilityId, isOwner, setError, flash, onOrdered, onBrowse }) 
                   <div className="muted" style={{ fontSize: 12 }}>
                     {it.list_price > it.unit_price && <span className="shop-list">{won(it.list_price)}</span>}
                     {won(it.unit_price)} / {it.unit}{it.discount_rate ? ` · ${it.discount_rate}% 할인` : ""}
-                    {inventoryOf(it.product_id) ? " · 📦 입고 시 재고 반영" : ""}
                   </div>
                 </div>
                 <QtyInput value={it.quantity} onChange={(q) => setQty(it.product_id, q)} />
@@ -547,9 +662,6 @@ function CartTab({ facilityId, isOwner, setError, flash, onOrdered, onBrowse }) 
         <button className="btn" disabled={!quote || busy} onClick={order}>
           {busy ? "처리 중…" : isOwner ? "주문하고 결제하기" : "원장에게 결제 요청"}
         </button>
-        <span className="muted" style={{ fontSize: 11.5 }}>
-          {isOwner ? "모의 결제입니다 — 실제로 돈이 나가지 않습니다." : "원장이 승인·결제하면 알림이 갑니다."} 금액은 서버가 상품 가격으로 다시 계산합니다.
-        </span>
       </div>
       {paying && <PayModal order={paying} onClose={() => { setPaying(null); onOrdered(); }}
         onPaid={(o) => { flash(`결제 완료 (모의) · ${o.order_number} · 승인번호 ${o.payment_tid}`); }} />}
@@ -578,7 +690,7 @@ function PayModal({ order, onClose, onPaid }) {
     <div className="modal-backdrop" onClick={stage === "processing" ? undefined : onClose}>
       <div className="modal" style={{ width: "min(420px,100%)" }} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="모의 결제">
         <h3 style={{ marginBottom: 6 }}>결제하기 <span className="muted" style={{ fontSize: 12, fontWeight: 400 }}>{order.order_number}</span></h3>
-        <div className="pay-mock">모의 결제 화면입니다 — 실제 결제 대행사로 연결되지 않으며 돈이 나가지 않습니다.</div>
+        <div className="pay-mock">모의 결제</div>
         {err && <div className="fl-banner danger" style={{ marginTop: 8 }}>{err}</div>}
         {stage !== "done" && <div className="pay-amount">{won(order.total)}</div>}
         {stage === "select" && (
@@ -599,7 +711,6 @@ function PayModal({ order, onClose, onPaid }) {
             <div style={{ fontSize: 40 }}>✅</div>
             <b style={{ fontSize: 17 }}>결제가 완료되었습니다 (모의)</b>
             <span className="muted">{result.payment_method_label} · 승인번호 {result.payment_tid}</span>
-            <span className="muted">물건이 도착하면 주문 내역에서 ‘입고 처리’를 누르면 재고에 반영됩니다.</span>
             <div className="modal-actions"><button className="btn" onClick={onClose}>주문 내역 보기</button></div>
           </div>
         )}
@@ -625,9 +736,8 @@ function OrdersTab({ isOwner, setError, flash }) {
     catch (e) { setError(errorText(e, "처리하지 못했습니다.")); }
     finally { setBusy(false); }
   };
-  const receive = (o) => act(() => receiveShopOrder(o.order_id), (res) => (res.inventory_applied.length
-    ? `입고 완료 · 재고 반영: ${res.inventory_applied.map((i) => `${i.name} +${i.added}${i.unit}(현재 ${i.quantity})`).join(", ")}`
-    : "입고 완료 · 연결된 재고 물품이 없어 수량은 바뀌지 않았습니다 (재고 관리에서 쇼핑몰 상품을 연결하면 자동 반영)"));
+  const receive = (o) => act(() => receiveShopOrder(o.order_id), (res) =>
+    `입고 완료 · ${res.inventory_applied.map((i) => `${i.name} +${i.added}${i.unit}${i.created ? "(새 물품)" : ""}`).join(", ")}`);
   const cancel = (o) => {
     const reason = window.prompt(o.status === "PAID" ? "취소 사유 (결제 완료 주문 → 모의 환불)" : "취소 사유 (선택)", "");
     if (reason === null) return;
@@ -642,12 +752,12 @@ function OrdersTab({ isOwner, setError, flash }) {
         <div className="stat-card"><div className="stat-card-head"><span className="stat-label" title={data.definitions.month_spent}>이번 달 구매</span></div>
           <div className="stat-value num">{won(s.month_spent)}</div><div className="stat-sub">{s.month_orders}건 결제</div></div>
         <div className="stat-card"><div className="stat-card-head"><span className="stat-label" title={data.definitions.month_saved}>이번 달 아낀 금액</span></div>
-          <div className="stat-value num" style={{ color: "#DC2626" }}>{won(s.month_saved)}</div><div className="stat-sub">상품 할인 + 학원 회원가</div></div>
+          <div className="stat-value num" style={{ color: "#DC2626" }}>{won(s.month_saved)}</div></div>
         <div className="stat-card"><div className="stat-card-head"><span className="stat-label">결제 대기</span></div>
           <div className="stat-value num">{s.pending_approval + s.pending_payment}<span className="unit">건</span></div>
           <div className="stat-sub">직원 요청 {s.pending_approval}건</div></div>
         <div className="stat-card"><div className="stat-card-head"><span className="stat-label">입고 대기</span></div>
-          <div className="stat-value num">{s.to_receive}<span className="unit">건</span></div><div className="stat-sub">도착하면 입고 처리</div></div>
+          <div className="stat-value num">{s.to_receive}<span className="unit">건</span></div></div>
       </div>
       <div className="toolbar" style={{ marginBottom: 10 }}>
         <select className="select" value={status} onChange={(e) => setStatus(e.target.value)} aria-label="주문 상태">

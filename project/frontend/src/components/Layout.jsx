@@ -5,7 +5,7 @@ import {
   fetchAdminNotifications, fetchAdminSummary, fetchAppSettings, fetchMe, fetchSyncVersion, importAdminSettings, loadDemoData,
   markAdminNotificationsRead, saveAppSettings, signOut, updateAdminAccount,
 } from "../api";
-import { FACILITY_TYPES, NOTIFICATION_META, WEATHER_CITIES, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
+import { FACILITY_TYPES, NOTIFICATION_META, WEATHER_CITIES, facilityColor, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import { announceDataChanged } from "../utils/sync";
 import { resizeImageFile } from "../utils/image";
 import Brand from "./Brand.jsx";
@@ -73,6 +73,7 @@ export default function Layout() {
   const [online, setOnline] = useState(true);
   const [notifications, setNotifications] = useState([]);
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);      // 모바일(세로 화면) 메뉴 서랍
   const [toasts, setToasts] = useState([]);
   const [globalQuery, setGlobalQuery] = useState("");
   const searchRef = useRef(null);
@@ -212,9 +213,19 @@ export default function Layout() {
     return () => window.clearInterval(timer);
   }, [summary?.todos, pushToast]);
 
+  // 모바일 메뉴 서랍: 화면 이동하면 닫고, 열려 있는 동안 뒤 화면 스크롤 잠금
+  useEffect(() => { setIsMenuOpen(false); }, [location.pathname, location.search]);
+  useEffect(() => {
+    if (!isMenuOpen) return undefined;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [isMenuOpen]);
+
   useEffect(() => {
     const onKey = (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); searchRef.current?.focus(); }
+      if (e.key === "Escape") { setIsMenuOpen(false); setIsDropdownOpen(false); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -233,9 +244,12 @@ export default function Layout() {
     fetchAdminAccounts().then(setAdminAccounts).catch((error) => setSettingsMessage(errorText(error, "계정 목록을 불러오지 못했습니다.")));
   }, [activeTab, isSettingsOpen, isOwner]);
 
+  const openSettings = () => { setIsMenuOpen(false); setIsSettingsOpen(true); };
+
   const openNotifications = async () => {
     const next = !isDropdownOpen;
     setIsDropdownOpen(next);
+    if (next) setIsMenuOpen(false);
     if (next) {
       try {
         if (typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => null);
@@ -432,13 +446,18 @@ export default function Layout() {
   const brand = summary?.brand || {};
   const unreadCount = summary?.unread_notifications || 0;
   const visibleMenu = isOwner ? menuOrder : menuOrder.filter((item) => STAFF_PATHS.includes(item.to));
+  const menuHasBadge = visibleMenu.some((item) => NAV_BADGES[item.id] && NAV_BADGES[item.id](summary?.badges || {}) > 0);
   const setA = (key) => (e) => setAcademyInfo((prev) => ({ ...prev, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
   const tabs = isOwner ? ["화면", "기관 정보", "수납", "계정", "데이터"] : ["화면"];
 
   return (
     <div className="app-shell app-shell-responsive">
-      <aside className="sidebar">
-        <div className="sidebar-brand"><Brand sub={facility.name} /></div>
+      {isMenuOpen && <div className="sidebar-backdrop" onClick={() => setIsMenuOpen(false)} aria-hidden="true" />}
+      <aside id="app-menu" className={`sidebar${isMenuOpen ? " open" : ""}`} aria-label="메뉴">
+        <div className="sidebar-brand">
+          <Brand sub={facility.name} />
+          <button type="button" className="sidebar-close" onClick={() => setIsMenuOpen(false)} aria-label="메뉴 닫기">✕</button>
+        </div>
         <div className="sidebar-section-label">메뉴</div>
         <nav>
           {visibleMenu.map((item, index) => (
@@ -452,6 +471,11 @@ export default function Layout() {
               )}
             </NavLink>
           ))}
+          {/* 메뉴 목록 바로 밑의 설정 — 데스크톱·모바일 모두 같은 위치 */}
+          <button type="button" className="nav-link nav-settings" onClick={openSettings}>
+            <span style={{ width: 18, textAlign: "center" }}>⚙</span>
+            <span>설정</span>
+          </button>
         </nav>
         <div className="sidebar-foot">
           <div className="avatar">{(brand.principal || account.username || "관").charAt(0)}</div>
@@ -459,7 +483,7 @@ export default function Layout() {
             <div className="sidebar-foot-name">{isOwner ? (brand.principal || account.username) : account.username}</div>
             <div className="sidebar-foot-role">{isOwner ? (brand.role || "원장") : "직원"}</div>
           </div>
-          <button type="button" className="sidebar-foot-gear" onClick={() => setIsSettingsOpen(true)} title="설정"
+          <button type="button" className="sidebar-foot-gear" onClick={openSettings} title="설정" aria-label="설정"
             style={{ border: 0, background: "transparent" }}>⚙</button>
         </div>
       </aside>
@@ -485,8 +509,11 @@ export default function Layout() {
               </button>
               {isDropdownOpen && (
                 <div className="notification-dropdown">
-                  <div className="notification-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span>알림 {unreadCount > 0 ? `(${unreadCount})` : ""}</span>
+                  <div className="notification-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                      <span className="fac-dot" style={{ background: facilityColor(facility.facility_id) }} />
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{facility.name} 알림 {unreadCount > 0 ? `(${unreadCount})` : ""}</span>
+                    </span>
                     {unreadCount > 0 && <button className="notification-del-btn" onClick={handleReadAll}>모두 읽음</button>}
                   </div>
                   {notifications.length === 0 ? (
@@ -506,6 +533,12 @@ export default function Layout() {
                 </div>
               )}
             </div>
+            {/* 모바일(세로 화면)에서만 보이는 메뉴 버튼 — 누르면 오른쪽에서 메뉴 서랍이 열림 */}
+            <button type="button" className="topbar-menu-btn" onClick={() => { setIsDropdownOpen(false); setIsMenuOpen((v) => !v); }}
+              aria-label={isMenuOpen ? "메뉴 닫기" : "메뉴 열기"} aria-expanded={isMenuOpen} aria-controls="app-menu">
+              <span /><span /><span />
+              {menuHasBadge && <i className="topbar-menu-dot" aria-hidden="true" />}
+            </button>
           </div>
         </div>
 

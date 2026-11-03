@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  createFacility, deleteFacility, devSignIn, enterFacility, errorText, fetchFacilities, fetchGoogleAuthConfig, fetchMe,
-  selectRole, signInWithGoogle, signOut, updateFacility,
+  createFacility, deleteFacility, devSignIn, enterFacility, errorText, fetchAllFacilityNotifications, fetchFacilities,
+  fetchGoogleAuthConfig, fetchMe, markAllFacilityNotificationsRead, selectRole, signInWithGoogle, signOut, updateFacility,
 } from "../api";
 import { BRAND } from "../utils/brand";
-import { FACILITY_TYPES, facilityTypeLabel } from "../utils/constants";
+import {
+  FACILITY_TYPES, NOTIFICATION_META, facilityColor, facilityTypeLabel, relativeTime, startVisiblePolling,
+} from "../utils/constants";
 import SubjectPicker from "./SubjectPicker.jsx";
 import Brand from "./Brand.jsx";
 
@@ -66,6 +68,30 @@ const STYLES = `
 .fm-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;}
 .fm-form-grid .full{grid-column:1/-1;}
 .fm-check{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--text-2);}
+.fac-card{border-left:4px solid var(--fac-color,var(--border));}
+.fac-card.fac-new{border-left:1.5px dashed var(--border-strong);}
+.fac-card.current{border-left-color:var(--fac-color);}
+.fac-unread{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:var(--fac-color);background:color-mix(in srgb,var(--fac-color) 12%,transparent);border-radius:999px;padding:2px 8px;margin-top:4px;}
+.fm-bell{position:relative;}
+.fm-bell-btn{position:relative;width:34px;height:34px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);display:grid;place-items:center;font-size:14px;}
+.fm-bell-btn .cnt{position:absolute;top:-5px;right:-5px;min-width:17px;height:17px;padding:0 4px;border-radius:9px;background:var(--danger);color:#fff;font-size:10px;font-weight:700;display:grid;place-items:center;}
+.fm-notif{position:absolute;top:42px;right:0;width:360px;max-height:min(520px,75dvh);display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-lg);z-index:50;overflow:hidden;text-align:left;}
+.fm-notif-head{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border-bottom:1px solid var(--border);background:var(--surface-2);font-weight:700;font-size:13px;}
+.fm-notif-filter{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;}
+.fm-notif-filter button{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface);font-size:12px;color:var(--text-2);}
+.fm-notif-filter button.active{border-color:var(--text-2);color:var(--text);font-weight:700;}
+.fm-notif-filter b{font-size:10.5px;color:var(--danger);}
+.fm-notif-list{overflow-y:auto;}
+.fm-notif-item{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--border);border-left:4px solid var(--fac-color);background:var(--surface);padding:10px 12px;cursor:pointer;}
+.fm-notif-item:hover{background:var(--surface-hover);}
+.fm-notif-item.unread{background:color-mix(in srgb,var(--fac-color) 7%,var(--surface));}
+.fm-notif-fac{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:var(--fac-color);margin-bottom:3px;max-width:100%;}
+.fm-notif-fac span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fm-notif-title{font-size:13px;color:var(--text);}
+.fm-notif-item.unread .fm-notif-title{font-weight:700;}
+.fm-notif-body{font-size:12px;color:var(--text-2);margin-top:2px;line-height:1.45;}
+.fm-notif-meta{font-size:11px;color:var(--text-3);margin-top:3px;}
+.fm-notif-empty{padding:30px 16px;text-align:center;color:var(--text-3);font-size:13px;}
 @media(max-width:640px){
   .fm-header{padding:10px 12px;gap:8px;}
   .fm-user .name{display:none;}
@@ -73,6 +99,7 @@ const STYLES = `
   .fm-hero h1{font-size:22px;}
   .choice-grid,.fm-form-grid{grid-template-columns:1fr;}
   .fac-head h1{font-size:20px;}
+  .fm-notif{position:fixed;top:56px;left:8px;right:8px;width:auto;}
 }
 `;
 
@@ -80,12 +107,13 @@ function Banner({ tone = "danger", children }) {
   return <div className={`fl-banner ${tone}`} role="alert">{children}</div>;
 }
 
-function Header({ me, onRole, onLogout }) {
+function Header({ me, onRole, onLogout, bell }) {
   return (
     <header className="fm-header">
       <Brand />
       {me ? (
         <div className="fm-user">
+          {bell}
           {me.user.picture && <img src={me.user.picture} alt="" referrerPolicy="no-referrer" />}
           <span className="name">{me.user.name || me.user.email}</span>
           {onRole && <button className="btn ghost sm" type="button" onClick={onRole}>역할 변경</button>}
@@ -276,7 +304,109 @@ function DeleteFacility({ facility, onClose, onDeleted }) {
   );
 }
 
-function FacilityPicker({ me, onEntered }) {
+// ---------------------------------------------------------------------
+// 메인(학원 선택) 화면 알림 — 내가 관리하는 모든 학원의 알림을 한곳에서. 학원마다 고정 색 + 이름으로 구분
+// ---------------------------------------------------------------------
+const MAIN_NOTIFY_INTERVAL = 30000;
+const STAFF_PATHS = ["/attendances", "/members", "/classes", "/inventory", "/shop"];
+
+function useAllFacilityNotifications(enabled) {
+  const [state, setState] = useState({ unread: 0, unread_by_facility: {}, items: [] });
+  const refresh = useCallback(async () => {
+    try { setState(await fetchAllFacilityNotifications({ limit: 50 })); } catch { /* 다음 주기에 재시도 */ }
+  }, []);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    refresh();
+    return startVisiblePolling(refresh, MAIN_NOTIFY_INTERVAL);
+  }, [enabled, refresh]);
+  return [state, refresh, setState];
+}
+
+function MainNotificationBell({ data, refresh, setData, onOpenItem }) {
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState(null);      // null = 전체, 숫자 = facility_id
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  const facilities = [];
+  const seen = new Set();
+  data.items.forEach((n) => {
+    if (!seen.has(n.facility_id)) { seen.add(n.facility_id); facilities.push({ id: n.facility_id, name: n.facility_name }); }
+  });
+  const items = filter == null ? data.items : data.items.filter((n) => n.facility_id === filter);
+
+  const readAll = async () => {
+    const payload = filter == null ? { all: true } : { ids: items.filter((n) => !n.is_read).map((n) => n.notification_id) };
+    await markAllFacilityNotificationsRead(payload).catch(() => null);
+    refresh();
+  };
+  const clickItem = async (n) => {
+    if (!n.is_read) {
+      setData((prev) => ({
+        ...prev,
+        unread: Math.max(0, prev.unread - 1),
+        unread_by_facility: { ...prev.unread_by_facility, [n.facility_id]: Math.max(0, (prev.unread_by_facility[n.facility_id] || 1) - 1) },
+        items: prev.items.map((x) => (x.notification_id === n.notification_id ? { ...x, is_read: true } : x)),
+      }));
+      markAllFacilityNotificationsRead({ ids: [n.notification_id] }).catch(() => null);
+    }
+    setOpen(false);
+    onOpenItem(n);
+  };
+
+  return (
+    <div className="fm-bell" ref={wrapRef}>
+      <button type="button" className="fm-bell-btn" onClick={() => { setOpen((v) => !v); if (!open) refresh(); }}
+        aria-label={`전체 학원 알림 ${data.unread}건`} aria-expanded={open}>
+        🔔{data.unread > 0 && <span className="cnt">{data.unread > 99 ? "99+" : data.unread}</span>}
+      </button>
+      {open && (
+        <div className="fm-notif" role="dialog" aria-label="전체 학원 알림">
+          <div className="fm-notif-head">
+            <span>전체 학원 알림 {data.unread > 0 ? `(${data.unread})` : ""}</span>
+            {items.some((n) => !n.is_read) && <button type="button" className="btn ghost sm" onClick={readAll}>모두 읽음</button>}
+          </div>
+          {facilities.length > 1 && (
+            <div className="fm-notif-filter">
+              <button type="button" className={filter == null ? "active" : ""} onClick={() => setFilter(null)}>전체</button>
+              {facilities.map((f) => (
+                <button key={f.id} type="button" className={filter === f.id ? "active" : ""} onClick={() => setFilter(f.id)}>
+                  <span className="fac-dot" style={{ background: facilityColor(f.id) }} />{f.name}
+                  {data.unread_by_facility[f.id] > 0 && <b>{data.unread_by_facility[f.id]}</b>}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="fm-notif-list">
+            {items.length === 0 ? <div className="fm-notif-empty">새 알림이 없습니다.</div> : items.map((n) => (
+              <button type="button" key={n.notification_id} className={`fm-notif-item${n.is_read ? "" : " unread"}`}
+                style={{ "--fac-color": facilityColor(n.facility_id) }} onClick={() => clickItem(n)}>
+                <div className="fm-notif-fac">
+                  <span className="fac-dot" style={{ background: facilityColor(n.facility_id) }} />
+                  <span>{n.facility_name}</span>
+                </div>
+                <div className="fm-notif-title">{NOTIFICATION_META[n.kind]?.icon || "🔔"} {n.title}</div>
+                {n.body && <div className="fm-notif-body">{n.body}</div>}
+                <div className="fm-notif-meta">{relativeTime(n.created_at)}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FacilityPicker({ me, onEntered, unreadByFacility = {} }) {
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);     // {} = 새 학원
@@ -317,6 +447,7 @@ function FacilityPicker({ me, onEntered }) {
           <div className="fac-grid">
             {items.map((f) => (
               <div key={f.facility_id} className={`fac-card${me.facility?.facility_id === f.facility_id ? " current" : ""}`}
+                style={{ "--fac-color": facilityColor(f.facility_id) }}
                 role="button" tabIndex={0} aria-busy={busyId === f.facility_id}
                 onClick={() => enter(f)} onKeyDown={(e) => e.key === "Enter" && enter(f)}>
                 {f.pending_applications > 0 && <span className="badge warning fac-alert no-dot">가입 신청 {f.pending_applications}</span>}
@@ -325,6 +456,7 @@ function FacilityPicker({ me, onEntered }) {
                   <div style={{ minWidth: 0 }}>
                     <h3>{f.name}</h3>
                     <div className="meta">{[facilityTypeLabel(f.facility_type), f.branch, f.region].filter(Boolean).join(" · ")}</div>
+                    {unreadByFacility[f.facility_id] > 0 && <span className="fac-unread">🔔 새 알림 {unreadByFacility[f.facility_id]}</span>}
                   </div>
                 </div>
                 <div className="fac-stats">
@@ -372,6 +504,8 @@ export default function FacilityManagerUI() {
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const showMainBell = screen === "facilities" && !!me?.can_admin && me?.active_role === "admin";
+  const [allNotifications, refreshAllNotifications, setAllNotifications] = useAllFacilityNotifications(showMainBell);
 
   useEffect(() => {
     fetchGoogleAuthConfig().then(setConfig).catch(() => setConfig({ enabled: false }));
@@ -383,7 +517,12 @@ export default function FacilityManagerUI() {
         else if (current.active_role === "parent") navigate("/parentportal", { replace: true });
         else setScreen("role");
       })
-      .catch(() => setScreen("login"))
+      .catch((err) => {
+        // 401(세션 없음/만료)일 때만 로그인 화면. 서버 일시 오류는 로그인을 풀지 않고 안내만 표시
+        const status = err?.response?.status;
+        if (status && status !== 401 && status !== 403) setError(errorText(err, "서버에 연결하지 못했습니다. 잠시 후 새로고침하세요."));
+        setScreen("login");
+      })
       .finally(() => setChecking(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -426,19 +565,36 @@ export default function FacilityManagerUI() {
     setMe(current);
     navigate(current.facility?.my_role === "owner" ? "/dashboard" : "/attendances");
   };
+  // 메인 알림을 누르면: 그 학원으로 입장 → 알림이 가리키는 화면으로 이동
+  const handleOpenNotification = (n) => run(async () => {
+    const current = await enterFacility(n.facility_id);
+    setMe(current);
+    const isOwner = current.facility?.my_role === "owner";
+    let target = n.link ? `/${String(n.link).replace(/^\//, "")}` : NOTIFICATION_META[n.kind]?.admin;
+    if (target === "/members" && n.member_id) target = `/members?member=${n.member_id}`;
+    if (!target || !(isOwner || STAFF_PATHS.some((p) => target.startsWith(p)))) target = isOwner ? "/dashboard" : "/attendances";
+    navigate(target);
+  }, "알림의 학원으로 이동하지 못했습니다.");
 
   if (checking) return <div className="auth-loading">로그인 상태를 확인하고 있습니다.</div>;
 
   return (
     <div className="fm-root">
       <style>{STYLES}</style>
-      <Header me={me} onLogout={handleLogout} onRole={screen === "facilities" ? () => { setError(""); setScreen("role"); } : null} />
+      <Header me={me} onLogout={handleLogout} onRole={screen === "facilities" ? () => { setError(""); setScreen("role"); } : null}
+        bell={showMainBell ? (
+          <MainNotificationBell data={allNotifications} refresh={refreshAllNotifications} setData={setAllNotifications}
+            onOpenItem={handleOpenNotification} />
+        ) : null} />
       {screen === "login" || !me ? (
         <LoginScreen config={config} error={error} busy={busy} onCredential={handleCredential} onDevLogin={handleDevLogin} />
       ) : screen === "role" ? (
         <RoleSelect me={me} error={error} busy={busy} onParent={handleParent} onAdmin={handleAdmin} />
       ) : (
-        <FacilityPicker me={me} onEntered={handleEntered} />
+        <>
+          {error && <div style={{ width: "min(1080px, calc(100% - 24px))", margin: "16px auto 0" }}><Banner>{error}</Banner></div>}
+          <FacilityPicker me={me} onEntered={handleEntered} unreadByFacility={allNotifications.unread_by_facility} />
+        </>
       )}
     </div>
   );

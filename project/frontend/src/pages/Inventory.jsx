@@ -110,8 +110,8 @@ export default function Inventory() {
     const created = await createPurchaseRequest({ item_id: item.item_id, quantity, note: approve ? "원장 바로 구매 결정" : "" });
     if (approve) await decidePurchaseRequest(created.request_id, "APPROVED", "구매 확인 화면에서 바로 결정");
     return created;
-  }, approve ? `${item.name} ${quantity}${item.unit} 구매를 결정했습니다. 물품이 오면 '구매 요청' 탭에서 입고 처리하세요.`
-    : `${item.name} ${quantity}${item.unit} 구매 요청을 보냈습니다. 원장이 승인하면 알림이 갑니다.`, "구매 요청을 보내지 못했습니다.");
+  }, approve ? `${item.name} ${quantity}${item.unit} 구매 결정`
+    : `${item.name} ${quantity}${item.unit} 구매 요청 완료`, "구매 요청을 보내지 못했습니다.");
 
   const decide = (r, decision) => {
     const note = decision === "REJECTED" ? window.prompt("반려 사유(선택)", "") : "";
@@ -133,7 +133,6 @@ export default function Inventory() {
     <>
       <style>{STYLES}</style>
       <h2 className="page-title">재고 관리</h2>
-      <p className="page-subtitle">물품 수량을 기록하고, 부족하면 구매 여부를 확인해 쇼핑몰·B2B 발주로 바로 연결합니다.</p>
       {error && <div className="fl-banner danger" onClick={() => setError("")}>{error}</div>}
       {notice && <div className="fl-banner success" role="status">{notice}</div>}
 
@@ -141,14 +140,13 @@ export default function Inventory() {
         <div className="stat-grid" style={{ marginBottom: 14 }}>
           <div className="stat-card"><div className="stat-card-head"><span className="stat-label">등록 물품</span></div>
             <div className="stat-value num">{summary.total}<span className="unit">종</span></div></div>
-          <div className="stat-card"><div className="stat-card-head"><span className="stat-label" title={data.definitions.low}>부족</span></div>
+          <div className="stat-card"><div className="stat-card-head"><span className="stat-label">부족</span></div>
             <div className="stat-value num" style={{ color: summary.low ? "var(--warning-text)" : undefined }}>{summary.low}<span className="unit">종</span></div>
-            <div className="stat-sub">{data.definitions.low}</div></div>
+</div>
           <div className="stat-card"><div className="stat-card-head"><span className="stat-label">품절</span></div>
             <div className="stat-value num" style={{ color: summary.out ? "var(--danger-text, var(--danger))" : undefined }}>{summary.out}<span className="unit">종</span></div></div>
           <div className="stat-card"><div className="stat-card-head"><span className="stat-label">구매 승인 대기</span></div>
-            <div className="stat-value num">{summary.pending_requests}<span className="unit">건</span></div>
-            <div className="stat-sub">{isOwner ? "구매 요청 탭에서 승인·반려" : "원장이 확인합니다"}</div></div>
+            <div className="stat-value num">{summary.pending_requests}<span className="unit">건</span></div></div>
         </div>
       )}
 
@@ -206,7 +204,7 @@ export default function Inventory() {
                   </div>
                 );
               })}
-              {!data.items.length && <div className="empty">{q || status || category !== "전체" ? "조건에 맞는 물품이 없습니다." : "아직 등록한 물품이 없습니다. ‘물품 추가’로 교재·도복·소모품 등을 등록하세요."}</div>}
+              {!data.items.length && <div className="empty">{q || status || category !== "전체" ? "조건에 맞는 물품이 없습니다." : "등록한 물품이 없습니다."}</div>}
             </div>
           )}
         </>
@@ -215,10 +213,9 @@ export default function Inventory() {
       {tab === "check" && (
         check === null ? <div className="fl-skeleton" style={{ height: 220 }} /> : (
           <div className="inv-check">
-            <p className="muted" style={{ margin: 0, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              <span>{check.definition}. 연결한 상품이 없으면 물품 이름(또는 검색어)으로 쇼핑몰·B2B 상품을 찾아 드립니다.</span>
-              <button className="btn ghost sm" style={{ marginLeft: "auto" }} onClick={() => navigate("/shop?tab=cart")}>🛒 쇼핑몰 장바구니 보기</button>
-            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button className="btn ghost sm" onClick={() => navigate("/shop?tab=cart")}>🛒 장바구니</button>
+            </div>
             {check.items.map((item) => <CheckCard key={item.item_id} item={item} isOwner={isOwner} busy={busy}
               onRequest={requestPurchase} navigate={navigate} facilityId={me?.facility?.facility_id} onCart={flash} />)}
             {!check.items.length && <div className="empty">부족하거나 품절된 물품이 없습니다. 👍</div>}
@@ -282,7 +279,7 @@ function CheckCard({ item, isOwner, busy, onRequest, navigate, facilityId, onCar
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <b style={{ fontSize: 15 }}>{item.name}</b>
         <span className={`badge ${STATUS_TONE[item.status]} no-dot`}>{item.status_label}</span>
-        <span className="muted">현재 {item.quantity}{item.unit} · 안전 재고 {item.min_quantity}{item.unit} · 권장 구매 {item.suggested_quantity}{item.unit}</span>
+        <span className="muted">현재 {item.quantity}{item.unit} · 권장 {item.suggested_quantity}{item.unit}</span>
       </div>
       {item.options.length ? item.options.map((o, i) => (
         <div key={i} className="inv-opt">
@@ -299,8 +296,8 @@ function CheckCard({ item, isOwner, busy, onRequest, navigate, facilityId, onCar
                     addToCart(facilityId, { product_id: o.product_id, name: o.name, quantity: Math.max(qty, o.min_quantity || 1),
                       inventory_item_id: item.item_id, min_quantity: o.min_quantity });
                     logShopClick(o.product_id, "inventory");
-                    onCart(`장바구니에 담았습니다: ${o.name} ${Math.max(qty, o.min_quantity || 1)}개 — 입고 처리하면 '${item.name}' 재고가 늘어납니다.`);
-                  }}>🛒 장바구니에 담기</button>
+                    onCart(`장바구니에 담았습니다: ${o.name} ${Math.max(qty, o.min_quantity || 1)}개`);
+                  }}>🛒 담기</button>
                 : <a className="btn ghost sm" href={o.url} target="_blank" rel="noopener noreferrer" onClick={() => logShopClick(o.product_id, "inventory")}>쇼핑몰에서 보기 ↗</a>}
           </span>
         </div>
@@ -310,7 +307,7 @@ function CheckCard({ item, isOwner, busy, onRequest, navigate, facilityId, onCar
         </div>
       )}
       {open ? (
-        <div className="muted">구매 요청 #{open.request_id} — <b>{open.status_label}</b> ({open.quantity}{item.unit}). ‘구매 요청’ 탭에서 확인하세요.</div>
+        <div className="muted">구매 요청 #{open.request_id} · <b>{open.status_label}</b> ({open.quantity}{item.unit})</div>
       ) : (
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <label className="muted" htmlFor={`qty-${item.item_id}`}>구매 수량</label>
@@ -368,9 +365,9 @@ function ItemForm({ initial, categories, onClose, onSaved }) {
             <input className="input" list="inv-categories" value={form.category} onChange={set("category")} maxLength={40} />
             <datalist id="inv-categories">{[...new Set(["교재", "소모품", "수업 물품", "도장 용품", "행사 용품", ...categories])].map((c) => <option key={c} value={c} />)}</datalist></div>
           <div className="form-row"><label>단위</label><input className="input" value={form.unit} onChange={set("unit")} maxLength={20} placeholder="개·권·박스·롤" /></div>
-          <div className="form-row"><label>{isEdit ? "현재 수량 (바꾸면 '재고 조정' 기록)" : "현재 수량"}</label>
+          <div className="form-row"><label>현재 수량</label>
             <input className="input" type="number" min="0" value={form.quantity} onChange={set("quantity")} /></div>
-          <div className="form-row"><label>안전 재고 (이하가 되면 '부족')</label>
+          <div className="form-row"><label>안전 재고</label>
             <input className="input" type="number" min="0" value={form.min_quantity} onChange={set("min_quantity")} /></div>
           <div className="form-row wide"><label>보관 위치</label><input className="input" value={form.location} onChange={set("location")} maxLength={100} placeholder="예: 사무실 수납장 2칸" /></div>
           <div className="form-row"><label>B2B 상품 연결 (선택)</label>
@@ -383,8 +380,8 @@ function ItemForm({ initial, categories, onClose, onSaved }) {
               <option value="">연결 안 함</option>
               {shop.map((p) => <option key={p.product_id} value={p.product_id}>{p.name}</option>)}
             </select></div>
-          <div className="form-row wide"><label>쇼핑몰 검색어 (연결 상품이 없을 때 이 말로 찾음)</label>
-            <input className="input" value={form.keyword} onChange={set("keyword")} maxLength={100} placeholder="비우면 물품 이름으로 찾음 (예: 태권도 띠)" /></div>
+          <div className="form-row wide"><label>쇼핑몰 검색어</label>
+            <input className="input" value={form.keyword} onChange={set("keyword")} maxLength={100} placeholder="비우면 물품 이름" /></div>
           <div className="form-row wide"><label>메모</label><input className="input" value={form.note} onChange={set("note")} maxLength={300} /></div>
         </div>
         <div className="modal-actions">

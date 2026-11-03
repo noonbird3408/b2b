@@ -468,6 +468,7 @@ class CommunityPost(TenantMixin, Base):
     status      = Column(String(10), default="VISIBLE")   # VISIBLE / PENDING(자동 검토 대기) / HIDDEN
     updated_at  = Column(TIMESTAMP)
     content_html = Column(Text)                           # v10: 서식 본문(정리된 HTML). content 는 순수 텍스트
+    is_anonymous = Column(Boolean, default=False)         # v12: 익명 글(학부모) — 관리자 화면에서는 실명 확인 가능
 
 class CommunityComment(TenantMixin, Base):
     __tablename__ = "community_comments"
@@ -482,6 +483,21 @@ class CommunityComment(TenantMixin, Base):
     author_role = Column(String(10), default="parent")
     admin_user_id = Column(Integer)
     post       = relationship("CommunityPost")
+    # v12: 대댓글(한 단계) · 익명 · 공감 · 답글이 남은 댓글의 '삭제됨' 표시
+    parent_comment_id = Column(Integer, index=True)       # 답글이면 원 댓글 번호 (답글의 답글은 원 댓글에 붙임)
+    is_anonymous = Column(Boolean, default=False)
+    like_count   = Column(Integer, default=0)
+    deleted_at   = Column(TIMESTAMP)                      # 답글이 있는 댓글을 지우면 내용만 지우고 자리 유지
+
+
+# v12: 댓글 공감 — 사용자당 댓글 1회 (다시 누르면 취소)
+class CommunityCommentLike(TenantMixin, Base):
+    __tablename__ = "community_comment_likes"
+    __table_args__ = (UniqueConstraint("comment_id", "user_id", name="uq_community_comment_like"),)
+    like_id    = Column(Integer, primary_key=True, autoincrement=True)
+    comment_id = Column(Integer, ForeignKey("community_comments.comment_id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id    = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
 
 
 # v8.1: 좋아요 — 사용자당 게시물 1회 (새로고침해도 다시 누를 수 없음, 다시 누르면 취소)
@@ -1386,7 +1402,11 @@ def _public_base_url(request: Request, configured: str = "") -> str:
 #   3) 미들웨어가 /api/parent/* 는 학부모 세션, 그 외 /api/* 는 관리자 세션을 요구
 # =====================================================================
 AUTH_COOKIE_NAME = "facility_session"
-AUTH_SESSION_DAYS = 14
+# 로그인 유지: 세션은 '마지막 사용 시점'부터 AUTH_SESSION_DAYS 일 동안 유효(슬라이딩 만료).
+#   /api/auth/me 를 부를 때마다(=앱을 열 때마다) 만료일을 다시 늘리므로, 로그아웃하거나 이 기간 동안
+#   한 번도 접속하지 않은 경우가 아니면 로그인이 풀리지 않습니다.
+AUTH_SESSION_DAYS = max(1, int(os.getenv("AUTH_SESSION_DAYS", "30") or 30))
+AUTH_SESSION_RENEW_AFTER = timedelta(hours=12)   # 너무 잦은 DB 쓰기를 막기 위해 12시간에 한 번만 연장
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true" if IS_SERVERLESS else "false").lower() == "true"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ADMIN_SIGNUP_CODE = os.getenv("ADMIN_SIGNUP_CODE", "").strip()
@@ -1979,9 +1999,20 @@ def _session_from_request(request: Request, db: Session):
     return session, user
 
 
+def _renew_session(session: UserSession, raw_token: str, response: Response, db: Session) -> None:
+    """슬라이딩 만료: 사용 중인 세션의 만료일과 쿠키 수명을 다시 AUTH_SESSION_DAYS 로 늘림"""
+    new_expiry = _now() + timedelta(days=AUTH_SESSION_DAYS)
+    if session.expires_at and new_expiry - session.expires_at < AUTH_SESSION_RENEW_AFTER:
+        return
+    session.expires_at = new_expiry
+    db.commit()
+    _set_session_cookie(response, raw_token)
+
+
 @app.get("/api/auth/me")
-def auth_me(request: Request, db: Session = Depends(get_db)):
+def auth_me(request: Request, response: Response, db: Session = Depends(get_db)):
     session, user = _session_from_request(request, db)
+    _renew_session(session, request.cookies.get(AUTH_COOKIE_NAME), response, db)
     return _me_out(db, session, user)
 
 
@@ -2324,6 +2355,62 @@ def my_facilities(db: Session = Depends(get_db), account: AdminAccount = Depends
               .order_by(Facility.name).execution_options(all_facilities=True).all())
     counts = _facility_counts(db, [f.facility_id for f, _ in rows])
     return [_facility_admin_out(f, role, counts) for f, role in rows]
+
+
+# ---------------------------------------------------------------------
+# 메인(학원 선택) 화면 알림함 — 내가 관리하는 모든 학원의 관리자 알림을 학원 이름과 함께 모아 보여 줌
+#   /api/facilities/* 는 학원 선택 전에도 쓰는 영역(_ADMIN_GLOBAL_PREFIXES)이라 관리자 로그인만 확인됩니다.
+#   조회 범위는 '이 사용자에게 온 admin 알림' ∩ '내가 직원/원장으로 등록된(삭제되지 않은) 학원' 으로 제한합니다.
+# ---------------------------------------------------------------------
+def _my_facility_map(db: Session, account: AdminAccount) -> dict:
+    rows = (db.query(Facility.facility_id, Facility.name, Facility.facility_type)
+              .join(FacilityStaff, FacilityStaff.facility_id == Facility.facility_id)
+              .filter(FacilityStaff.account_id == account.account_id, Facility.deleted_at.is_(None))
+              .execution_options(all_facilities=True).all())
+    return {fid: {"facility_id": fid, "facility_name": name, "facility_type": ftype} for fid, name, ftype in rows}
+
+
+@app.get("/api/facilities/notifications")
+def all_facility_notifications(request: Request, limit: int = Query(30, ge=1, le=100), unread_only: bool = False,
+                               db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
+    facilities = _my_facility_map(db, account)
+    if not facilities:
+        return {"unread": 0, "unread_by_facility": {}, "items": []}
+    base = (db.query(Notification)
+              .filter(Notification.user_id == request.state.user.user_id, Notification.audience == "admin",
+                      Notification.facility_id.in_(list(facilities)))
+              .execution_options(all_facilities=True))
+    unread_rows = (db.query(Notification.facility_id, func.count(Notification.notification_id))
+                     .filter(Notification.user_id == request.state.user.user_id, Notification.audience == "admin",
+                             Notification.facility_id.in_(list(facilities)), Notification.is_read.is_(False))
+                     .group_by(Notification.facility_id).execution_options(all_facilities=True).all())
+    unread_by_facility = {int(fid): int(cnt) for fid, cnt in unread_rows}
+    query = base.filter(Notification.is_read.is_(False)) if unread_only else base
+    rows = query.order_by(Notification.created_at.desc(), Notification.notification_id.desc()).limit(limit).all()
+    ids = {n.member_id for n in rows if n.member_id}
+    names = (dict(db.query(Member.member_id, Member.name).filter(Member.member_id.in_(ids))
+                    .execution_options(all_facilities=True).all()) if ids else {})
+    items = [{**_notification_out(n, names), **facilities.get(n.facility_id, {})} for n in rows]
+    return {"unread": sum(unread_by_facility.values()), "unread_by_facility": unread_by_facility, "items": items}
+
+
+@app.post("/api/facilities/notifications/read")
+def all_facility_notifications_read(payload: NotificationReadRequest, request: Request, db: Session = Depends(get_db),
+                                    account: AdminAccount = Depends(current_account)):
+    facilities = _my_facility_map(db, account)
+    if not facilities:
+        return {"updated": 0}
+    query = (db.query(Notification)
+               .filter(Notification.user_id == request.state.user.user_id, Notification.audience == "admin",
+                       Notification.facility_id.in_(list(facilities)), Notification.is_read.is_(False))
+               .execution_options(all_facilities=True))
+    if not payload.all:
+        if not payload.ids:
+            return {"updated": 0}
+        query = query.filter(Notification.notification_id.in_(payload.ids[:500]))
+    updated = query.update({"is_read": True}, synchronize_session=False)
+    db.commit()
+    return {"updated": updated}
 
 
 @app.post("/api/facilities", status_code=201)
@@ -4607,6 +4694,7 @@ SEARCH_FIELDS = ("title", "content", "title_content", "author")
 
 
 class CommunityPostCreate(BaseModel):
+    is_anonymous: bool = False                       # v12: 학부모 익명 글 (관리자 글은 무시)
     title: str = Field("", max_length=200)
     content: str = Field("", max_length=10000)
     content_html: Optional[str] = Field(None, max_length=60000)   # v10: 서식 본문
@@ -4623,11 +4711,17 @@ class CommunityPostUpdate(BaseModel):
     category: Optional[str] = Field(None, max_length=20)
     photos: List[Union[str, PhotoIn]] = Field(default_factory=list, max_length=20)   # 기존 사진은 받은 사진 URL 그대로, 새 사진은 data URL
     is_pinned: Optional[bool] = None
+    is_anonymous: Optional[bool] = None
 
 
 class CommunityCommentCreate(BaseModel):
     content: str = Field(min_length=1, max_length=1000)
     author: str = Field("관리자", max_length=50)
+    parent_comment_id: Optional[int] = None          # v12: 답글
+
+
+HOT_LIKES = max(1, int(os.getenv("COMMUNITY_HOT_LIKES", "3") or 3))   # v12: 공감이 이만큼 모이면 HOT 게시글
+ANON_LABEL = "익명"
 
 
 _PHOTO_REF_RE = re.compile(r"^/api/(?:parent/)?community/photos/(\d+)$")
@@ -4777,12 +4871,15 @@ def _post_to_out(p: CommunityPost, photo_ids: List[int], parent: bool = False,
                  comment_count: int = 0, liked: bool = False, viewer_user_id: Optional[int] = None,
                  attachments: Optional[List[dict]] = None) -> dict:
     category = p.category if p.category in POST_CATEGORIES else "FREE"
-    return {
+    anonymous = bool(p.is_anonymous) and (p.author_role or "admin") == "parent"
+    out = {
         "kind": "post", "key": f"p{p.post_id}",
         "post_id": p.post_id,
         "title": _post_title(p),
-        "author": p.author,
+        "author": ANON_LABEL if anonymous and parent else p.author,
         "author_role": p.author_role or "admin",
+        "is_anonymous": anonymous,
+        "is_hot": (p.like_count or 0) >= HOT_LIKES,
         "category": category, "category_label": POST_CATEGORIES[category],
         "content": p.content,
         "content_html": p.content_html or None,          # v10: 서식 본문 (없으면 content 를 그대로 표시)
@@ -4799,6 +4896,9 @@ def _post_to_out(p: CommunityPost, photo_ids: List[int], parent: bool = False,
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
+    if anonymous and not parent:
+        out["author"] = f"{ANON_LABEL} ({p.author})"      # 관리자: 익명 글도 실제 작성자 확인(운영·검토용)
+    return out
 
 
 def _visible_comment_filter():
@@ -4813,7 +4913,8 @@ def _comment_counts(db: Session, post_ids: List[int]) -> dict:
         return {}
     return dict(db.query(CommunityComment.post_id, func.count(CommunityComment.comment_id))
                   .outerjoin(CommentReview, CommentReview.comment_id == CommunityComment.comment_id)
-                  .filter(CommunityComment.post_id.in_(post_ids), _visible_comment_filter())
+                  .filter(CommunityComment.post_id.in_(post_ids), _visible_comment_filter(),
+                          CommunityComment.deleted_at.is_(None))
                   .group_by(CommunityComment.post_id).all())
 
 
@@ -4939,7 +5040,7 @@ def _notice_board_out(n: Notice, class_names: dict, read_counts: Optional[dict] 
 def _board(db: Session, *, parent_user: Optional[AppUser], category: str, q: str, field: str,
            page: int, size: int) -> dict:
     """공지 + 게시글을 최신순으로 합친 게시판 페이지. 각 출처에서 page*size 개만 읽어 병합 후 자름"""
-    if category not in ("ALL", *BOARD_CATEGORIES):
+    if category not in ("ALL", "HOT", *BOARD_CATEGORIES):
         raise HTTPException(400, "말머리가 올바르지 않습니다.")
     field = field if field in SEARCH_FIELDS else "title_content"
     pattern = _like_pattern(q) if q.strip() else None
@@ -4956,8 +5057,12 @@ def _board(db: Session, *, parent_user: Optional[AppUser], category: str, q: str
     if post_q is not None:
         if category in POST_CATEGORIES:
             post_q = post_q.filter(func.coalesce(CommunityPost.category, "FREE") == category)
+        if category == "HOT":
+            post_q = post_q.filter(func.coalesce(CommunityPost.like_count, 0) >= HOT_LIKES)
         if parent_user:
             post_q = post_q.filter(_parent_post_visibility(user_id))
+            if pattern and field == "author":         # 익명 글은 작성자로 찾을 수 없게
+                post_q = post_q.filter(func.coalesce(CommunityPost.is_anonymous, False).is_(False))
         if pattern:
             post_q = post_q.filter(_search_condition(field, pattern, CommunityPost.title, CommunityPost.content,
                                                      CommunityPost.author))
@@ -5002,7 +5107,7 @@ def _board(db: Session, *, parent_user: Optional[AppUser], category: str, q: str
     items = [notice_out(x) if k == "n" else post_out[x.post_id] for k, _, x in merged]
     pinned = [notice_out(n) for n in pinned_notices] + [post_out[p.post_id] for p in pinned_posts]
     return {"items": items, "pinned": pinned, "total": total, "page": page, "size": size,
-            "pages": max(1, (total + size - 1) // size), "categories": BOARD_CATEGORIES}
+            "pages": max(1, (total + size - 1) // size), "categories": BOARD_CATEGORIES, "hot_likes": HOT_LIKES}
 
 
 @app.get("/api/community/board")
@@ -5176,6 +5281,7 @@ def _delete_post(db: Session, p: CommunityPost) -> None:
     comment_ids = [cid for (cid,) in db.query(CommunityComment.comment_id).filter(CommunityComment.post_id == post_id)]
     if comment_ids:
         db.query(CommentReview).filter(CommentReview.comment_id.in_(comment_ids)).delete(synchronize_session=False)
+        db.query(CommunityCommentLike).filter(CommunityCommentLike.comment_id.in_(comment_ids)).delete(synchronize_session=False)
     db.query(CommunityLike).filter(CommunityLike.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityComment).filter(CommunityComment.post_id == post_id).delete(synchronize_session=False)
     db.query(CommunityPhoto).filter(CommunityPhoto.post_id == post_id).delete(synchronize_session=False)
@@ -5210,6 +5316,8 @@ def _update_post(db: Session, p: CommunityPost, payload: CommunityPostUpdate) ->
         p.title = payload.title.strip() or None
     if payload.category is not None:
         p.category = _post_category(payload.category)
+    if payload.is_anonymous is not None and (p.author_role or "admin") == "parent":
+        p.is_anonymous = payload.is_anonymous
     p.updated_at = _now()
 
 
@@ -5267,11 +5375,19 @@ def moderation_posts(status: str = Query("PENDING", max_length=10), db: Session 
 
 
 def _comment_out(c: CommunityComment, review: Optional[CommentReview] = None, viewer_user_id: Optional[int] = None,
-                 admin: bool = False) -> dict:
-    out = {"comment_id": c.comment_id, "post_id": c.post_id, "author": c.author, "content": c.content,
+                 admin: bool = False, display: Optional[str] = None, is_writer: bool = False, liked: bool = False) -> dict:
+    deleted = c.deleted_at is not None
+    anonymous = bool(c.is_anonymous) and c.user_id is not None
+    author = display or (ANON_LABEL if anonymous else c.author)
+    if anonymous and admin and not deleted:
+        author = f"{author} ({c.author})"              # 관리자: 익명 댓글의 실제 작성자 확인
+    out = {"comment_id": c.comment_id, "post_id": c.post_id, "author": "" if deleted else author,
+           "content": "" if deleted else c.content, "deleted": deleted,
+           "parent_comment_id": c.parent_comment_id, "is_anonymous": anonymous, "is_writer": is_writer,
+           "like_count": c.like_count or 0, "liked": liked,
            "author_role": "parent" if c.user_id else "admin",
            "created_at": c.created_at.isoformat() if c.created_at else None,
-           "mine": bool(viewer_user_id and (c.user_id == viewer_user_id or c.admin_user_id == viewer_user_id)),
+           "mine": bool(not deleted and viewer_user_id and (c.user_id == viewer_user_id or c.admin_user_id == viewer_user_id)),
            "pending_review": bool(review and review.flagged and review.decision is None)}
     if admin:
         out["from_parent"] = c.user_id is not None
@@ -5288,23 +5404,133 @@ def _comments_with_reviews(db: Session, post_id: int):
               .order_by(CommunityComment.created_at.asc(), CommunityComment.comment_id.asc()).limit(500).all())
 
 
+def _comment_labels(post: Optional[CommunityPost], rows: list) -> dict:
+    """댓글 표시 이름 — 익명 댓글은 글 안에서 처음 쓴 순서대로 익명1·익명2…, 익명 글쓴이는 '익명(글쓴이)'
+    반환: comment_id → (표시 이름 또는 None, 글쓴이 여부)"""
+    writer_uid = post.user_id if post is not None and (post.author_role or "admin") == "parent" else None
+    writer_admin = post.user_id if post is not None and (post.author_role or "admin") == "admin" else None
+    numbers: dict = {}
+    out = {}
+    for c, _r in rows:
+        is_writer = bool((writer_uid and c.user_id == writer_uid) or (writer_admin and c.admin_user_id == writer_admin))
+        label = None
+        if c.is_anonymous and c.user_id:
+            if is_writer:
+                label = f"{ANON_LABEL}(글쓴이)"
+            else:
+                numbers.setdefault(c.user_id, len(numbers) + 1)
+                label = f"{ANON_LABEL}{numbers[c.user_id]}"
+        out[c.comment_id] = (label, is_writer)
+    return out
+
+
+def _liked_comments(db: Session, user_id: Optional[int], comment_ids: List[int]) -> set:
+    if not user_id or not comment_ids:
+        return set()
+    return {cid for (cid,) in db.query(CommunityCommentLike.comment_id).filter(
+        CommunityCommentLike.user_id == user_id, CommunityCommentLike.comment_id.in_(comment_ids))}
+
+
+def _comments_view(db: Session, post_id: int, viewer_user_id: Optional[int], admin: bool,
+                   parent_viewer: Optional[int] = None) -> List[dict]:
+    """댓글 목록(작성 순) — 학부모(parent_viewer)는 숨김 댓글·남의 검토 대기 댓글 제외.
+    삭제된 댓글은 남은 답글이 있을 때만 '삭제된 댓글' 자리로 보여 줌"""
+    post = db.query(CommunityPost).options(defer(CommunityPost.photos)).filter(CommunityPost.post_id == post_id).first()
+    rows = _comments_with_reviews(db, post_id)
+    labels = _comment_labels(post, rows)
+    if parent_viewer is not None:
+        rows = [(c, r) for c, r in rows
+                if not (r and r.decision == "HIDDEN") and not (r and r.flagged and r.decision is None and c.user_id != parent_viewer)]
+    has_reply = {c.parent_comment_id for c, _ in rows if c.parent_comment_id and c.deleted_at is None}
+    rows = [(c, r) for c, r in rows if c.deleted_at is None or c.comment_id in has_reply]
+    liked = _liked_comments(db, viewer_user_id, [c.comment_id for c, _ in rows])
+    return [_comment_out(c, r, viewer_user_id=viewer_user_id, admin=admin, display=labels.get(c.comment_id, (None, False))[0],
+                         is_writer=labels.get(c.comment_id, (None, False))[1], liked=c.comment_id in liked)
+            for c, r in rows]
+
+
+def _reply_parent(db: Session, post_id: int, parent_comment_id: Optional[int]) -> Optional[CommunityComment]:
+    """답글 대상 확인 — 같은 글의 댓글이어야 하고, 답글에 단 답글은 원 댓글에 붙임(한 단계)"""
+    if not parent_comment_id:
+        return None
+    target = db.query(CommunityComment).filter(CommunityComment.comment_id == parent_comment_id,
+                                               CommunityComment.post_id == post_id).first()
+    if not target:
+        raise HTTPException(404, "답글을 달 댓글을 찾을 수 없습니다.")
+    if target.parent_comment_id:
+        root = db.query(CommunityComment).filter(CommunityComment.comment_id == target.parent_comment_id).first()
+        target = root or target
+    if target.deleted_at is not None:
+        raise HTTPException(409, "삭제된 댓글에는 답글을 달 수 없습니다.")
+    return target
+
+
+def _notify_reply(db: Session, post: CommunityPost, root: Optional[CommunityComment], content: str,
+                  actor_user_id: Optional[int]) -> Optional[int]:
+    """답글 알림(원 댓글 작성 학부모) — 알림을 받은 user_id 반환"""
+    if root is None or not root.user_id or root.user_id == actor_user_id:
+        return None
+    db.add(Notification(user_id=root.user_id, audience="parent", kind="COMMENT", link="feed",
+                        title=f"내 댓글에 답글: {_post_title(post)[:40]}", body=content[:120]))
+    return root.user_id
+
+
+def _remove_comment(db: Session, c: CommunityComment) -> None:
+    """댓글 삭제 — 남은 답글이 있으면 '삭제된 댓글'로 자리만 남기고, 없으면 지움(답글이면 비어 버린 원 댓글도 정리)"""
+    replies = (db.query(func.count(CommunityComment.comment_id))
+                 .filter(CommunityComment.parent_comment_id == c.comment_id, CommunityComment.deleted_at.is_(None)).scalar() or 0)
+    if replies:
+        c.deleted_at, c.content = _now(), ""
+        return
+    parent_id = c.parent_comment_id
+    db.query(CommentReview).filter(CommentReview.comment_id == c.comment_id).delete(synchronize_session=False)
+    db.query(CommunityCommentLike).filter(CommunityCommentLike.comment_id == c.comment_id).delete(synchronize_session=False)
+    db.delete(c)
+    db.flush()
+    if parent_id:
+        parent = db.query(CommunityComment).filter(CommunityComment.comment_id == parent_id).first()
+        left = (db.query(func.count(CommunityComment.comment_id))
+                  .filter(CommunityComment.parent_comment_id == parent_id, CommunityComment.deleted_at.is_(None)).scalar() or 0)
+        if parent is not None and parent.deleted_at is not None and not left:
+            db.query(CommentReview).filter(CommentReview.comment_id == parent_id).delete(synchronize_session=False)
+            db.query(CommunityCommentLike).filter(CommunityCommentLike.comment_id == parent_id).delete(synchronize_session=False)
+            db.query(CommunityComment).filter(CommunityComment.parent_comment_id == parent_id).delete(synchronize_session=False)
+            db.delete(parent)
+
+
+def _toggle_comment_like(db: Session, c: CommunityComment, user: AppUser, actor_type: str) -> dict:
+    if c.deleted_at is not None:
+        raise HTTPException(409, "삭제된 댓글입니다.")
+    existing = db.query(CommunityCommentLike).filter(CommunityCommentLike.comment_id == c.comment_id,
+                                                     CommunityCommentLike.user_id == user.user_id).first()
+    if existing:
+        db.delete(existing)
+        liked = False
+    else:
+        db.add(CommunityCommentLike(comment_id=c.comment_id, user_id=user.user_id))
+        liked = True
+        _log(db, actor_type, user.user_id, "community.comment_like", "comment", c.comment_id, "공감")
+    db.flush()
+    c.like_count = db.query(func.count(CommunityCommentLike.like_id)).filter(CommunityCommentLike.comment_id == c.comment_id).scalar() or 0
+    db.commit()
+    return {"comment_id": c.comment_id, "like_count": c.like_count, "liked": liked}
+
+
+def _created_comment_out(db: Session, c: CommunityComment, viewer_user_id: int, admin: bool) -> dict:
+    """방금 쓴 댓글 — 목록과 같은 표시 이름(익명 번호)으로"""
+    view = _comments_view(db, c.post_id, viewer_user_id, admin, parent_viewer=None if admin else viewer_user_id)
+    return next((x for x in view if x["comment_id"] == c.comment_id), _comment_out(c, viewer_user_id=viewer_user_id, admin=admin))
+
+
 @app.get("/api/community/posts/{post_id}/comments")
 def list_community_comments(post_id: int, request: Request, db: Session = Depends(get_db)):
     """관리자: 모든 댓글 + 자동 검토 결과"""
-    return [_comment_out(c, r, viewer_user_id=request.state.user.user_id, admin=True)
-            for c, r in _comments_with_reviews(db, post_id)]
+    return _comments_view(db, post_id, request.state.user.user_id, admin=True)
 
 
 def _parent_visible_comments(db: Session, post_id: int, user_id: int) -> List[dict]:
     """학부모: 공개 댓글 + 본인의 '검토 중' 댓글 (숨김 처리된 댓글은 제외)"""
-    out = []
-    for c, r in _comments_with_reviews(db, post_id):
-        if r and r.decision == "HIDDEN":
-            continue
-        if r and r.flagged and r.decision is None and c.user_id != user_id:
-            continue
-        out.append(_comment_out(c, r, viewer_user_id=user_id))
-    return out
+    return _comments_view(db, post_id, user_id, admin=False, parent_viewer=user_id)
 
 
 @app.post("/api/community/posts/{post_id}/comments", status_code=201)
@@ -5316,14 +5542,17 @@ def create_community_comment(post_id: int, payload: CommunityCommentCreate, requ
     if not post:
         raise HTTPException(404, "게시물을 찾을 수 없습니다.")
     user = request.state.user
+    root = _reply_parent(db, post_id, payload.parent_comment_id)
     c = CommunityComment(post_id=post_id, author=_admin_author(db, request), content=content,
-                         author_role="admin", admin_user_id=user.user_id)
+                         author_role="admin", admin_user_id=user.user_id,
+                         parent_comment_id=root.comment_id if root else None)
     db.add(c); db.flush()
-    if post.user_id and post.author_role == "parent":
+    notified = _notify_reply(db, post, root, content, None)
+    if post.user_id and post.author_role == "parent" and post.user_id != notified:
         db.add(Notification(user_id=post.user_id, audience="parent", kind="COMMENT", link="feed",
                             title=f"내 글에 관리자 댓글: {_post_title(post)[:40]}", body=content[:120]))
     db.commit(); db.refresh(c)
-    return _comment_out(c, viewer_user_id=user.user_id, admin=True)
+    return _created_comment_out(db, c, user.user_id, admin=True)
 
 
 @app.delete("/api/community/comments/{comment_id}", status_code=204)
@@ -5331,8 +5560,16 @@ def delete_community_comment(comment_id: int, db: Session = Depends(get_db)):
     c = db.query(CommunityComment).filter(CommunityComment.comment_id == comment_id).first()
     if not c:
         raise HTTPException(404, "댓글을 찾을 수 없습니다.")
-    db.query(CommentReview).filter(CommentReview.comment_id == comment_id).delete(synchronize_session=False)
-    db.delete(c); db.commit()
+    _remove_comment(db, c)
+    db.commit()
+
+
+@app.post("/api/community/comments/{comment_id}/like")
+def like_community_comment(comment_id: int, request: Request, db: Session = Depends(get_db)):
+    c = db.query(CommunityComment).filter(CommunityComment.comment_id == comment_id).first()
+    if not c:
+        raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+    return _toggle_comment_like(db, c, request.state.user, "admin")
 
 
 # ---------- 커뮤니티 멤버 관리 (관리자) — 경고 · 채팅 금지 · 강퇴 ----------
@@ -5454,7 +5691,7 @@ def moderation_queue(status: str = "pending", limit: int = Query(100, ge=1, le=5
     query = (db.query(CommunityComment, CommentReview, CommunityPost.content)
                .outerjoin(CommentReview, CommentReview.comment_id == CommunityComment.comment_id)
                .join(CommunityPost, CommunityPost.post_id == CommunityComment.post_id)
-               .filter(CommunityComment.user_id.isnot(None)))
+               .filter(CommunityComment.user_id.isnot(None), CommunityComment.deleted_at.is_(None)))
     if status == "pending":
         query = query.filter(CommentReview.flagged.is_(True), CommentReview.decision.is_(None))
     elif status == "flagged":
@@ -5823,6 +6060,31 @@ def _month_start(day: date, offset: int = 0) -> date:
     return date(y, m, 1)
 
 
+_ACTIVITY_ACTORS = {"parent": "학부모", "kiosk": "키오스크", "admin": "관리자"}
+
+
+def _activity_out(l: "ActivityLog", member_names: dict) -> dict:
+    return {"log_id": l.log_id, "time": l.created_at.isoformat(timespec="minutes") if l.created_at else None,
+            "actor": _ACTIVITY_ACTORS.get(l.actor_type, l.actor_type), "actor_type": l.actor_type,
+            "action": l.action, "member_name": member_names.get(l.target_id) if l.target_type == "member" else None,
+            "summary": l.summary}
+
+
+@app.get("/api/dashboard/activity")
+def dashboard_activity(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0, le=100000),
+                       actor: Optional[str] = Query(None, pattern="^(parent|kiosk|admin)$"),
+                       db: Session = Depends(get_db)):
+    """대시보드 '최근 활동'의 전체 이력 (최신순, 페이지 단위). 학원 범위는 테넌트 필터가 자동 적용."""
+    query = db.query(ActivityLog).filter(ActivityLog.actor_type.in_(tuple(_ACTIVITY_ACTORS)))
+    if actor:
+        query = query.filter(ActivityLog.actor_type == actor)
+    total = query.count()
+    rows = query.order_by(ActivityLog.created_at.desc(), ActivityLog.log_id.desc()).offset(offset).limit(limit).all()
+    member_ids = {l.target_id for l in rows if l.target_type == "member" and l.target_id}
+    names = dict(db.query(Member.member_id, Member.name).filter(Member.member_id.in_(member_ids)).all()) if member_ids else {}
+    return {"total": total, "offset": offset, "limit": limit, "items": [_activity_out(l, names) for l in rows]}
+
+
 @app.get("/api/dashboard/insights")
 def dashboard_insights(db: Session = Depends(get_db)):
     today = _today()
@@ -6023,10 +6285,7 @@ def dashboard_insights(db: Session = Depends(get_db)):
         "unpaid_members": unpaid_list[:50],
         "risk_students": risks[:8],
         "parents": {"linked_accounts": int(parent_accounts), "active_7d": int(parent_active)},
-        "recent_activity": [{"time": l.created_at.isoformat(timespec="minutes") if l.created_at else None,
-                             "actor": {"parent": "학부모", "kiosk": "키오스크", "admin": "관리자"}.get(l.actor_type, l.actor_type),
-                             "action": l.action, "member_name": log_names.get(l.target_id) if l.target_type == "member" else None,
-                             "summary": l.summary} for l in recent_logs],
+        "recent_activity": [_activity_out(l, log_names) for l in recent_logs],
         "definitions": INSIGHT_DEFINITIONS,
     }
 
@@ -6677,6 +6936,8 @@ class ParentKakaoReady(BaseModel):
 
 class ParentCommentCreate(BaseModel):
     content: str = Field(max_length=1000)
+    parent_comment_id: Optional[int] = None          # v12: 답글
+    is_anonymous: bool = False                       # v12: 익명 댓글
 
 
 def _digits_expr(column):
@@ -7040,14 +7301,15 @@ def parent_create_post(payload: CommunityPostCreate, request: Request, db: Sessi
     result = _moderate_text(f"{title}\n{content}")          # 서식이 아니라 순수 텍스트로 모니터링
     p = CommunityPost(author=_parent_author(membership, user), title=title, content=content, content_html=content_html,
                       category=_post_category(payload.category), user_id=user.user_id, author_role="parent",
-                      is_pinned=False, status="PENDING" if result.flagged else "VISIBLE", photos=None)
+                      is_pinned=False, status="PENDING" if result.flagged else "VISIBLE", photos=None,
+                      is_anonymous=bool(payload.is_anonymous))
     db.add(p); db.flush()
     _save_new_photos(db, p.post_id, photos)
     if result.flagged:
         _notify_admins(db, "MODERATION", "검토가 필요한 게시글", f"자동 탐지: {', '.join(result.reasons)[:200]}",
                        "community?tab=moderation")
     else:
-        _notify_admins(db, "POST", f"새 글: {title[:40]}", f"{p.author} · {POST_CATEGORIES[p.category]}", "community")
+        _notify_admins(db, "POST", f"새 글: {title[:40]}", f"{ANON_LABEL if p.is_anonymous else p.author} · {POST_CATEGORIES[p.category]}", "community")
     _log(db, "parent", user.user_id, "community.post", "post", p.post_id, "검토 대기" if result.flagged else "글 작성")
     db.commit(); db.refresh(p)
     return _single_post_out(db, p, parent=True, user_id=user.user_id)
@@ -7175,32 +7437,44 @@ def parent_create_comment(post_id: int, payload: ParentCommentCreate, request: R
     if not content:
         raise HTTPException(400, "댓글은 1~1000자로 입력하세요.")
     post = _parent_post_or_404(db, post_id, user)
-    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지 — 학원 닉네임)
+    root = _reply_parent(db, post_id, payload.parent_comment_id)
+    # 작성자 이름은 클라이언트가 아닌 서버가 결정 (사칭 방지 — 학원 닉네임). 익명이어도 실제 이름은 관리자 검토용으로 보관
     comment = CommunityComment(post_id=post_id, author=_parent_author(membership, user), content=content,
-                               user_id=user.user_id, author_role="parent")
+                               user_id=user.user_id, author_role="parent", is_anonymous=bool(payload.is_anonymous),
+                               parent_comment_id=root.comment_id if root else None)
     db.add(comment); db.flush()
     review = _review_comment(db, comment)          # 자동 모니터링
     if review.flagged:
         _notify_admins(db, "MODERATION", "검토가 필요한 댓글", f"자동 탐지: {review.reasons}", "community?tab=moderation")
     else:
-        _notify_admins(db, "COMMENT", f"{comment.author} 님의 새 댓글", content[:80], "community")
-        if post.user_id and post.author_role == "parent" and post.user_id != user.user_id:
+        shown = ANON_LABEL if comment.is_anonymous else comment.author
+        _notify_admins(db, "COMMENT", f"{shown} 님의 새 {'답글' if root else '댓글'}", content[:80], "community")
+        notified = _notify_reply(db, post, root, content, user.user_id)
+        if post.user_id and post.author_role == "parent" and post.user_id not in (user.user_id, notified):
             db.add(Notification(user_id=post.user_id, audience="parent", kind="COMMENT", link="feed",
                                 title=f"내 글에 새 댓글: {_post_title(post)[:40]}", body=content[:120]))
     _log(db, "parent", user.user_id, "community.comment", "post", post_id, "검토 대기" if review.flagged else "댓글 작성")
     db.commit(); db.refresh(comment)
-    return _comment_out(comment, review, viewer_user_id=user.user_id)
+    return _created_comment_out(db, comment, user.user_id, admin=False)
 
 
 @app.delete("/api/parent/community/comments/{comment_id}", status_code=204)
 def parent_delete_comment(comment_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
     c = db.query(CommunityComment).filter(CommunityComment.comment_id == comment_id,
                                           CommunityComment.user_id == user.user_id).first()
-    if not c:
+    if not c or c.deleted_at is not None:
         raise HTTPException(404, "본인이 쓴 댓글만 삭제할 수 있습니다.")
-    db.query(CommentReview).filter(CommentReview.comment_id == comment_id).delete(synchronize_session=False)
-    db.delete(c)
+    _remove_comment(db, c)
     db.commit()
+
+
+@app.post("/api/parent/community/comments/{comment_id}/like")
+def parent_like_comment(comment_id: int, db: Session = Depends(get_db), user: AppUser = Depends(current_parent)):
+    c = (db.query(CommunityComment).join(CommunityPost, CommunityPost.post_id == CommunityComment.post_id)
+           .filter(CommunityComment.comment_id == comment_id, _parent_post_visibility(user.user_id)).first())
+    if not c:
+        raise HTTPException(404, "댓글을 찾을 수 없습니다.")
+    return _toggle_comment_like(db, c, user, "parent")
 
 
 
@@ -8055,6 +8329,24 @@ def pay_shop_order(order_id: int, payload: ShopPayIn, db: Session = Depends(get_
     return _shop_order_out(order, _account_names(db, [order.account_id, order.paid_by]))
 
 
+def _inventory_for_shop_item(db: Session, it: "ShopOrderItem") -> tuple:
+    """입고할 주문 품목에 맞는 재고 물품 — (물품, 새로 만들었는지)"""
+    name = (it.product_name or "").strip()[:100] or "쇼핑몰 상품"
+    same = (db.query(InventoryItem).filter(InventoryItem.active.is_(True), func.lower(InventoryItem.name) == name.lower())
+              .order_by(InventoryItem.item_id).first())
+    if same:
+        if not same.shop_product_id:
+            same.shop_product_id = it.product_id
+        return same, False
+    product = db.query(ShopProduct).filter(ShopProduct.product_id == it.product_id).first()
+    item = InventoryItem(name=name, category=((product.category if product else "") or "소모품")[:40],
+                         unit=(it.unit or "개")[:20], quantity=0, min_quantity=0,
+                         shop_product_id=it.product_id if product else None, note="쇼핑몰 입고로 자동 등록")
+    db.add(item)
+    db.flush()
+    return item, True
+
+
 @app.post("/api/shop/orders/{order_id}/receive")
 def receive_shop_order(order_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(current_account)):
     """입고 처리 — 연결된 재고 물품(담을 때 고른 물품, 또는 이 상품과 연결해 둔 물품)의 수량을 주문 수량만큼 늘림"""
@@ -8068,12 +8360,19 @@ def receive_shop_order(order_id: int, db: Session = Depends(get_db), account: Ad
     explicit_ids = {it.inventory_item_id for it in order.items if it.inventory_item_id}
     explicit = {i.item_id: i for i in db.query(InventoryItem).filter(InventoryItem.item_id.in_(explicit_ids or {-1})).all()}
     applied = []
+    created_by_product: dict = {}
     for it in order.items:
-        inv = explicit.get(it.inventory_item_id) or linked.get(it.product_id)
-        if not inv or not inv.active:
-            continue
+        inv = explicit.get(it.inventory_item_id) or linked.get(it.product_id) or created_by_product.get(it.product_id)
+        if inv is not None and not inv.active:
+            inv = None
+        created = False
+        if inv is None:
+            # 연결된 재고 물품이 없으면 같은 이름의 물품을 찾고, 그래도 없으면 새로 등록해 상품과 연결
+            inv, created = _inventory_for_shop_item(db, it)
+            created_by_product[it.product_id] = inv
         _change_stock(db, inv, it.quantity, "PURCHASE", f"쇼핑몰 주문 {order.order_number}", account.account_id)
-        applied.append({"item_id": inv.item_id, "name": inv.name, "added": it.quantity, "quantity": inv.quantity, "unit": inv.unit})
+        applied.append({"item_id": inv.item_id, "name": inv.name, "added": it.quantity, "quantity": inv.quantity,
+                        "unit": inv.unit, "created": created})
         for req in db.query(PurchaseRequest).filter(PurchaseRequest.item_id == inv.item_id,
                                                     PurchaseRequest.status.in_(("REQUESTED", "APPROVED"))).all():
             req.status, req.received_at = "RECEIVED", _now()
@@ -8581,7 +8880,7 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 #     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
 # ---------------------------------------------------------------------
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 
 
 def _tenant_tables() -> List[str]:
@@ -8617,6 +8916,12 @@ COLUMN_PATCHES = [
     ("shop_products", "mall_code", "VARCHAR(30)", "ix_shop_products_mall_code"),
     ("shop_products", "list_price", "INTEGER", None),
     ("shop_products", "unit", "VARCHAR(20)", None),
+    # v12: 커뮤니티 대댓글 · 익명 · 댓글 공감
+    ("community_posts", "is_anonymous", "BOOLEAN", None),
+    ("community_comments", "parent_comment_id", "INTEGER", "ix_community_comments_parent_comment_id"),
+    ("community_comments", "is_anonymous", "BOOLEAN", None),
+    ("community_comments", "like_count", "INTEGER", None),
+    ("community_comments", "deleted_at", "TIMESTAMP", None),
 ]
 # 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼 — 여러 개면 "a, b")
 #   v10 성능 점검에서 추가: 자주 쓰는 조회 조건(폴링·목록·집계)에 맞춘 인덱스. 모두 CREATE INDEX IF NOT EXISTS (비파괴)

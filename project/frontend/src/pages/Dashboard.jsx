@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDataRefresh } from "../utils/sync";
 import { useNavigate } from "react-router-dom";
 import {
-  clearTodos, createTodo, deleteTodo, errorText, fetchAdminSummary, fetchDashboardInsights, fetchNotices,
+  clearTodos, createTodo, deleteTodo, errorText, fetchAdminSummary, fetchDashboardActivity, fetchDashboardInsights, fetchNotices,
   fetchTodos, notifyMemberParents, updateTodo,
 } from "../api";
 import { WEATHER_CITIES } from "../utils/constants";
@@ -20,6 +20,8 @@ const TAGS = { primary: "업무", success: "상담", warning: "확인", danger: 
 const won = (n) => `${Number(n || 0).toLocaleString("ko-KR")}원`;
 const manwon = (n) => `${Math.round(Number(n || 0) / 10000).toLocaleString("ko-KR")}만원`;
 const pctText = (v) => (v == null ? "-" : `${v}%`);
+const ACTIVITY_PREVIEW = 5;      // 카드에는 최근 5건만, 그 이상은 '전체 이력 보기'
+const ACTIVITY_PAGE = 50;
 
 const PRINT_CSS = `
 @media print {
@@ -88,6 +90,7 @@ export default function Dashboard() {
   const [showUnpaid, setShowUnpaid] = useState(false);
   const [todoModal, setTodoModal] = useState(null);   // null | {todo_id?, text, due_time, tag}
   const [showAllTodos, setShowAllTodos] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -222,10 +225,7 @@ export default function Dashboard() {
       <div className="dash-two">
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-            <div>
-              <h3 className="card-title">주간 출석 추이</h3>
-              <div className="card-sub">파란 선 이번 주 · 점선 지난주 (출석 + 지각)</div>
-            </div>
+            <h3 className="card-title">주간 출석 추이</h3>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
               30일 출석률 <b style={{ color: "var(--text)" }}>{pctText(attendance.rate_30d)}</b><Info text={def.attendance_rate_30d} />
               <div>직전 30일 {pctText(attendance.rate_prev_30d)}</div>
@@ -236,10 +236,7 @@ export default function Dashboard() {
 
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-            <div>
-              <h3 className="card-title">미납 집중 관리</h3>
-              <div className="card-sub">연체가 긴 순 · 학부모 포털로 바로 안내</div>
-            </div>
+            <h3 className="card-title">미납 집중 관리</h3>
             <span className="badge danger no-dot">{unpaidList.length}명</span>
           </div>
           {unpaidList.length === 0 ? <div className="empty" style={{ padding: 24 }}>미납 청구서가 없습니다.</div> : (
@@ -255,10 +252,7 @@ export default function Dashboard() {
       <div className="dash-eq">
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <h3 className="card-title">반별 출석률</h3>
-              <div className="card-sub">오늘 수업이 있는 반 먼저 · 막대는 오늘(없으면 30일)</div>
-            </div>
+            <h3 className="card-title">반별 출석률</h3>
             <span className="badge primary no-dot">{data.classes.length}개 반</span>
           </div>
           {data.classes.length === 0 ? <div className="empty" style={{ padding: 24 }}>운영 중인 반이 없습니다.</div> : data.classes.map((c) => {
@@ -284,10 +278,7 @@ export default function Dashboard() {
 
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-            <div>
-              <h3 className="card-title">월별 매출</h3>
-              <div className="card-sub">실제 결제 이력 합계 (카카오페이·현장 수납 포함)</div>
-            </div>
+            <h3 className="card-title">월별 매출</h3>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
               이번 달 <b style={{ color: "var(--text)" }}>{won(revenue.this_month)}</b>
               <div>지난달 {won(revenue.last_month)}</div>
@@ -301,10 +292,7 @@ export default function Dashboard() {
       <div className="dash-eq">
         <div className="card">
           <div className="card-head">
-            <div>
-              <h3 className="card-title">관심이 필요한 학생<Info text={def.risk} /></h3>
-              <div className="card-sub">출석·연체 신호로 계산한 이탈 위험 (규칙 기반)</div>
-            </div>
+            <h3 className="card-title">관심이 필요한 학생<Info text={def.risk} /></h3>
           </div>
           {data.risk_students.length === 0 ? <div className="empty" style={{ padding: 24 }}>위험 신호가 있는 학생이 없습니다.</div> :
             data.risk_students.map((r) => (
@@ -321,23 +309,21 @@ export default function Dashboard() {
 
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-            <div>
-              <h3 className="card-title">최근 활동</h3>
-              <div className="card-sub">출석 체크·학부모 포털·관리자 동작 로그</div>
-            </div>
+            <h3 className="card-title">최근 활동</h3>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
               학부모 앱 활성(7일)<Info text={def.parent_active_7d} />
               <div><b style={{ color: "var(--text)" }}>{data.parents.active_7d}</b> / 연결 {data.parents.linked_accounts}가정</div>
             </div>
           </div>
-          {data.recent_activity.length === 0 ? <div className="empty" style={{ padding: 24 }}>아직 기록된 활동이 없습니다.</div> :
-            data.recent_activity.map((a, i) => (
-              <div className="activity-row" key={i}>
-                <time>{a.time ? a.time.slice(11, 16) : ""}</time>
-                <span className="badge gray no-dot" style={{ fontSize: 10 }}>{a.actor}</span>
-                <span style={{ flex: 1 }}>{a.member_name ? <b>{a.member_name} </b> : null}{a.summary || a.action}</span>
-              </div>
-            ))}
+          {data.recent_activity.length === 0 ? <div className="empty" style={{ padding: 24 }}>아직 기록된 활동이 없습니다.</div> : (
+            <>
+              {data.recent_activity.slice(0, ACTIVITY_PREVIEW).map((a, i) => <ActivityRow key={a.log_id ?? i} a={a} />)}
+              {data.recent_activity.length > ACTIVITY_PREVIEW && (
+                <button className="btn ghost sm no-print" style={{ marginTop: 8, width: "100%", justifyContent: "center" }}
+                  onClick={() => setShowActivity(true)}>전체 이력 보기 →</button>
+              )}
+            </>
+          )}
         </div>
       </div>
 
@@ -345,10 +331,7 @@ export default function Dashboard() {
       <div className="dash-eq">
         <div className="card">
           <div className="card-head">
-            <div>
-              <h3 className="card-title">최근 공지사항</h3>
-              <div className="card-sub">학부모 읽음 현황 포함</div>
-            </div>
+            <h3 className="card-title">최근 공지사항</h3>
             <button className="btn ghost sm" onClick={() => navigate("/community?category=NOTICE")}>공지사항으로 →</button>
           </div>
           {notices.length === 0 ? <div className="empty" style={{ padding: 24 }}>등록된 공지사항이 없습니다.</div> : (
@@ -374,10 +357,7 @@ export default function Dashboard() {
 
         <div className="card">
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <h3 className="card-title">오늘의 업무</h3>
-              <div className="card-sub">계정별로 저장 · 시간을 넣으면 정시에 알림</div>
-            </div>
+            <h3 className="card-title">오늘의 업무</h3>
             <div className="no-print" style={{ display: "flex", gap: 6 }}>
               <button className="btn ghost sm" onClick={() => setShowAllTodos(true)}>전체 {todos.length}</button>
               <button className="btn ghost sm" onClick={clearDone}>완료 정리</button>
@@ -401,6 +381,7 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+      {showActivity && <ActivityHistoryModal onClose={() => setShowActivity(false)} />}
       {todoModal && <TodoModal initial={todoModal} onClose={() => setTodoModal(null)} onSave={saveTodo} />}
       {showAllTodos && (
         <div className="modal-backdrop" onClick={() => setShowAllTodos(false)}>
@@ -424,6 +405,89 @@ export default function Dashboard() {
         </div>
       )}
     </>
+  );
+}
+
+function ActivityRow({ a, withDate = false }) {
+  return (
+    <div className="activity-row">
+      <time style={withDate ? { minWidth: 86 } : undefined}>
+        {a.time ? (withDate ? `${a.time.slice(5, 10).replace("-", ".")} ${a.time.slice(11, 16)}` : a.time.slice(11, 16)) : ""}
+      </time>
+      <span className="badge gray no-dot" style={{ fontSize: 10, alignSelf: "flex-start" }}>{a.actor}</span>
+      <span style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere" }}>{a.member_name ? <b>{a.member_name} </b> : null}{a.summary || a.action}</span>
+    </div>
+  );
+}
+
+/* 최근 활동 전체 이력 — 서버에서 50건씩 페이지로 불러오고, 주체(학부모/관리자)로 거를 수 있음 */
+function ActivityHistoryModal({ onClose }) {
+  const [actor, setActor] = useState("");
+  const [items, setItems] = useState([]);
+  const [total, setTotal] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const loadPage = useCallback(async (offset, actorFilter) => {
+    setBusy(true);
+    try {
+      const res = await fetchDashboardActivity({ limit: ACTIVITY_PAGE, offset, ...(actorFilter ? { actor: actorFilter } : {}) });
+      setItems((prev) => (offset === 0 ? res.items : [...prev, ...res.items]));
+      setTotal(res.total);
+      setError("");
+    } catch (e) {
+      setError(errorText(e, "활동 이력을 불러오지 못했습니다."));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+  useEffect(() => { loadPage(0, actor); }, [actor, loadPage]);
+
+  // 날짜별로 묶어서 표시
+  const groups = useMemo(() => {
+    const out = [];
+    items.forEach((a) => {
+      const day = a.time ? a.time.slice(0, 10) : "날짜 없음";
+      if (!out.length || out[out.length - 1].day !== day) out.push({ day, rows: [] });
+      out[out.length - 1].rows.push(a);
+    });
+    return out;
+  }, [items]);
+  const dayLabel = (day) => {
+    const d = new Date(`${day}T00:00:00`);
+    return Number.isNaN(d.getTime()) ? day : `${d.getMonth() + 1}월 ${d.getDate()}일 (${"일월화수목금토"[d.getDay()]})`;
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" style={{ width: 620 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+          <h3 style={{ margin: 0 }}>활동 전체 이력 {total != null ? `(${total.toLocaleString("ko-KR")}건)` : ""}</h3>
+          <div className="segmented">
+            {[["", "전체"], ["admin", "관리자"], ["parent", "학부모"]].map(([v, l]) => (
+              <button key={v} type="button" className={actor === v ? "active" : ""} onClick={() => setActor(v)}>{l}</button>
+            ))}
+          </div>
+        </div>
+        {error && <div className="error-banner">{error}</div>}
+        <div style={{ maxHeight: "min(480px, 60dvh)", overflowY: "auto" }}>
+          {groups.map((g) => (
+            <div key={g.day} style={{ marginBottom: 10 }}>
+              <div style={{ position: "sticky", top: 0, background: "var(--surface)", fontSize: 12, fontWeight: 700,
+                color: "var(--text-2)", padding: "6px 0", borderBottom: "1px solid var(--border)" }}>{dayLabel(g.day)}</div>
+              {g.rows.map((a, i) => <ActivityRow key={a.log_id ?? `${g.day}${i}`} a={a} />)}
+            </div>
+          ))}
+          {!busy && total === 0 && <div className="empty">기록된 활동이 없습니다.</div>}
+          {busy && <div className="muted" style={{ padding: 12, textAlign: "center" }}>불러오는 중…</div>}
+          {!busy && total != null && items.length < total && (
+            <button className="btn ghost sm" style={{ width: "100%", justifyContent: "center", marginTop: 6 }}
+              onClick={() => loadPage(items.length, actor)}>더 보기 ({items.length}/{total})</button>
+          )}
+        </div>
+        <div className="modal-actions"><button className="btn ghost" onClick={onClose}>닫기</button></div>
+      </div>
+    </div>
   );
 }
 

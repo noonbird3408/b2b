@@ -10,8 +10,8 @@
 .b2b-auth-state { display: grid; min-height: 100vh; place-items: center; color: var(--text-2); font-size: 13px; }
 .b2b-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--danger); background: var(--danger-soft); color: var(--danger-text); font-size: 12px; }
 .b2b-error button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid currentColor; background: var(--surface); color: inherit; font: inherit; cursor: pointer; }
-.b2b-recommend-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; padding: 10px 0 4px; }
-.b2b-recommend-list button { display: grid; gap: 4px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
+.b2b-recommend-list { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(170px, 200px); gap: 8px; padding: 10px 0 8px; overflow-x: auto; scroll-snap-type: x proximity; scrollbar-width: thin; }
+.b2b-recommend-list button { scroll-snap-align: start; align-content: start; display: grid; gap: 4px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; cursor: pointer; }
 .b2b-recommend-list button:hover { border-color: #0f766e; }
 .b2b-recommend-list strong { font-size: 11px; }
 .b2b-recommend-list span { color: var(--text-3); font-size: 10px; line-height: 1.5; }
