@@ -16,7 +16,7 @@ import { DAY_LABELS, STATUS_LABEL, STATUS_TONE, announceDataChanged, won } from 
 import Checkout from "./Checkout";
 import AccountModal, { UserAvatar } from "../components/AccountSettings.jsx";
 import JoinByCode from "../components/JoinByCode.jsx";
-import { PushNudge } from "../components/PushSettings.jsx";
+import PushSettings, { PushNudge } from "../components/PushSettings.jsx";
 import { PUSH_EVENT, forgetPushOnThisDevice, syncPushSubscription } from "../utils/push";
 
 /* =====================================================================
@@ -27,6 +27,15 @@ import { PUSH_EVENT, forgetPushOnThisDevice, syncPushSubscription } from "../uti
 ===================================================================== */
 const CSS = `
 .pp-me{border:0;background:transparent;padding:0;border-radius:50%;display:inline-flex;cursor:pointer;}
+.pp-push:empty{display:none;}
+.pp-push:not(:empty){border:1px solid var(--border);border-radius:12px;overflow:hidden;}
+.pp-push .push-nudge{border-bottom:0;}
+.pp-link{border:0;background:transparent;color:var(--text-3);font-size:12px;text-decoration:underline;cursor:pointer;padding:4px;}
+.pp-link:hover{color:var(--danger);}
+.att-legend{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11.5px;color:var(--text-2);margin-top:8px;}
+.att-legend span{display:inline-flex;align-items:center;gap:4px;}
+.att-dot{width:10px;height:10px;border-radius:3px;display:inline-block;}
+.att-dot.PRESENT{background:var(--success);}.att-dot.LATE{background:var(--warning);}.att-dot.ABSENT{background:var(--danger);}
 .pp-me:focus-visible{outline:2px solid var(--primary);outline-offset:2px;}
 .pp{min-height:100vh;background:var(--bg);display:flex;flex-direction:column;color:var(--text);}
 .pp-head{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:20;}
@@ -155,10 +164,14 @@ function HeaderMenu({ me, onMeChange, onLogout }) {
         <UserAvatar user={me?.user} size={30} />
       </button>
       <button className="btn ghost sm hide-sm" onClick={() => navigate("/?role=1")}>역할 변경</button>
-      <button className="btn ghost sm" onClick={onLogout}>로그아웃</button>
+      <button className="btn ghost sm hide-sm" onClick={onLogout}>로그아웃</button>
       {accountOpen && me && (
         <AccountModal me={me} onClose={() => setAccountOpen(false)} onSaved={onMeChange}
-          roleHint="커뮤니티 닉네임은 학원마다 '학원 정보' 탭에서 따로 정합니다." />
+          roleHint="커뮤니티 닉네임은 학원마다 '학원 정보' 탭에서 따로 정합니다."
+          actions={<>
+            <button type="button" className="btn ghost sm" onClick={() => navigate("/?role=1")}>역할 변경</button>
+            <button type="button" className="btn danger sm" onClick={onLogout}>로그아웃</button>
+          </>} />
       )}
     </>
   );
@@ -683,7 +696,7 @@ function FacilityHome({ me, onExit, onLogout, onReload, onMeChange }) {
       <header className="pp-head" style={{ position: "sticky" }}>
         <Brand to="/parentportal" sub={facility?.name} />
         <div className="right">
-          <button className="btn ghost sm" onClick={onExit} title="다른 학원으로">학원 전환</button>
+          <button className="btn ghost sm" onClick={onExit} title="다른 학원으로" aria-label="학원 전환">🏫<span className="hide-sm"> 학원 전환</span></button>
           <button className="bell" onClick={openPanel} aria-label={`알림 ${unread}건`}>
             🔔{unread > 0 && <span className="dot">{unread > 99 ? "99+" : unread}</span>}
           </button>
@@ -714,7 +727,8 @@ function FacilityHome({ me, onExit, onLogout, onReload, onMeChange }) {
       </nav>
       <main className="pp-body">
         {tab === "kids" && (kids === null ? <div className="fl-skeleton" style={{ height: 200 }} /> :
-          <KidsTab kids={kids} onChanged={loadKids} onGoPay={() => setTab("pay")} onApply={() => setApplyOpen(true)} />)}
+          <KidsTab kids={kids} onChanged={loadKids} onGoPay={() => setTab("pay")} onApply={() => setApplyOpen(true)}
+            onOpenSettings={() => setTab("info")} />)}
         {tab === "pay" && <Checkout hasChildren={(kids || []).length > 0} onLinkChild={() => setTab("kids")} />}
         {tab === "feed" && <Board mode="parent" api={PARENT_API} membership={summary?.membership} />}
         {tab === "info" && <FacilityInfo facility={facility} membership={summary?.membership} onChanged={() => { refreshSummary(); onReload(); }}
@@ -751,15 +765,21 @@ function ChildAttendance({ child }) {
   useEffect(() => {
     fetchParentAttendances(child.member_id, 30).then(setAtt).catch(() => setAtt({ summary: null, items: [] }));
   }, [child.member_id]);
+  // 막대: 맨 위 '전체'(모든 출결 기록) + 수업별. 수업 없이 기록된 출결(학원 출입)은 '전체'에만 포함
   const byClass = useMemo(() => {
+    const items = att?.items || [];
+    if (!items.length) return [];
     const map = {};
-    (att?.items || []).forEach((a) => {
-      const k = a.class_name || "수업 무관";
-      map[k] = map[k] || { total: 0, ok: 0 };
-      map[k].total += 1;
-      if (a.status !== "ABSENT") map[k].ok += 1;
+    items.forEach((a) => {
+      if (!a.class_name) return;
+      map[a.class_name] = map[a.class_name] || { total: 0, ok: 0 };
+      map[a.class_name].total += 1;
+      if (a.status !== "ABSENT") map[a.class_name].ok += 1;
     });
-    return Object.entries(map);
+    const all = { total: items.length, ok: items.filter((a) => a.status !== "ABSENT").length, isTotal: true };
+    const classes = Object.entries(map);
+    // 수업이 하나뿐이고 모든 기록이 그 수업이면 '전체'와 같으므로 수업 막대만
+    return classes.length === 1 && classes[0][1].total === all.total ? classes : [["전체", all], ...classes];
   }, [att]);
   if (!att) return <div className="fl-skeleton" style={{ height: 80, marginTop: 10 }} />;
   const s = att.summary || {};
@@ -774,9 +794,9 @@ function ChildAttendance({ child }) {
       </div>
       {byClass.map(([name, v]) => (
         <div key={name} style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) 120px 44px", gap: 8, alignItems: "center", fontSize: 12.5, marginBottom: 6 }}>
-          <span>{name}</span>
+          <span style={{ fontWeight: v.isTotal ? 700 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
           <div style={{ height: 7, background: "var(--surface-hover)", borderRadius: 99, overflow: "hidden" }}>
-            <div style={{ width: `${(v.ok / v.total) * 100}%`, height: "100%", background: colorOf(name) }} />
+            <div style={{ width: `${(v.ok / v.total) * 100}%`, height: "100%", background: v.isTotal ? "var(--primary)" : colorOf(name) }} />
           </div>
           <b style={{ textAlign: "right" }}>{Math.round((v.ok / v.total) * 100)}%</b>
         </div>
@@ -787,6 +807,12 @@ function ChildAttendance({ child }) {
         ))}
         {!att.items.length && <span className="muted">최근 30일 출결 기록이 없습니다.</span>}
       </div>
+      {att.items.length > 0 && (
+        <div className="att-legend" aria-hidden="true">
+          <span><i className="att-dot PRESENT" />출석</span><span><i className="att-dot LATE" />지각</span><span><i className="att-dot ABSENT" />결석</span>
+          <span className="muted" style={{ marginLeft: "auto" }}>숫자 = 날짜 · 최근 30일</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -813,7 +839,7 @@ function Assignments() {
   );
 }
 
-function KidsTab({ kids, onChanged, onGoPay, onApply }) {
+function KidsTab({ kids, onChanged, onGoPay, onApply, onOpenSettings }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [error, setError] = useState("");
@@ -839,23 +865,10 @@ function KidsTab({ kids, onChanged, onGoPay, onApply }) {
     await unlinkParentChild(child.member_id).catch(() => null);
     onChanged();
   };
-  // v10: 출석 키오스크 대신 선생님이 '출석 체크'를 누르면 알림 → 브라우저 알림 권한을 직접 켤 수 있게 안내
-  const [notifyPerm, setNotifyPerm] = useState(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
-  const enableNotify = async () => {
-    try { setNotifyPerm(await Notification.requestPermission()); } catch { setNotifyPerm("denied"); }
-  };
-
   return (
     <>
-      {kids.length > 0 && notifyPerm === "default" && (
-        <div className="fl-banner" style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <span>🔔 선생님이 출석·하원을 체크하면 바로 알려 드려요. 이 기기에서 알림을 받으려면 알림을 켜 주세요.</span>
-          <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={enableNotify}>알림 켜기</button>
-        </div>
-      )}
-      {kids.length > 0 && notifyPerm === "denied" && (
-        <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>브라우저 알림이 꺼져 있어 화면 안의 알림(🔔)으로만 알려 드립니다. 브라우저 설정에서 이 사이트 알림을 허용할 수 있습니다.</div>
-      )}
+      {/* 선생님이 출석·하원을 체크하면 휴대폰으로 바로 — 아직 안 켠 기기에서만 보임 */}
+      {kids.length > 0 && <div className="pp-push"><PushNudge onOpenSettings={onOpenSettings} /></div>}
       {kids.length === 0 && (
         <div className="pp-hero">
           <h2>아직 연결된 자녀가 없어요</h2>
@@ -879,7 +892,6 @@ function KidsTab({ kids, onChanged, onGoPay, onApply }) {
                 {!child.class_items?.length && <span className="muted">수강 중인 수업 없음</span>}
               </div>
             </div>
-            <button className="btn ghost sm" onClick={() => unlink(child)}>연결 해제</button>
           </div>
           <TodayChips child={child} />
           {child.unpaid_amount > 0 && (
@@ -888,6 +900,9 @@ function KidsTab({ kids, onChanged, onGoPay, onApply }) {
             </button>
           )}
           <ChildAttendance child={child} />
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+            <button type="button" className="pp-link" onClick={() => unlink(child)}>이 자녀 연결 해제</button>
+          </div>
         </div>
       ))}
       {kids.length > 0 && <Assignments />}
@@ -922,22 +937,22 @@ function FacilityInfo({ facility, membership, onChanged, onLeft, onApply }) {
     e.preventDefault();
     try {
       await updateParentMembership(nickname.trim());
-      setMsg("닉네임을 바꿨습니다.");
+      setMsg({ tone: "success", text: "닉네임을 바꿨습니다. 이후 새 글·댓글에 적용돼요." });
       onChanged();
     } catch (err) {
-      setMsg(errorText(err, "바꾸지 못했습니다."));
+      setMsg({ tone: "danger", text: errorText(err, "바꾸지 못했습니다.") });
     }
   };
   const leave = async () => {
     if (!window.confirm(`${facility.name} 에서 나갈까요? 자녀 연결과 커뮤니티 멤버십이 해제됩니다.`)) return;
-    try { await leaveParentFacility(facility.facility_id); onLeft(); } catch (err) { setMsg(errorText(err, "나가지 못했습니다.")); }
+    try { await leaveParentFacility(facility.facility_id); onLeft(); } catch (err) { setMsg({ tone: "danger", text: errorText(err, "나가지 못했습니다.") }); }
   };
 
   return (
     <>
       <div className="pp-card">
         <h3>{facility?.name}</h3>
-        <p className="sub">{[facility?.facility_type, facility?.branch, facility?.region].filter(Boolean).join(" · ")}</p>
+        <p className="sub">{[facility?.facility_type && facilityTypeLabel(facility.facility_type), facility?.branch, facility?.region].filter(Boolean).join(" · ")}</p>
         <div style={{ display: "grid", gap: 6, fontSize: 14 }}>
           {facility?.phone && <div>☎ <a href={`tel:${facility.phone}`}>{facility.phone}</a></div>}
           {facility?.address && <div>📍 {facility.address}</div>}
@@ -950,10 +965,15 @@ function FacilityInfo({ facility, membership, onChanged, onLeft, onApply }) {
         {membership?.warnings > 0 && <div className="fl-banner warning">관리자 경고 {membership.warnings}회</div>}
         <div style={{ display: "flex", gap: 6 }}>
           <input className="input" style={{ flex: 1 }} value={nickname} onChange={(e) => setNickname(e.target.value)} minLength={2} maxLength={20} />
-          <button className="btn" type="submit">저장</button>
+          <button className="btn" type="submit" disabled={nickname.trim().length < 2 || nickname.trim() === (membership?.nickname || "")}>저장</button>
         </div>
-        {msg && <div className="muted" style={{ marginTop: 8 }}>{msg}</div>}
+        {msg && <div className={`fl-banner ${msg.tone}`} role="status" style={{ marginTop: 10, marginBottom: 0 }}>{msg.text}</div>}
       </form>
+      <div className="pp-card">
+        <h3>📱 휴대폰 알림</h3>
+        <p className="sub">등원·하원, 수강료 청구, 공지, 댓글 알림을 앱을 닫아 둬도 휴대폰으로 받아요. 기기마다 따로 켭니다.</p>
+        <PushSettings compact />
+      </div>
       <div className="pp-card">
         <h3>학원 나가기</h3>
         <p className="sub">이 학원의 자녀 연결과 커뮤니티 멤버십을 해제합니다.</p>

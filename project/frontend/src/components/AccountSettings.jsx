@@ -122,7 +122,7 @@ export function AccountForm({ me, onSaved, roleHint }) {
 }
 
 /** 단독 모달 (메인 화면·학부모 포털) */
-export default function AccountModal({ me, onClose, onSaved, roleHint }) {
+export default function AccountModal({ me, onClose, onSaved, roleHint, actions }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -140,6 +140,11 @@ export default function AccountModal({ me, onClose, onSaved, roleHint }) {
           <h4 style={{ margin: "0 0 10px", fontSize: 14 }}>📱 휴대폰 알림</h4>
           <PushSettings compact />
         </section>
+        {actions && (
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)", display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {actions}
+          </div>
+        )}
       </div>
     </div>
   );
