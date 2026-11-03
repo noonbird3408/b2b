@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDataRefresh } from "../utils/sync";
 import { useNavigate } from "react-router-dom";
 import {
@@ -30,8 +30,15 @@ const PRINT_CSS = `
   .card, .stat-card { break-inside: avoid; box-shadow: none !important; }
   body { background: #fff !important; }
 }
-.info-dot{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;
-  border:1px solid var(--border-strong,#cbd5e1);font-size:10px;color:var(--text-3);cursor:help;margin-left:4px;}
+.info-dot{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;padding:0;
+  border:1px solid var(--border-strong,#cbd5e1);background:var(--surface);font-size:11px;font-weight:700;font-style:italic;
+  font-family:Georgia,serif;color:var(--text-3);cursor:pointer;margin-left:5px;vertical-align:1px;transition:all .12s;}
+.info-dot:hover,.info-dot[aria-expanded="true"]{border-color:var(--primary);color:var(--primary);background:var(--primary-soft);}
+.info-pop{position:fixed;z-index:3000;width:min(280px,calc(100vw - 24px));background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-lg);padding:12px 14px;font-size:12.5px;
+  line-height:1.6;text-align:left;font-weight:400;letter-spacing:0;text-transform:none;white-space:normal;}
+.info-pop b{display:block;font-size:13px;margin-bottom:4px;}
+.info-pop .formula{margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);color:var(--text-3);font-size:11.5px;}
 .dash-two{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:16px;margin-bottom:16px;}
 .dash-eq{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px;}
 @media (max-width:900px){.dash-two,.dash-eq{grid-template-columns:minmax(0,1fr);}}
@@ -43,8 +50,66 @@ const PRINT_CSS = `
 .activity-row time{color:var(--text-3);min-width:44px;font-variant-numeric:tabular-nums;}
 `;
 
-function Info({ text }) {
-  return text ? <span className="info-dot" title={text} aria-label={text}>i</span> : null;
+// 지표 설명 — i 를 누르면(모바일 포함) 쉬운 설명 + 서버가 내려준 계산식이 뜸. 바깥을 누르거나 Esc 로 닫힘
+const METRIC_HELP = {
+  member_change: ["재원생", "지금 다니고 있는 학생 수입니다. 오른쪽 ↑↓ 는 이번 달 새로 등록한 학생에서 퇴원한 학생을 뺀 숫자예요."],
+  attendance_rate_today: ["오늘 출석률", "오늘 수업이 있는 학생 중 출석하거나 지각한 학생의 비율입니다. 아직 아무도 체크하지 않았으면 '체크 전'으로 보여요. 오른쪽 %p 는 최근 30일 출석률이 그 전 30일보다 얼마나 변했는지입니다."],
+  unpaid: ["미납", "아직 내지 않은 수강료 청구서의 합계입니다. 납부 기한이 지난 학생은 '연체'로 따로 셉니다. 미납 집중 관리에서 학부모에게 바로 안내할 수 있어요."],
+  collection_rate: ["이달 수납률", "이번 달에 청구한 금액 중 실제로 받은 금액의 비율입니다. 80% 이상이면 초록색, 미만이면 주황색으로 표시돼요. 오른쪽 % 는 지난달 대비 매출 증감입니다."],
+  attendance_rate_30d: ["30일 출석률", "최근 30일 동안 기록된 출결 중 출석·지각의 비율입니다."],
+  risk: ["관심이 필요한 학생", "출석률이 낮거나, 연속으로 결석했거나, 수강료가 연체된 학생을 점수로 보여 줍니다. 점수가 높을수록 먼저 살펴보세요."],
+  parent_active_7d: ["학부모 앱 활성", "최근 7일 동안 학부모 포털을 이용한 가정 수 / 자녀와 연결된 학부모 계정 수입니다."],
+};
+
+function Info({ id, text }) {
+  const [pos, setPos] = useState(null);
+  const btnRef = useRef(null);
+  const popRef = useRef(null);
+  const [title, plain] = METRIC_HELP[id] || [null, null];
+
+  useEffect(() => {
+    if (!pos) return undefined;
+    const close = (e) => {
+      if (e.type === "keydown" ? e.key === "Escape" : !(popRef.current?.contains(e.target) || btnRef.current?.contains(e.target))) setPos(null);
+    };
+    const onScroll = () => setPos(null);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("touchstart", close, { passive: true });
+    document.addEventListener("keydown", close);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onScroll);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("touchstart", close);
+      document.removeEventListener("keydown", close);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onScroll);
+    };
+  }, [pos]);
+
+  if (!text && !plain) return null;
+  const toggle = (e) => {
+    e.stopPropagation();
+    if (pos) { setPos(null); return; }
+    const r = btnRef.current.getBoundingClientRect();
+    const width = Math.min(280, window.innerWidth - 24);
+    const left = Math.max(12, Math.min(r.left + r.width / 2 - width / 2, window.innerWidth - width - 12));
+    const below = r.bottom + 8;
+    setPos(below + 180 > window.innerHeight ? { left, bottom: window.innerHeight - r.top + 8 } : { left, top: below });
+  };
+  return (
+    <>
+      <button type="button" ref={btnRef} className="info-dot no-print" onClick={toggle} aria-expanded={!!pos}
+        aria-label={`${title || "지표"} 설명 보기`}>i</button>
+      {pos && (
+        <div ref={popRef} className="info-pop" role="tooltip" style={pos}>
+          {title && <b>{title}</b>}
+          {plain || text}
+          {plain && text && <div className="formula">계산 방식 · {text}</div>}
+        </div>
+      )}
+    </>
+  );
 }
 
 function Trend({ value, unit = "%", positiveIsGood = true }) {
@@ -180,7 +245,7 @@ export default function Dashboard() {
       <div className="stat-grid" style={{ marginTop: 16 }}>
         <div className="stat-card">
           <div className="stat-card-head">
-            <span className="stat-label">재원생<Info text={def.member_change} /></span>
+            <span className="stat-label">재원생<Info id="member_change" text={def.member_change} /></span>
             <Trend value={members.change} unit="명" />
           </div>
           <div className="stat-value num">{members.active}<span className="unit">명</span></div>
@@ -188,7 +253,7 @@ export default function Dashboard() {
         </div>
         <div className="stat-card">
           <div className="stat-card-head">
-            <span className="stat-label">오늘 출석률<Info text={def.attendance_rate_today} /></span>
+            <span className="stat-label">오늘 출석률<Info id="attendance_rate_today" text={def.attendance_rate_today} /></span>
             <Trend value={attendance.rate_change} unit="%p" />
           </div>
           <div className="stat-value num primary">{today.present + today.late + today.absent === 0 ? "체크 전" : pctText(today.rate)}</div>
@@ -199,7 +264,7 @@ export default function Dashboard() {
         </div>
         <div className="stat-card">
           <div className="stat-card-head">
-            <span className="stat-label">미납<Info text={def.unpaid} /></span>
+            <span className="stat-label">미납<Info id="unpaid" text={def.unpaid} /></span>
             {billing.overdue_members > 0 && <span className="stat-trend down">연체 {billing.overdue_members}명</span>}
           </div>
           <div className="stat-value num danger">{manwon(billing.unpaid_total)}</div>
@@ -207,7 +272,7 @@ export default function Dashboard() {
         </div>
         <div className="stat-card">
           <div className="stat-card-head">
-            <span className="stat-label">이달 수납률<Info text={def.collection_rate} /></span>
+            <span className="stat-label">이달 수납률<Info id="collection_rate" text={def.collection_rate} /></span>
             <Trend value={revenue.change_rate} />
           </div>
           <div className={`stat-value num ${billing.collection_rate == null ? "" : billing.collection_rate >= 80 ? "success" : "warning"}`}>
@@ -227,7 +292,7 @@ export default function Dashboard() {
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <h3 className="card-title">주간 출석 추이</h3>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
-              30일 출석률 <b style={{ color: "var(--text)" }}>{pctText(attendance.rate_30d)}</b><Info text={def.attendance_rate_30d} />
+              30일 출석률 <b style={{ color: "var(--text)" }}>{pctText(attendance.rate_30d)}</b><Info id="attendance_rate_30d" text={def.attendance_rate_30d} />
               <div>직전 30일 {pctText(attendance.rate_prev_30d)}</div>
             </div>
           </div>
@@ -292,7 +357,7 @@ export default function Dashboard() {
       <div className="dash-eq">
         <div className="card">
           <div className="card-head">
-            <h3 className="card-title">관심이 필요한 학생<Info text={def.risk} /></h3>
+            <h3 className="card-title">관심이 필요한 학생<Info id="risk" text={def.risk} /></h3>
           </div>
           {data.risk_students.length === 0 ? <div className="empty" style={{ padding: 24 }}>위험 신호가 있는 학생이 없습니다.</div> :
             data.risk_students.map((r) => (
@@ -311,7 +376,7 @@ export default function Dashboard() {
           <div className="card-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <h3 className="card-title">최근 활동</h3>
             <div style={{ textAlign: "right", fontSize: 12, color: "var(--text-3)" }}>
-              학부모 앱 활성(7일)<Info text={def.parent_active_7d} />
+              학부모 앱 활성(7일)<Info id="parent_active_7d" text={def.parent_active_7d} />
               <div><b style={{ color: "var(--text)" }}>{data.parents.active_7d}</b> / 연결 {data.parents.linked_accounts}가정</div>
             </div>
           </div>

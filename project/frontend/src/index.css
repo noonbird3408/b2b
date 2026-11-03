@@ -182,11 +182,11 @@ button { font-family: inherit; cursor: pointer; }
 .sidebar-foot-role { font-size: 11px; color: var(--text-3); }
 .sidebar-foot-gear {
   margin-left: auto;
-  width: 28px; height: 28px;
+  width: 32px; height: 32px;
   display: flex; align-items: center; justify-content: center;
   border-radius: 6px;
-  color: var(--text-3);
-  font-size: 14px;
+  color: var(--text-2);
+  font-size: 16px;
 }
 .sidebar-foot-gear:hover { background: var(--surface-hover); color: var(--text-2); }
 
@@ -1486,9 +1486,6 @@ textarea.input { height: auto; padding: 10px 12px; }
    - 데스크톱: 왼쪽 사이드바 그대로, 메뉴 목록 바로 밑에 '설정'
    - 900px 이하(세로로 긴 화면): 사이드바를 숨기고 상단 오른쪽 ☰ 버튼 → 오른쪽에서 서랍이 열림
    ===================================================================== */
-.nav-link.nav-settings { width: 100%; border: 0; background: transparent; text-align: left; cursor: pointer;
-  margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border); border-radius: 0 0 8px 8px; }
-.nav-link.nav-settings:hover { border-radius: 8px; }
 .sidebar nav { overflow-y: auto; min-height: 0; }
 .sidebar-close { display: none; }
 .topbar-menu-btn { display: none; }
@@ -1513,8 +1510,7 @@ textarea.input { height: auto; padding: 10px 12px; }
   .app-shell-responsive .sidebar nav .nav-link { padding: 11px 12px; font-size: 14.5px; cursor: pointer; }
   .app-shell-responsive .sidebar-section-label,
   .app-shell-responsive .sidebar-foot { display: flex; }
-  /* v13: 모바일 서랍에서는 메뉴 목록 밑 '설정' 대신 하단 관리자 이름 옆 톱니(⚙) 하나만 */
-  .app-shell-responsive .sidebar nav .nav-link.nav-settings { display: none; }
+  /* 설정은 하단 관리자 이름 옆 톱니(⚙)에서 — 모바일은 누르기 쉽게 크게 */
   .app-shell-responsive .sidebar-foot .sidebar-foot-gear { display: flex; width: 38px; height: 38px; font-size: 18px;
     border: 1px solid var(--border) !important; background: var(--surface-2) !important; color: var(--text-2); }
   .app-shell-responsive .sidebar-backdrop { display: block; position: fixed; inset: 0; z-index: 2090;

@@ -44,9 +44,13 @@ const SHOP_CSS = `
 .shop-price{font-weight:800;font-size:15px;font-variant-numeric:tabular-nums;}
 .shop-list{font-size:12px;color:var(--text-3);text-decoration:line-through;margin-right:4px;}
 .shop-member{font-size:11.5px;color:var(--success-text,#15803D);font-weight:700;}
-.shop-qty{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:8px;overflow:hidden;}
-.shop-qty button{width:26px;height:28px;border:0;background:var(--surface-2);color:var(--text);font-size:14px;cursor:pointer;}
-.shop-qty input{width:42px;height:28px;border:0;text-align:center;background:var(--surface);color:var(--text);font-size:13px;}
+.shop-qty{display:inline-flex;align-items:center;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface);flex-shrink:0;}
+.shop-qty button{width:28px;height:30px;border:0;background:var(--surface-2);color:var(--text);font-size:15px;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0;}
+.shop-qty button:hover:not(:disabled){background:var(--surface-hover);}
+.shop-qty button:disabled{color:var(--text-3);cursor:default;}
+.shop-qty button.del{color:var(--danger);font-size:13px;}
+.shop-qty input{width:40px;height:30px;border:0;text-align:center;background:var(--surface);color:var(--text);font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;padding:0;-moz-appearance:textfield;appearance:textfield;}
+.shop-qty input::-webkit-outer-spin-button,.shop-qty input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
 .shop-cats{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 12px;}
 .shop-cats button{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:6px 12px;font-size:12px;cursor:pointer;color:var(--text-2);}
 .shop-cats button.active{background:var(--primary);border-color:var(--primary);color:#fff;}
@@ -56,9 +60,29 @@ const SHOP_CSS = `
 .shop-searchbar .input{flex:1 1 260px;min-width:0;height:42px;font-size:14px;}
 .shop-toggle{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;padding:6px 10px;border:1px solid var(--border);border-radius:99px;background:var(--surface);cursor:pointer;user-select:none;color:var(--text);}
 .shop-toggle.on{border-color:var(--primary);background:var(--primary-soft);color:var(--primary-text);font-weight:600;}
-.shop-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;padding:12px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2);margin-bottom:12px;}
-.shop-filters label{display:grid;gap:4px;font-size:12px;color:var(--text-2);}
-.shop-filters .check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text);}
+.shop-filters{display:grid;gap:14px;padding:14px;border:1px solid var(--border);border-radius:12px;background:var(--surface-2);margin-bottom:12px;}
+.shop-filters fieldset{border:0;margin:0;padding:0;display:grid;gap:8px;min-width:0;}
+.shop-filters legend{font-size:12px;font-weight:700;color:var(--text-2);padding:0;margin-bottom:6px;}
+.shop-filters .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.shop-filters .row .input{width:130px;flex:0 1 130px;min-width:0;height:36px;}
+.shop-filters .row .tilde{color:var(--text-3);}
+.shop-filters .presets{display:flex;gap:6px;flex-wrap:wrap;}
+.shop-filters .presets button{border:1px solid var(--border);background:var(--surface);border-radius:99px;padding:4px 10px;font-size:12px;color:var(--text-2);cursor:pointer;}
+.shop-filters .presets button.on{border-color:var(--primary);background:var(--primary-soft);color:var(--primary-text);font-weight:700;}
+.shop-filters .checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 14px;}
+.shop-filters .check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer;}
+.shop-filters .check input{width:16px;height:16px;accent-color:var(--primary);flex-shrink:0;}
+.shop-filters .foot{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;border-top:1px dashed var(--border);padding-top:10px;font-size:12px;color:var(--text-3);}
+.shop-filters .warn{color:var(--warning-text);}
+.shop-active{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:0 0 10px;}
+.shop-active .chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--primary);background:var(--primary-soft);color:var(--primary-text);border-radius:99px;padding:3px 4px 3px 10px;font-size:12px;font-weight:600;}
+.shop-active .chip button{border:0;background:transparent;color:inherit;width:20px;height:20px;border-radius:50%;cursor:pointer;font-size:11px;display:grid;place-items:center;}
+.shop-active .chip button:hover{background:rgba(59,130,246,.15);}
+.shop-active .clear{border:0;background:transparent;color:var(--text-3);font-size:12px;text-decoration:underline;cursor:pointer;}
+.shop-toggle .cnt{min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--primary);color:#fff;font-size:11px;font-weight:700;display:inline-grid;place-items:center;}
+.shop-result-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px;flex-wrap:wrap;}
+.shop-result-bar .shop-section-sub{margin:0;}
+.shop-result-bar .select{width:auto;min-width:140px;height:34px;font-size:13px;}
 .shop-suggest{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px;align-items:center;font-size:12px;color:var(--text-3);}
 .shop-suggest button{border:1px dashed var(--border-strong);background:var(--surface);border-radius:99px;padding:3px 10px;font-size:12px;color:var(--text-2);cursor:pointer;}
 .mall-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;}
@@ -70,7 +94,7 @@ const SHOP_CSS = `
 .mall-meta b{color:var(--text);}
 .cart-group{border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--surface);margin-bottom:12px;overflow:hidden;}
 .cart-group-head{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--surface-2);border-bottom:1px solid var(--border);font-size:13px;flex-wrap:wrap;}
-.cart-line{display:grid;grid-template-columns:minmax(0,1fr) auto 110px 28px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);font-size:13px;}
+.cart-line{display:grid;grid-template-columns:minmax(0,1fr) auto 110px;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);font-size:13px;}
 .cart-line:last-child{border-bottom:0;}
 .cart-foot{display:flex;justify-content:space-between;gap:8px;padding:8px 14px;font-size:12px;color:var(--text-2);border-top:1px dashed var(--border);flex-wrap:wrap;}
 .cart-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start;}
@@ -124,7 +148,7 @@ const SHOP_CSS = `
 .shop-form label{display:grid;gap:4px;font-size:12px;color:var(--text-2);}
 @media(max-width:980px){.shop-why{grid-template-columns:1fr 1fr;}.cart-layout{grid-template-columns:1fr;}.cart-sum{position:static;}}
 @media(max-width:640px){.shop-rail{grid-auto-columns:68%;}.shop-rail-nav{display:none;}
-  .shop-form{grid-template-columns:1fr;}.shop-admin table{display:block;overflow-x:auto;}.shop-filters{grid-template-columns:1fr 1fr;}
+  .shop-form{grid-template-columns:1fr;}.shop-admin table{display:block;overflow-x:auto;}.shop-filters .checks{grid-template-columns:1fr;}.shop-filters .row .input{flex:1 1 0;width:auto;}
   .cart-line{grid-template-columns:minmax(0,1fr) auto;}.cart-line .hide-sm{display:none;}}
 `;
 
@@ -136,6 +160,32 @@ const MATCH_LABEL = { name: "상품명", tags: "태그", category: "분류", des
 const MALL_CODES = ["edubooks", "munguland", "makerlab", "artnmusic", "sportsfarm", "prizeshop", "ddm"];
 const EMPTY_FILTER = { min_price: "", max_price: "", quantity: "", fit: false, include_quote: true, sort: "relevance",
   discount_only: false, purchasable_only: false };
+// 자주 쓰는 가격대 (원) — 누르면 최저·최고 가격이 한 번에 채워짐
+const PRICE_PRESETS = [["~1만원", "", 10000], ["1~3만원", 10000, 30000], ["3~10만원", 30000, 100000], ["10만원~", 100000, ""]];
+const SORT_LABELS = { relevance: "일치순", discount: "할인율 높은 순", popular: "많이 본 순", price_asc: "낮은 가격순", price_desc: "높은 가격순", name: "이름순" };
+const manwonText = (n) => (n === "" || n == null ? "" : Number(n) >= 10000 && Number(n) % 10000 === 0 ? `${Number(n) / 10000}만원` : `${Number(n).toLocaleString("ko-KR")}원`);
+
+/** 최저>최고로 넣었으면 서로 바꿔서 검색 (화면 값은 그대로 두고 안내) */
+function normalizedPrice(filter) {
+  const min = filter.min_price === "" ? null : Number(filter.min_price);
+  const max = filter.max_price === "" ? null : Number(filter.max_price);
+  return min != null && max != null && min > max ? { min: max, max: min, swapped: true } : { min, max, swapped: false };
+}
+
+/** 지금 걸려 있는 조건 → 지울 수 있는 칩 목록 [{key, label, clear}] */
+function activeFilterChips(filter) {
+  const chips = [];
+  const { min, max } = normalizedPrice(filter);
+  if (min != null || max != null) {
+    chips.push({ key: "price", label: `💰 ${min != null ? manwonText(min) : ""}~${max != null ? manwonText(max) : ""}`, clear: { min_price: "", max_price: "" } });
+  }
+  if (filter.quantity !== "") chips.push({ key: "qty", label: `👥 ${filter.quantity}명 단체`, clear: { quantity: "" } });
+  if (filter.discount_only) chips.push({ key: "disc", label: "🏷 할인 상품", clear: { discount_only: false } });
+  if (filter.purchasable_only) chips.push({ key: "buy", label: "⚡ 바로 주문 가능", clear: { purchasable_only: false } });
+  if (!filter.include_quote) chips.push({ key: "quote", label: "견적 문의 제외", clear: { include_quote: true } });
+  if (filter.fit) chips.push({ key: "fit", label: "🏫 우리 학원 전용", clear: { fit: false } });
+  return chips;
+}
 const EMPTY_FORM = { name: "", category: "교재", url: "", description: "", price: "", list_price: "", unit: "개", mall_code: "",
   image_url: "", tags: "", facility_types: "", min_quantity: 1, active: true };
 
@@ -149,13 +199,27 @@ function PriceBlock({ product }) {
   );
 }
 
-function QtyInput({ value, onChange, min = 1 }) {
+/** 수량 조절 — −/＋ 버튼 한 쌍 + 직접 입력 (브라우저 기본 위아래 화살표는 숨김)
+ *  onRemove 를 주면(장바구니) 최소 수량에서 − 대신 🗑 가 나와 바로 뺄 수 있음 */
+function QtyInput({ value, onChange, min = 1, onRemove }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => { setDraft(String(value)); }, [value]);
+  const clamp = (n) => Math.max(min, Math.min(10000, n));
+  const commit = () => {
+    const n = clamp(Number(draft) || min);
+    setDraft(String(n));
+    if (n !== value) onChange(n);
+  };
+  const atMin = value <= min;
   return (
     <span className="shop-qty">
-      <button type="button" aria-label="수량 빼기" onClick={() => onChange(Math.max(min, value - 1))}>−</button>
-      <input type="number" min={min} max={10000} value={value} aria-label="수량"
-        onChange={(e) => onChange(Math.max(min, Math.min(10000, Number(e.target.value) || min)))} />
-      <button type="button" aria-label="수량 더하기" onClick={() => onChange(Math.min(10000, value + 1))}>＋</button>
+      {atMin && onRemove
+        ? <button type="button" className="del" aria-label="장바구니에서 빼기" title="빼기" onClick={onRemove}>🗑</button>
+        : <button type="button" aria-label="수량 빼기" disabled={atMin} onClick={() => onChange(clamp(value - 1))}>−</button>}
+      <input type="text" inputMode="numeric" pattern="[0-9]*" value={draft} aria-label="수량"
+        onChange={(e) => setDraft(e.target.value.replace(/\D/g, "").slice(0, 5))}
+        onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } }} />
+      <button type="button" aria-label="수량 더하기" disabled={value >= 10000} onClick={() => onChange(clamp(value + 1))}>＋</button>
     </span>
   );
 }
@@ -333,6 +397,7 @@ export default function Shop() {
   const [personalize, setPersonalize] = useState(true);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [filter, setFilter] = useState(EMPTY_FILTER);
+  const [appliedFilter, setAppliedFilter] = useState(EMPTY_FILTER);   // 숫자를 치는 동안 매 글자 검색하지 않도록 0.4초 뒤 적용
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState("");
@@ -348,19 +413,32 @@ export default function Shop() {
   const loadMalls = useCallback(() => fetchShopMalls().then(setMalls).catch((e) => setError(errorText(e, "제휴몰을 불러오지 못했습니다."))), []);
   const runSearch = useCallback(() => {
     setSearching(true);
+    const f = appliedFilter;
+    const price = normalizedPrice(f);
     const params = {
-      q: debounced || undefined, category: category === "전체" ? undefined : category, mall: mall || undefined, personalize, sort: filter.sort,
-      min_price: filter.min_price === "" ? undefined : Number(filter.min_price),
-      max_price: filter.max_price === "" ? undefined : Number(filter.max_price),
-      quantity: filter.quantity === "" ? undefined : Number(filter.quantity),
-      fit: filter.fit ? "facility" : "all", include_quote: filter.include_quote,
-      discount_only: filter.discount_only || undefined, purchasable_only: filter.purchasable_only || undefined,
+      q: debounced || undefined, category: category === "전체" ? undefined : category, mall: mall || undefined, personalize, sort: f.sort,
+      min_price: price.min ?? undefined, max_price: price.max ?? undefined,
+      quantity: f.quantity === "" ? undefined : Number(f.quantity),
+      fit: f.fit ? "facility" : "all", include_quote: f.include_quote,
+      discount_only: f.discount_only || undefined, purchasable_only: f.purchasable_only || undefined,
     };
     return searchShopProducts(params)
       .then((d) => { setResults(d); setError(""); })
       .catch((e) => setError(errorText(e, "검색하지 못했습니다.")))
       .finally(() => setSearching(false));
-  }, [debounced, category, mall, personalize, filter]);
+  }, [debounced, category, mall, personalize, appliedFilter]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setAppliedFilter(filter), 400);
+    return () => window.clearTimeout(timer);
+  }, [filter]);
+  // 체크·정렬·칩 삭제처럼 바로 바뀌어야 하는 조건은 기다리지 않고 적용
+  const changeFilter = (patch, immediate = false) => {
+    setFilter((prev) => {
+      const next = { ...prev, ...patch };
+      if (immediate) setAppliedFilter(next);
+      return next;
+    });
+  };
 
   useEffect(() => {
     fetchMe().then(setMe).catch(() => navigate("/"));
@@ -407,6 +485,7 @@ export default function Shop() {
   };
 
   const ctx = recs?.context;
+  const filterChips = activeFilterChips(filter);
   const categories = ["전체", ...(info.categories || [])];
   const mallChips = useMemo(() => [...(malls?.malls || []), ...(malls?.external ? [malls.external] : [])], [malls]);
 
@@ -454,22 +533,73 @@ export default function Shop() {
             <button type="button" className={`shop-toggle${personalize ? " on" : ""}`} aria-pressed={personalize} onClick={() => setPersonalize((v) => !v)}
 >🎯 맞춤</button>
             <button type="button" className={`shop-toggle${filter.discount_only ? " on" : ""}`} aria-pressed={filter.discount_only}
-              onClick={() => setFilter((f) => ({ ...f, discount_only: !f.discount_only }))}>🏷 할인</button>
-            <button type="button" className={`shop-toggle${filtersOpen ? " on" : ""}`} aria-expanded={filtersOpen} onClick={() => setFiltersOpen((v) => !v)}>⚙ 필터</button>
+              onClick={() => changeFilter({ discount_only: !filter.discount_only }, true)}>🏷 할인</button>
+            <button type="button" className={`shop-toggle${filtersOpen || filterChips.length ? " on" : ""}`} aria-expanded={filtersOpen}
+              onClick={() => setFiltersOpen((v) => !v)}>
+              ⚙ 필터{filterChips.length > 0 && <span className="cnt" aria-label={`조건 ${filterChips.length}개`}>{filterChips.length}</span>}
+            </button>
           </form>
           {filtersOpen && (
-            <div className="shop-filters">
-              <label>최저 가격(원)<input className="input" type="number" min="0" value={filter.min_price} onChange={(e) => setFilter({ ...filter, min_price: e.target.value })} placeholder="0" /></label>
-              <label>최고 가격(원)<input className="input" type="number" min="0" value={filter.max_price} onChange={(e) => setFilter({ ...filter, max_price: e.target.value })} placeholder="제한 없음" /></label>
-              <label>단체 인원(명)<input className="input" type="number" min="1" value={filter.quantity} onChange={(e) => setFilter({ ...filter, quantity: e.target.value })} placeholder="예: 30" /></label>
-              <label>정렬<select className="select" value={filter.sort} onChange={(e) => setFilter({ ...filter, sort: e.target.value })}>
-                <option value="relevance">{personalize ? "맞춤·일치순" : "일치순"}</option><option value="discount">할인율 높은 순</option>
-                <option value="popular">많이 본 순</option><option value="price_asc">낮은 가격순</option><option value="price_desc">높은 가격순</option><option value="name">이름순</option>
-              </select></label>
-              <span className="check"><input type="checkbox" id="f-buy" checked={filter.purchasable_only} onChange={(e) => setFilter({ ...filter, purchasable_only: e.target.checked })} /><label htmlFor="f-buy" style={{ display: "inline" }}>바로 주문 가능한 상품만</label></span>
-              <span className="check"><input type="checkbox" id="f-quote" checked={filter.include_quote} onChange={(e) => setFilter({ ...filter, include_quote: e.target.checked })} /><label htmlFor="f-quote" style={{ display: "inline" }}>견적 문의 상품 포함</label></span>
-              <span className="check"><input type="checkbox" id="f-fit" checked={filter.fit} onChange={(e) => setFilter({ ...filter, fit: e.target.checked })} /><label htmlFor="f-fit" style={{ display: "inline" }}>우리 학원 종류 전용 상품만</label></span>
-              <button type="button" className="btn ghost sm" style={{ justifySelf: "start" }} onClick={() => setFilter(EMPTY_FILTER)}>조건 초기화</button>
+            <div className="shop-filters" role="group" aria-label="상세 필터">
+              <fieldset>
+                <legend>가격 (1개당)</legend>
+                <div className="presets">
+                  {PRICE_PRESETS.map(([label, lo, hi]) => {
+                    const on = String(filter.min_price) === String(lo) && String(filter.max_price) === String(hi);
+                    return (
+                      <button key={label} type="button" className={on ? "on" : ""} aria-pressed={on}
+                        onClick={() => changeFilter(on ? { min_price: "", max_price: "" } : { min_price: lo, max_price: hi }, true)}>{label}</button>
+                    );
+                  })}
+                </div>
+                <div className="row">
+                  <input className="input" type="number" min="0" step="1000" inputMode="numeric" placeholder="최저 (원)" aria-label="최저 가격"
+                    value={filter.min_price} onChange={(e) => changeFilter({ min_price: e.target.value })} />
+                  <span className="tilde">~</span>
+                  <input className="input" type="number" min="0" step="1000" inputMode="numeric" placeholder="최고 (원)" aria-label="최고 가격"
+                    value={filter.max_price} onChange={(e) => changeFilter({ max_price: e.target.value })} />
+                </div>
+                {normalizedPrice(filter).swapped && <span className="warn" style={{ fontSize: 12 }}>최저 가격이 최고 가격보다 커서 서로 바꿔 검색합니다.</span>}
+              </fieldset>
+              <fieldset>
+                <legend>단체 구매 인원</legend>
+                <div className="row">
+                  <input className="input" type="number" min="1" inputMode="numeric" placeholder="예: 30" aria-label="단체 인원"
+                    value={filter.quantity} onChange={(e) => changeFilter({ quantity: e.target.value })} />
+                  <span className="muted">명 — 최소 주문 수량·단체 할인을 반영해 찾습니다</span>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend>조건</legend>
+                <div className="checks">
+                  <label className="check"><input type="checkbox" checked={filter.purchasable_only}
+                    onChange={(e) => changeFilter({ purchasable_only: e.target.checked }, true)} />바로 주문 가능한 상품만</label>
+                  <label className="check"><input type="checkbox" checked={filter.include_quote}
+                    onChange={(e) => changeFilter({ include_quote: e.target.checked }, true)} />견적 문의 상품 포함</label>
+                  <label className="check"><input type="checkbox" checked={filter.fit}
+                    onChange={(e) => changeFilter({ fit: e.target.checked }, true)} />우리 학원 종류 전용 상품만</label>
+                  <label className="check"><input type="checkbox" checked={filter.discount_only}
+                    onChange={(e) => changeFilter({ discount_only: e.target.checked }, true)} />할인 중인 상품만</label>
+                </div>
+              </fieldset>
+              <div className="foot">
+                <span>{searching ? "검색 중…" : results ? `조건에 맞는 상품 ${results.total}개` : ""}</span>
+                <span style={{ display: "flex", gap: 6 }}>
+                  <button type="button" className="btn ghost sm" onClick={() => changeFilter({ ...EMPTY_FILTER, sort: filter.sort }, true)}
+                    disabled={!filterChips.length}>조건 초기화</button>
+                  <button type="button" className="btn sm" onClick={() => { setAppliedFilter(filter); setFiltersOpen(false); }}>적용하고 닫기</button>
+                </span>
+              </div>
+            </div>
+          )}
+          {filterChips.length > 0 && (
+            <div className="shop-active" aria-label="적용된 조건">
+              {filterChips.map((c) => (
+                <span key={c.key} className="chip">{c.label}
+                  <button type="button" aria-label={`${c.label} 조건 지우기`} onClick={() => changeFilter(c.clear, true)}>✕</button>
+                </span>
+              ))}
+              <button type="button" className="clear" onClick={() => changeFilter({ ...EMPTY_FILTER, sort: filter.sort }, true)}>모두 지우기</button>
             </div>
           )}
           <div className="shop-cats" role="group" aria-label="제휴몰">
@@ -488,7 +618,12 @@ export default function Shop() {
               {results.suggestions.slice(0, 8).map((w) => <button key={w} type="button" onClick={() => { setQuery(w); setDebounced(w); }}>{w}</button>)}
             </div>
           )}
-          <p className="shop-section-sub">{searching ? "검색 중…" : results ? `${results.total}개` : ""}</p>
+          <div className="shop-result-bar">
+            <p className="shop-section-sub">{searching ? "검색 중…" : results ? `상품 ${results.total}개` : ""}</p>
+            <select className="select" aria-label="정렬" value={filter.sort} onChange={(e) => changeFilter({ sort: e.target.value }, true)}>
+              {Object.entries(SORT_LABELS).map(([v, l]) => <option key={v} value={v}>{v === "relevance" && personalize ? "맞춤·일치순" : l}</option>)}
+            </select>
+          </div>
           <div className="shop-grid">
             {(results?.items || []).map((p) => <ProductCard key={p.product_id} product={p} context="search" onAdd={handleAdd} onDetail={handleDetail} />)}
             {results && !results.items.length && <div className="empty">검색 결과가 없습니다.</div>}
@@ -635,9 +770,8 @@ function CartTab({ facilityId, isOwner, setError, flash, onOrdered, onBrowse }) 
                     {won(it.unit_price)} / {it.unit}{it.discount_rate ? ` · ${it.discount_rate}% 할인` : ""}
                   </div>
                 </div>
-                <QtyInput value={it.quantity} onChange={(q) => setQty(it.product_id, q)} />
+                <QtyInput value={it.quantity} min={it.min_quantity || 1} onChange={(q) => setQty(it.product_id, q)} onRemove={() => remove(it.product_id)} />
                 <b className="hide-sm" style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{won(it.line_total)}</b>
-                <button className="btn ghost sm" aria-label={`${it.name} 빼기`} onClick={() => remove(it.product_id)}>✕</button>
               </div>
             ))}
             <div className="cart-foot"><span>상품 {won(g.subtotal)} + 배송 {won(g.shipping_fee)}</span><b>{won(g.total)}</b></div>

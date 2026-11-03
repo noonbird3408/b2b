@@ -477,11 +477,6 @@ export default function Layout() {
               )}
             </NavLink>
           ))}
-          {/* 메뉴 목록 바로 밑의 설정 — 데스크톱·모바일 모두 같은 위치 */}
-          <button type="button" className="nav-link nav-settings" onClick={openSettings}>
-            <span style={{ width: 18, textAlign: "center" }}>⚙</span>
-            <span>설정</span>
-          </button>
         </nav>
         <div className="sidebar-foot">
           <UserAvatar user={me.user} size={32} />
