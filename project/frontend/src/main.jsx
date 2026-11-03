@@ -1,6 +1,6 @@
 import { lazy, Suspense } from "react";
 import ReactDOM from "react-dom/client";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useSearchParams } from "react-router-dom";
 
 import "./index.css";
 import FacilityManagerUI from "./components/FacilityManagerUI.jsx";
@@ -19,6 +19,13 @@ const B2BShop = lazy(() => import("./pages/B2BShopLive.jsx"));
 const ParentPortal = lazy(() => import("./pages/ParentPortal.jsx"));
 const Inventory = lazy(() => import("./pages/Inventory.jsx"));
 
+// v13 초대 링크: /join?code=123456 → 메인(로그인 → 코드 확인 → 학원 등록)
+function JoinRedirect() {
+  const [params] = useSearchParams();
+  const code = (params.get("code") || "").replace(/\D/g, "").slice(0, 6);
+  return <Navigate to={code ? `/?join=${code}` : "/"} replace />;
+}
+
 const Loading = () => <div className="auth-loading">화면을 불러오는 중입니다.</div>;
 
 ReactDOM.createRoot(document.getElementById("root")).render(
@@ -27,6 +34,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
         <Routes>
           {/* 1) Google 로그인 → 2) 학부모/관리자 선택 → 3) 관리자는 학원 관리/쇼핑몰 선택 */}
           <Route path="/" element={<FacilityManagerUI />} />
+          <Route path="/join" element={<JoinRedirect />} />
           {/* 학부모 (카카오페이 결과는 /checkout?kakao=... 로 돌아옴) */}
           <Route path="/parentportal" element={<ParentPortal />} />
           <Route path="/checkout" element={<ParentPortal />} />

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
   FACILITY_REQUIRED_EVENT, createAdminAccount, deleteAdminAccount, errorText, exportAdminData, fetchAdminAccounts,
-  fetchAdminNotifications, fetchAdminSummary, fetchAppSettings, fetchMe, fetchSyncVersion, importAdminSettings, loadDemoData,
+  fetchAdminNotifications, fetchAdminSummary, fetchAppSettings, fetchMe, fetchSyncVersion, importAdminSettings, loadDemoData, localToday,
   markAdminNotificationsRead, saveAppSettings, signOut, updateAdminAccount,
 } from "../api";
 import { FACILITY_TYPES, NOTIFICATION_META, WEATHER_CITIES, facilityColor, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
@@ -10,6 +10,8 @@ import { announceDataChanged } from "../utils/sync";
 import { resizeImageFile } from "../utils/image";
 import Brand from "./Brand.jsx";
 import SubjectPicker from "./SubjectPicker.jsx";
+import { AccountForm, UserAvatar } from "./AccountSettings.jsx";
+import InviteManager from "./InviteManager.jsx";
 import { BRAND } from "../utils/brand";
 
 const SETTINGS_STYLES = `
@@ -240,11 +242,15 @@ export default function Layout() {
   }, [isSettingsOpen, isOwner]);
 
   useEffect(() => {
-    if (!isSettingsOpen || activeTab !== "계정" || !isOwner) return;
+    if (!isSettingsOpen || activeTab !== "직원 계정" || !isOwner) return;
     fetchAdminAccounts().then(setAdminAccounts).catch((error) => setSettingsMessage(errorText(error, "계정 목록을 불러오지 못했습니다.")));
   }, [activeTab, isSettingsOpen, isOwner]);
 
-  const openSettings = () => { setIsMenuOpen(false); setIsSettingsOpen(true); };
+  const openSettings = (tab) => {
+    setIsMenuOpen(false);
+    if (typeof tab === "string") setActiveTab(tab);
+    setIsSettingsOpen(true);
+  };
 
   const openNotifications = async () => {
     const next = !isDropdownOpen;
@@ -404,7 +410,7 @@ export default function Layout() {
       const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${BRAND.slug}-${facility?.facility_id}-${new Date().toISOString().slice(0, 10)}.json`;
+      link.download = `${BRAND.slug}-${facility?.facility_id}-${localToday()}.json`;
       link.click();
       URL.revokeObjectURL(url);
     } catch (error) {
@@ -448,7 +454,7 @@ export default function Layout() {
   const visibleMenu = isOwner ? menuOrder : menuOrder.filter((item) => STAFF_PATHS.includes(item.to));
   const menuHasBadge = visibleMenu.some((item) => NAV_BADGES[item.id] && NAV_BADGES[item.id](summary?.badges || {}) > 0);
   const setA = (key) => (e) => setAcademyInfo((prev) => ({ ...prev, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
-  const tabs = isOwner ? ["화면", "기관 정보", "수납", "계정", "데이터"] : ["화면"];
+  const tabs = isOwner ? ["화면", "내 계정", "기관 정보", "수납", "직원 계정", "초대", "데이터"] : ["화면", "내 계정"];
 
   return (
     <div className="app-shell app-shell-responsive">
@@ -478,7 +484,7 @@ export default function Layout() {
           </button>
         </nav>
         <div className="sidebar-foot">
-          <div className="avatar">{(brand.principal || account.username || "관").charAt(0)}</div>
+          <UserAvatar user={me.user} size={32} />
           <div style={{ minWidth: 0 }}>
             <div className="sidebar-foot-name">{isOwner ? (brand.principal || account.username) : account.username}</div>
             <div className="sidebar-foot-role">{isOwner ? (brand.role || "원장") : "직원"}</div>
@@ -499,8 +505,7 @@ export default function Layout() {
             {isOwner && (
               <form className="topbar-search" onSubmit={handleGlobalSearch} role="search" style={{ marginLeft: 0 }}>
                 <input ref={searchRef} value={globalQuery} onChange={(e) => setGlobalQuery(e.target.value)}
-                  placeholder="학생·보호자·전화번호 검색" aria-label="학생 검색" />
-                <span className="kbd">⌘K</span>
+                  placeholder="학생·보호자·전화번호 검색" aria-label="학생 검색" title="Ctrl+K 로 바로 검색" />
               </form>
             )}
             <div className="topbar-bell-wrapper">
@@ -621,6 +626,12 @@ export default function Layout() {
                 </div>
               )}
 
+              {activeTab === "내 계정" && (
+                <AccountForm me={me} onSaved={(next) => setMe(next)} roleHint="관리자 화면과 직원 목록에 이 이름이 보입니다." />
+              )}
+
+              {activeTab === "초대" && isOwner && <InviteManager />}
+
               {activeTab === "기관 정보" && (academyInfo ? (
                 <div>
                   <div className="form-row">
@@ -686,7 +697,7 @@ export default function Layout() {
                 </div>
               ) : <div className="fl-skeleton" style={{ height: 200 }} />)}
 
-              {activeTab === "계정" && (
+              {activeTab === "직원 계정" && (
                 <div style={{ display: "grid", gap: 10 }}>
                   {adminAccounts.map((row) => (
                     <div className="account-row" key={row.account_id}>

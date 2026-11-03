@@ -5,7 +5,7 @@ import {
   createComment, createCommunityPost, createNotice, deleteAttachment, deleteComment, deleteCommunityPost, deleteNotice,
   downloadModerationDataset, draftNotice, errorText, fetchClasses, likeCommunityComment, fetchCommunityBoard, fetchCommunityMembers, fetchCommunityPost,
   fetchComments, fetchModerationPosts, fetchModerationQueue, fetchModerationStats, likeCommunityPost, moderateComment, moderatePost,
-  sanctionCommunityMember, updateCommunityPost, updateNotice, uploadNoticeAttachment, uploadPostAttachment,
+  localToday, sanctionCommunityMember, updateCommunityPost, updateNotice, uploadNoticeAttachment, uploadPostAttachment,
 } from "../api";
 import Board from "../components/Board.jsx";
 import { relativeTime } from "../utils/constants";
@@ -95,7 +95,7 @@ function ModerationTab() {
     try {
       const url = URL.createObjectURL(await downloadModerationDataset());
       const a = document.createElement("a");
-      a.href = url; a.download = `moderation_dataset_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.href = url; a.download = `moderation_dataset_${localToday()}.csv`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (e) {

@@ -10,6 +10,9 @@ import {
 } from "../utils/constants";
 import SubjectPicker from "./SubjectPicker.jsx";
 import Brand from "./Brand.jsx";
+import AccountModal, { UserAvatar } from "./AccountSettings.jsx";
+import JoinByCode from "./JoinByCode.jsx";
+import { resizeImageFile } from "../utils/image";
 
 // =====================================================================
 // 메인(/) : 로그인 → 역할 선택(학부모/관리자) → 관리자는 학원 선택·생성·수정·삭제
@@ -21,6 +24,7 @@ const STYLES = `
 .fm-user{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--text-2);min-width:0;}
 .fm-user img{width:28px;height:28px;border-radius:50%;}
 .fm-user .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;}
+.fm-user{flex-wrap:nowrap;}
 .fm-body{flex:1;display:flex;justify-content:center;padding:36px 20px 48px;}
 .fm-center{align-items:center;}
 .fm-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;width:min(420px,100%);box-shadow:var(--shadow-lg);text-align:center;}
@@ -68,6 +72,14 @@ const STYLES = `
 .fm-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;}
 .fm-form-grid .full{grid-column:1/-1;}
 .fm-check{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--text-2);}
+.fm-me{display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;background:transparent;border-radius:999px;padding:2px 8px 2px 2px;color:var(--text-2);font-size:12px;min-width:0;}
+.fm-me:hover{border-color:var(--border);background:var(--surface-2);}
+.fm-join{margin-top:18px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px 20px;text-align:left;}
+.fm-join h3{margin:0 0 4px;font-size:15px;}
+.fm-join>p{margin:0 0 12px;font-size:12.5px;color:var(--text-2);}
+.fm-logo-pick{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+.fm-logo-pick .pv{width:64px;height:64px;border-radius:14px;border:1px solid var(--border);background:var(--primary-soft);color:var(--primary-text);display:grid;place-items:center;font-weight:800;font-size:24px;overflow:hidden;flex-shrink:0;}
+.fm-logo-pick .pv img{width:100%;height:100%;object-fit:cover;}
 .fac-card{border-left:4px solid var(--fac-color,var(--border));}
 .fac-card.fac-new{border-left:1.5px dashed var(--border-strong);}
 .fac-card.current{border-left-color:var(--fac-color);}
@@ -107,15 +119,17 @@ function Banner({ tone = "danger", children }) {
   return <div className={`fl-banner ${tone}`} role="alert">{children}</div>;
 }
 
-function Header({ me, onRole, onLogout, bell }) {
+function Header({ me, onRole, onLogout, bell, onAccount }) {
   return (
     <header className="fm-header">
       <Brand />
       {me ? (
         <div className="fm-user">
           {bell}
-          {me.user.picture && <img src={me.user.picture} alt="" referrerPolicy="no-referrer" />}
-          <span className="name">{me.user.name || me.user.email}</span>
+          <button type="button" className="fm-me" onClick={onAccount} title="내 계정 (이름·프로필 사진)" aria-label="내 계정">
+            <UserAvatar user={me.user} size={28} />
+            <span className="name">{me.user.name || me.user.email}</span>
+          </button>
           {onRole && <button className="btn ghost sm" type="button" onClick={onRole}>역할 변경</button>}
           <button className="btn ghost sm" type="button" onClick={onLogout}>로그아웃</button>
         </div>
@@ -148,7 +162,7 @@ function GoogleSignInButton({ config, disabled, onCredential }) {
   return <div className="google-button-wrap" ref={buttonRef} aria-label="Google 계정으로 계속하기" />;
 }
 
-function LoginScreen({ config, error, busy, onCredential, onDevLogin }) {
+function LoginScreen({ config, error, busy, onCredential, onDevLogin, inviteCode }) {
   const [devEmail, setDevEmail] = useState("");
   return (
     <div className="fm-body fm-center">
@@ -156,6 +170,7 @@ function LoginScreen({ config, error, busy, onCredential, onDevLogin }) {
         <h1>{BRAND.logo} {BRAND.name} 시작하기</h1>
         <p>{BRAND.tagline} — 출결·수납·소통·물품 구매까지 학원 운영을 한곳에서.</p>
         {error && <Banner>{error}</Banner>}
+        {inviteCode && <Banner tone="info">🔑 초대 코드 {inviteCode} — 로그인하면 바로 학원 등록 화면으로 이어집니다.</Banner>}
         <GoogleSignInButton config={config} disabled={busy} onCredential={onCredential} />
         {config?.dev_login && (
           <form className="dev-login" onSubmit={(e) => { e.preventDefault(); onDevLogin(devEmail); }}>
@@ -170,7 +185,7 @@ function LoginScreen({ config, error, busy, onCredential, onDevLogin }) {
   );
 }
 
-function RoleSelect({ me, error, busy, onParent, onAdmin }) {
+function RoleSelect({ me, error, busy, onParent, onAdmin, onJoined }) {
   const [inviteCode, setInviteCode] = useState("");
   const [showInvite, setShowInvite] = useState(!me.can_admin);
   return (
@@ -204,13 +219,31 @@ function RoleSelect({ me, error, busy, onParent, onAdmin }) {
             )}
           </div>
         </div>
+        <section className="fm-join" aria-label="초대 코드로 학원 등록">
+          <h3>🔑 학원에서 받은 초대 코드가 있나요?</h3>
+          <p>숫자 6자리를 입력하면 학부모 또는 직원으로 그 학원에 바로 등록됩니다.</p>
+          <JoinByCode onJoined={onJoined} />
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function JoinScreen({ code, onJoined, onCancel }) {
+  return (
+    <div className="fm-body fm-center">
+      <div className="fm-card" style={{ textAlign: "left" }}>
+        <h1 style={{ textAlign: "center" }}>🔑 초대 코드로 등록</h1>
+        <p style={{ textAlign: "center" }}>초대받은 학원을 확인하고 참여하세요.</p>
+        <JoinByCode initialCode={code} autoCheck onJoined={onJoined} />
+        <button type="button" className="fm-link" onClick={onCancel}>초대 코드 없이 계속하기</button>
       </div>
     </div>
   );
 }
 
 const EMPTY_FACILITY = { name: "", facility_type: "학원", branch: "", region: "", address: "", phone: "", description: "",
-  principal: "", base_tuition_fee: "", is_public: true, subjects: [] };
+  principal: "", base_tuition_fee: "", is_public: true, subjects: [], logo: "" };
 
 function FacilityForm({ initial, onClose, onSaved }) {
   const [form, setForm] = useState(() => ({ ...EMPTY_FACILITY, ...(initial || {}),
@@ -218,12 +251,24 @@ function FacilityForm({ initial, onClose, onSaved }) {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
+  const pickLogo = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const logo = await resizeImageFile(file, "logo");
+      setForm((f) => ({ ...f, logo }));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
 
   const submit = async (e) => {
     e.preventDefault();
     setSaving(true);
     setError("");
-    const payload = { ...form, base_tuition_fee: form.base_tuition_fee === "" ? null : Number(form.base_tuition_fee) };
+    const payload = { ...form, base_tuition_fee: form.base_tuition_fee === "" ? null : Number(form.base_tuition_fee),
+      logo: form.logo || "" };
     try {
       const saved = initial?.facility_id ? await updateFacility(initial.facility_id, payload) : await createFacility(payload);
       onSaved(saved);
@@ -240,6 +285,16 @@ function FacilityForm({ initial, onClose, onSaved }) {
         <h3>{initial?.facility_id ? "학원 정보 수정" : "새 학원 만들기"}</h3>
         {error && <Banner>{error}</Banner>}
         <div className="fm-form-grid">
+          <div className="form-row full"><label>학원 프로필 사진</label>
+            <div className="fm-logo-pick">
+              <div className="pv">{form.logo ? <img src={form.logo} alt="학원 사진 미리보기" /> : (form.name || "학").charAt(0)}</div>
+              <label className="btn ghost sm" style={{ cursor: "pointer" }}>
+                사진 선택<input type="file" accept="image/*" onChange={pickLogo} style={{ display: "none" }} />
+              </label>
+              {form.logo && <button type="button" className="btn ghost sm" onClick={() => setForm((f) => ({ ...f, logo: "" }))}>삭제</button>}
+              <small style={{ color: "var(--text-3)", flexBasis: "100%" }}>학원 목록·학부모 검색·초대 화면에 보입니다. 정사각형 사진이 가장 잘 보여요.</small>
+            </div>
+          </div>
           <div className="form-row full"><label>학원 이름 *</label>
             <input className="input" required maxLength={100} value={form.name} onChange={set("name")} placeholder="예: 쑥쑥 수학학원" /></div>
           <div className="form-row"><label>학원 종류</label>
@@ -406,7 +461,8 @@ function MainNotificationBell({ data, refresh, setData, onOpenItem }) {
   );
 }
 
-function FacilityPicker({ me, onEntered, unreadByFacility = {} }) {
+function FacilityPicker({ me, onEntered, unreadByFacility = {}, onJoined }) {
+  const [joinOpen, setJoinOpen] = useState(false);
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);     // {} = 새 학원
@@ -438,9 +494,10 @@ function FacilityPicker({ me, onEntered, unreadByFacility = {} }) {
             <h1>내 학원</h1>
             <p>관리할 학원을 선택하세요.</p>
           </div>
-          {me.can_create_facility && (
-            <button type="button" className="btn" style={{ marginLeft: "auto" }} onClick={() => setEditing({})}>+ 새 학원</button>
-          )}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button type="button" className="btn ghost" onClick={() => setJoinOpen(true)}>🔑 초대 코드</button>
+            {me.can_create_facility && <button type="button" className="btn" onClick={() => setEditing({})}>+ 새 학원</button>}
+          </div>
         </div>
         {error && <Banner>{error}</Banner>}
         {items === null ? <div className="fl-skeleton" style={{ height: 160 }} /> : (
@@ -491,6 +548,17 @@ function FacilityPicker({ me, onEntered, unreadByFacility = {} }) {
         onSaved={() => { setEditing(null); load(); }} />}
       {deleting && <DeleteFacility facility={deleting} onClose={() => setDeleting(null)}
         onDeleted={() => { setDeleting(null); load(); }} />}
+      {joinOpen && (
+        <div className="modal-backdrop" onClick={() => setJoinOpen(false)}>
+          <div className="modal" style={{ width: "min(440px, 100%)" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <h3 style={{ margin: 0 }}>초대 코드로 학원 등록</h3>
+              <button type="button" className="btn ghost sm" onClick={() => setJoinOpen(false)} aria-label="닫기">✕</button>
+            </div>
+            <JoinByCode onJoined={(result) => { setJoinOpen(false); onJoined(result); }} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -504,6 +572,8 @@ export default function FacilityManagerUI() {
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const joinCode = (params.get("join") || "").replace(/\D/g, "").slice(0, 6);
   const showMainBell = screen === "facilities" && !!me?.can_admin && me?.active_role === "admin";
   const [allNotifications, refreshAllNotifications, setAllNotifications] = useAllFacilityNotifications(showMainBell);
 
@@ -512,7 +582,8 @@ export default function FacilityManagerUI() {
     fetchMe()
       .then((current) => {
         setMe(current);
-        if (params.get("role") === "1") setScreen("role");
+        if (joinCode) setScreen("join");
+        else if (params.get("role") === "1") setScreen("role");
         else if (current.active_role === "admin" && current.can_admin) setScreen("facilities");
         else if (current.active_role === "parent") navigate("/parentportal", { replace: true });
         else setScreen("role");
@@ -539,7 +610,13 @@ export default function FacilityManagerUI() {
     }
   };
 
-  const afterLogin = (current) => { setMe(current); setScreen("role"); };
+  // 초대 링크(/join?code=)로 들어왔으면 로그인 후 바로 코드 확인 화면으로
+  const afterLogin = (current) => { setMe(current); setScreen(joinCode ? "join" : "role"); };
+  const handleJoined = (result) => {
+    setMe(result.me);
+    setParams({}, { replace: true });
+    navigate(result.target);
+  };
   const handleCredential = useCallback(
     (credential) => run(async () => afterLogin(await signInWithGoogle(credential)), "Google 계정 인증에 실패했습니다."),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -582,20 +659,24 @@ export default function FacilityManagerUI() {
     <div className="fm-root">
       <style>{STYLES}</style>
       <Header me={me} onLogout={handleLogout} onRole={screen === "facilities" ? () => { setError(""); setScreen("role"); } : null}
+        onAccount={() => setAccountOpen(true)}
         bell={showMainBell ? (
           <MainNotificationBell data={allNotifications} refresh={refreshAllNotifications} setData={setAllNotifications}
             onOpenItem={handleOpenNotification} />
         ) : null} />
       {screen === "login" || !me ? (
-        <LoginScreen config={config} error={error} busy={busy} onCredential={handleCredential} onDevLogin={handleDevLogin} />
+        <LoginScreen config={config} error={error} busy={busy} onCredential={handleCredential} onDevLogin={handleDevLogin} inviteCode={joinCode} />
+      ) : screen === "join" ? (
+        <JoinScreen code={joinCode} onJoined={handleJoined} onCancel={() => { setParams({}, { replace: true }); setScreen("role"); }} />
       ) : screen === "role" ? (
-        <RoleSelect me={me} error={error} busy={busy} onParent={handleParent} onAdmin={handleAdmin} />
+        <RoleSelect me={me} error={error} busy={busy} onParent={handleParent} onAdmin={handleAdmin} onJoined={handleJoined} />
       ) : (
         <>
           {error && <div style={{ width: "min(1080px, calc(100% - 24px))", margin: "16px auto 0" }}><Banner>{error}</Banner></div>}
-          <FacilityPicker me={me} onEntered={handleEntered} unreadByFacility={allNotifications.unread_by_facility} />
+          <FacilityPicker me={me} onEntered={handleEntered} unreadByFacility={allNotifications.unread_by_facility} onJoined={handleJoined} />
         </>
       )}
+      {accountOpen && me && <AccountModal me={me} onClose={() => setAccountOpen(false)} onSaved={setMe} />}
     </div>
   );
 }

@@ -60,6 +60,17 @@ export const fetchMe = async (retries = 2) => {
 /** role: "parent" | "admin" — 관리자 권한은 서버가 판정 */
 export const selectRole = (role, inviteCode = "") => API.post("/api/auth/role", { role, invite_code: inviteCode }).then(data);
 export const signOut = () => API.post("/api/auth/logout").then(data);
+// ----- v13 계정 설정 (이름·프로필 사진) — 학부모·관리자 공통 -----
+/** payload: {display_name?: string, avatar?: string} — "" 이면 Google 프로필로 되돌림. 응답은 fetchMe 와 같은 모양 */
+export const updateProfile = (payload) => API.put("/api/auth/profile", payload).then(data);
+// ----- v13 초대 코드 (6자리 / 링크) -----
+export const previewInvite = (code) => API.post("/api/auth/invite/preview", { code }).then(data);
+/** 응답: {me, target, already_member, facility_name, role} */
+export const redeemInvite = (code) => API.post("/api/auth/invite/redeem", { code }).then(data);
+export const fetchInvites = () => API.get("/api/invites").then(data);
+/** payload: {role: "parent"|"staff", expires_days: 1~30, max_uses?: number} */
+export const createInvite = (payload) => API.post("/api/invites", payload).then(data);
+export const revokeInvite = (inviteId) => API.delete(`/api/invites/${inviteId}`);
 export const fetchAdminAccounts = () => API.get("/api/admin/accounts").then(data);
 export const createAdminAccount = (payload) => API.post("/api/admin/accounts", payload).then(data);
 export const updateAdminAccount = (accountId, payload) => API.patch(`/api/admin/accounts/${accountId}`, payload).then(data);

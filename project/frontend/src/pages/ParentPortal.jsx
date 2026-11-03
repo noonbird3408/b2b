@@ -14,6 +14,8 @@ import Board from "../components/Board.jsx";
 import { FACILITY_TYPES, NOTIFICATION_META, facilityTypeLabel, relativeTime, showBrowserNotification, startVisiblePolling } from "../utils/constants";
 import { DAY_LABELS, STATUS_LABEL, STATUS_TONE, announceDataChanged, won } from "../utils/sync";
 import Checkout from "./Checkout";
+import AccountModal, { UserAvatar } from "../components/AccountSettings.jsx";
+import JoinByCode from "../components/JoinByCode.jsx";
 
 /* =====================================================================
    학부모 포털
@@ -22,6 +24,8 @@ import Checkout from "./Checkout";
    모든 데이터는 /api/parent/* 에서 "이 계정 + 입장한 학원" 기준으로만 내려옵니다.
 ===================================================================== */
 const CSS = `
+.pp-me{border:0;background:transparent;padding:0;border-radius:50%;display:inline-flex;cursor:pointer;}
+.pp-me:focus-visible{outline:2px solid var(--primary);outline-offset:2px;}
 .pp{min-height:100vh;background:var(--bg);display:flex;flex-direction:column;color:var(--text);}
 .pp-head{background:var(--surface);border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:20;}
 .pp-head .right{margin-left:auto;display:flex;gap:6px;align-items:center;}
@@ -132,18 +136,26 @@ export default function ParentPortal() {
     <div className="pp">
       <style>{CSS}</style>
       {me.facility
-        ? <FacilityHome me={me} onExit={async () => { await exitParentFacility().catch(() => null); reloadMe(); }} onLogout={logout} onReload={reloadMe} />
-        : <Hub me={me} onEntered={(current) => setMe(current)} onLogout={logout} />}
+        ? <FacilityHome me={me} onMeChange={setMe} onExit={async () => { await exitParentFacility().catch(() => null); reloadMe(); }} onLogout={logout} onReload={reloadMe} />
+        : <Hub me={me} onMeChange={setMe} onEntered={(current) => setMe(current)} onLogout={logout} />}
     </div>
   );
 }
 
-function HeaderMenu({ onLogout }) {
+function HeaderMenu({ me, onMeChange, onLogout }) {
   const navigate = useNavigate();
+  const [accountOpen, setAccountOpen] = useState(false);
   return (
     <>
+      <button type="button" className="pp-me" onClick={() => setAccountOpen(true)} title="내 계정 (이름·프로필 사진)" aria-label="내 계정">
+        <UserAvatar user={me?.user} size={30} />
+      </button>
       <button className="btn ghost sm hide-sm" onClick={() => navigate("/?role=1")}>역할 변경</button>
       <button className="btn ghost sm" onClick={onLogout}>로그아웃</button>
+      {accountOpen && me && (
+        <AccountModal me={me} onClose={() => setAccountOpen(false)} onSaved={onMeChange}
+          roleHint="커뮤니티 닉네임은 학원마다 '학원 정보' 탭에서 따로 정합니다." />
+      )}
     </>
   );
 }
@@ -151,7 +163,8 @@ function HeaderMenu({ onLogout }) {
 // =====================================================================
 // 허브 — 학원 선택 전
 // =====================================================================
-function Hub({ me, onEntered, onLogout }) {
+function Hub({ me, onEntered, onLogout, onMeChange }) {
+  const navigate = useNavigate();
   const [tab, setTab] = useState("mine");
   const [mine, setMine] = useState(null);
   const [applications, setApplications] = useState([]);
@@ -177,13 +190,18 @@ function Hub({ me, onEntered, onLogout }) {
   };
 
   const pendingCount = applications.filter((a) => a.status === "PENDING").length;
-  const tabs = [["mine", "내 학원"], ["search", "학원 찾기"], ["children", "자녀 정보"], ["apps", `신청 현황${pendingCount ? ` ${pendingCount}` : ""}`]];
+  const tabs = [["mine", "내 학원"], ["search", "학원 찾기"], ["code", "초대 코드"], ["children", "자녀 정보"], ["apps", `신청 현황${pendingCount ? ` ${pendingCount}` : ""}`]];
+  // 초대 코드: 학부모 코드면 그 학원으로 바로 입장, 직원 코드면 관리자 화면으로
+  const joined = (result) => {
+    if (result.role === "parent") onEntered(result.me);
+    else navigate(result.target);
+  };
 
   return (
     <>
       <header className="pp-head">
         <Brand to="/parentportal" sub="학부모" />
-        <div className="right"><HeaderMenu onLogout={onLogout} /></div>
+        <div className="right"><HeaderMenu me={me} onMeChange={onMeChange} onLogout={onLogout} /></div>
       </header>
       <nav className="pp-tabs" style={{ top: 57 }}>
         {tabs.map(([k, v]) => <button key={k} className={`pp-tab${tab === k ? " on" : ""}`} onClick={() => setTab(k)}>{v}</button>)}
@@ -197,7 +215,11 @@ function Hub({ me, onEntered, onLogout }) {
               <div className="muted">이용할 학원을 선택하세요.</div>
             </div>
             {mine === null ? <div className="fl-skeleton" style={{ height: 140 }} /> : mine.length === 0 ? (
-              <div className="empty">아직 입장한 학원이 없습니다. <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setTab("search")}>학원 찾기</button></div>
+              <div className="empty">
+                아직 입장한 학원이 없습니다.
+                <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => setTab("search")}>학원 찾기</button>
+                <button className="btn ghost sm" style={{ marginLeft: 6 }} onClick={() => setTab("code")}>🔑 초대 코드 입력</button>
+              </div>
             ) : (
               <div className="fac-cards">
                 {mine.map((f) => (
@@ -219,6 +241,13 @@ function Hub({ me, onEntered, onLogout }) {
           </>
         )}
         {tab === "search" && <FacilitySearch onOpen={setDetailId} />}
+        {tab === "code" && (
+          <div className="pp-card" style={{ maxWidth: 460, width: "100%", margin: "0 auto" }}>
+            <h3 style={{ margin: "0 0 4px", fontSize: 16 }}>🔑 초대 코드로 학원 입장</h3>
+            <p className="muted" style={{ margin: "0 0 14px" }}>학원에서 받은 숫자 6자리를 입력하세요. 검색에 나오지 않는 학원도 코드로 들어갈 수 있습니다.</p>
+            <JoinByCode onJoined={joined} />
+          </div>
+        )}
         {tab === "children" && <ChildProfiles childrenList={children} onChanged={load} />}
         {tab === "apps" && <ApplicationList applications={applications} onChanged={load} onEnter={enter} />}
       </main>
@@ -497,7 +526,7 @@ function ApplicationList({ applications, onChanged, onEnter }) {
 // =====================================================================
 // 학원 안
 // =====================================================================
-function FacilityHome({ me, onExit, onLogout, onReload }) {
+function FacilityHome({ me, onExit, onLogout, onReload, onMeChange }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const hasPaymentResult = searchParams.has("kakao");
   const initialTab = hasPaymentResult ? "pay" : (searchParams.get("tab") || "kids");
@@ -589,7 +618,7 @@ function FacilityHome({ me, onExit, onLogout, onReload }) {
           <button className="bell" onClick={openPanel} aria-label={`알림 ${unread}건`}>
             🔔{unread > 0 && <span className="dot">{unread > 99 ? "99+" : unread}</span>}
           </button>
-          <HeaderMenu onLogout={onLogout} />
+          <HeaderMenu me={me} onMeChange={onMeChange} onLogout={onLogout} />
         </div>
         {panelOpen && (
           <div className="notif-panel" role="dialog" aria-label="알림">

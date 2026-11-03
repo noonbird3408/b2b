@@ -101,7 +101,8 @@ button { font-family: inherit; cursor: pointer; }
 /* ----- 레이아웃 ----- */
 .app-shell {
   display: grid;
-  grid-template-columns: 232px 1fr;
+  /* minmax(0,1fr): 가로로 긴 내용(쇼핑몰 상품 레일·넓은 표)이 열 너비를 늘려 상단 검색창이 화면 밖으로 밀리지 않도록 */
+  grid-template-columns: 232px minmax(0, 1fr);
   min-height: 100vh;
 }
 
@@ -190,7 +191,7 @@ button { font-family: inherit; cursor: pointer; }
 .sidebar-foot-gear:hover { background: var(--surface-hover); color: var(--text-2); }
 
 /* ----- 메인 영역 ----- */
-.main { width: 100%; display: flex; flex-direction: column; }
+.main { width: 100%; min-width: 0; display: flex; flex-direction: column; }
 
 .topbar {
   background: var(--surface);
@@ -207,7 +208,7 @@ button { font-family: inherit; cursor: pointer; }
 }
 .topbar-search input {
   width: 100%;
-  padding: 8px 36px 8px 34px;
+  padding: 8px 12px 8px 34px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1512,7 +1513,10 @@ textarea.input { height: auto; padding: 10px 12px; }
   .app-shell-responsive .sidebar nav .nav-link { padding: 11px 12px; font-size: 14.5px; cursor: pointer; }
   .app-shell-responsive .sidebar-section-label,
   .app-shell-responsive .sidebar-foot { display: flex; }
-  .app-shell-responsive .sidebar-foot .sidebar-foot-gear { display: none; }   /* 서랍에서는 메뉴 밑 '설정' 하나만 */
+  /* v13: 모바일 서랍에서는 메뉴 목록 밑 '설정' 대신 하단 관리자 이름 옆 톱니(⚙) 하나만 */
+  .app-shell-responsive .sidebar nav .nav-link.nav-settings { display: none; }
+  .app-shell-responsive .sidebar-foot .sidebar-foot-gear { display: flex; width: 38px; height: 38px; font-size: 18px;
+    border: 1px solid var(--border) !important; background: var(--surface-2) !important; color: var(--text-2); }
   .app-shell-responsive .sidebar-backdrop { display: block; position: fixed; inset: 0; z-index: 2090;
     background: rgba(15, 23, 42, .42); animation: fade-in .18s ease; }
   .app-shell-responsive .topbar { position: sticky; top: 0; z-index: 30; }
@@ -1529,3 +1533,9 @@ textarea.input { height: auto; padding: 10px 12px; }
 @media (prefers-reduced-motion: reduce) {
   .app-shell-responsive .sidebar, .app-shell-responsive .sidebar.open { transition: none; }
 }
+
+/* v13: 사용자 프로필 사진 (계정 설정) */
+.user-avatar { display: inline-grid; place-items: center; flex-shrink: 0; border-radius: 50%; overflow: hidden;
+  background: var(--primary-soft); color: var(--primary-text); font-weight: 700; border: 1px solid var(--border); }
+.user-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.page { min-width: 0; }

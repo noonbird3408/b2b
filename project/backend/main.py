@@ -601,6 +601,9 @@ class AppUser(Base):
     google_subject = Column(String(255), nullable=False, unique=True)
     name = Column(String(100), nullable=False, default="")
     picture = Column(String(500))
+    # v13 계정 설정: 앱에서 쓰는 이름·프로필 사진 (Google 로그인 때마다 덮어쓰는 name/picture 와 분리)
+    display_name = Column(String(50))
+    avatar = Column(Text)                                   # 작은 JPEG/PNG data URL (브라우저에서 축소)
     link_failures = Column(Integer, nullable=False, default=0)   # 자녀 연결 실패 횟수(무차별 대입 방지)
     link_locked_until = Column(TIMESTAMP)
     last_login_at = Column(TIMESTAMP)
@@ -719,6 +722,22 @@ class EnrollmentApplication(TenantMixin, Base):
     reject_reason  = Column(String(200))
     created_at     = Column(TIMESTAMP, default=_now, server_default=func.now())
     decided_at     = Column(TIMESTAMP)
+
+
+class FacilityInvite(TenantMixin, Base):
+    """v13: 6자리 초대 코드 / 초대 링크 — 원장이 발급하면 학부모·직원이 코드 입력(또는 링크)만으로 그 학원에 등록됩니다.
+    비공개 학원도 코드로는 들어올 수 있고, 학부모는 커뮤니티 멤버로·직원은 학원 직원으로 바로 등록됩니다.
+    (자녀 연결·수강 등록은 기존 가입 신청/승인 절차를 그대로 거침 — 코드만으로 학생 정보에 접근할 수 없음)"""
+    __tablename__ = "facility_invites"
+    invite_id  = Column(Integer, primary_key=True, autoincrement=True)
+    code       = Column(String(6), nullable=False, index=True)
+    role       = Column(String(10), nullable=False, default="parent")   # parent / staff
+    created_by = Column(Integer)                                          # admin_accounts.account_id
+    max_uses   = Column(Integer)                                          # None = 기간 내 무제한
+    use_count  = Column(Integer, nullable=False, default=0)
+    expires_at = Column(TIMESTAMP, nullable=False, index=True)
+    revoked    = Column(Boolean, nullable=False, default=False)
+    created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
 
 
 class AppMeta(Base):
@@ -1564,6 +1583,8 @@ def _admin_account_for(db: Session, user: AppUser) -> Optional[AdminAccount]:
 _PUBLIC_API_PATHS = {
     "/api/auth/google", "/api/auth/google/config", "/api/auth/dev-login",
     "/api/auth/logout", "/api/auth/me", "/api/auth/role",
+    # v13: 계정 설정·초대 코드는 역할(학부모/관리자) 선택 전에도 쓰므로 미들웨어 대신 핸들러가 로그인 세션을 직접 확인
+    "/api/auth/profile", "/api/auth/invite/preview", "/api/auth/invite/redeem",
     "/api/payments/kakao/status",
     "/api/payments/kakao-success", "/api/payments/kakao-cancel", "/api/payments/kakao-fail",
     "/api/cron/cleanup", "/api/health",
@@ -1889,6 +1910,13 @@ def _facility_brief(f: "Facility", my_role: Optional[str] = None) -> dict:
             "region": f.region or "", "logo": f.logo or "", "my_role": my_role}
 
 
+def _user_out(user: AppUser) -> dict:
+    """화면에 보이는 이름·사진은 계정 설정값 우선, 없으면 Google 프로필"""
+    return {"email": user.email, "name": (user.display_name or user.name or "").strip(),
+            "picture": user.avatar or user.picture, "google_name": user.name or "", "google_picture": user.picture,
+            "display_name": user.display_name or "", "has_custom_avatar": bool(user.avatar)}
+
+
 def _me_out(db: Session, session: UserSession, user: AppUser) -> dict:
     account = _admin_account_for(db, user)
     facility, my_role = None, None
@@ -1907,7 +1935,7 @@ def _me_out(db: Session, session: UserSession, user: AppUser) -> dict:
     if account and my_role and my_role != "parent":
         account.facility_role = my_role
     return {
-        "user": {"email": user.email, "name": user.name, "picture": user.picture},
+        "user": _user_out(user),
         "active_role": session.active_role,
         "admin": _account_to_out(account) if account else None,
         "can_admin": bool(account),
@@ -2057,6 +2085,215 @@ def auth_logout(request: Request, response: Response, db: Session = Depends(get_
             db.commit()
     response.delete_cookie(AUTH_COOKIE_NAME, path="/", httponly=True, secure=AUTH_COOKIE_SECURE, samesite="lax")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------
+# v13 계정 설정 — 앱에서 쓰는 이름(닉네임)·프로필 사진. 학부모·관리자 공통 (역할 선택 전에도 사용)
+#   Google 로그인 때마다 바뀌는 name/picture 와 따로 저장하므로, 바꾼 값이 다음 로그인에 덮어써지지 않습니다.
+# ---------------------------------------------------------------------
+AVATAR_MAX_CHARS = 200_000          # 약 150KB — 프론트가 256px JPEG 로 줄여서 보냄(보통 20~40KB)
+_IMAGE_DATA_URL = re.compile(r"data:image/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+")
+
+
+class ProfileUpdate(BaseModel):
+    display_name: Optional[str] = Field(None, max_length=20)          # None = 그대로, "" = Google 이름으로 되돌림
+    avatar: Optional[str] = Field(None, max_length=AVATAR_MAX_CHARS)  # None = 그대로, "" = Google 사진으로 되돌림
+
+    @field_validator("display_name")
+    @classmethod
+    def _clean_name(cls, v):
+        if v is None:
+            return v
+        v = re.sub(r"\s+", " ", v).strip()
+        if v and (len(v) < 2 or re.search(r"[<>\x00-\x1f]", v)):
+            raise ValueError("이름은 2~20자로 입력하세요. (<, > 등 특수 기호 제외)")
+        return v
+
+    @field_validator("avatar")
+    @classmethod
+    def _valid_avatar(cls, v):
+        if v and not _IMAGE_DATA_URL.fullmatch(v):
+            raise ValueError("프로필 사진은 PNG/JPG/WEBP 이미지만 사용할 수 있습니다.")
+        return v
+
+
+@app.get("/api/auth/profile")
+def get_profile(request: Request, db: Session = Depends(get_db)):
+    _, user = _session_from_request(request, db)
+    return _user_out(user)
+
+
+@app.put("/api/auth/profile")
+def update_profile(payload: ProfileUpdate, request: Request, db: Session = Depends(get_db)):
+    session, user = _session_from_request(request, db)
+    if payload.display_name is not None:
+        user.display_name = payload.display_name or None
+        account = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == user.email.lower()).first()
+        if account:     # 관리자 화면(사이드바·직원 목록)에 보이는 이름도 함께
+            account.username = (payload.display_name or user.name or user.email.split("@")[0])[:100]
+    if payload.avatar is not None:
+        user.avatar = payload.avatar or None
+    db.commit()
+    return _me_out(db, session, user)
+
+
+# ---------------------------------------------------------------------
+# v13 초대 코드 — 원장이 6자리 코드(또는 /join?code= 링크)를 발급 → 학부모·직원이 입력하면 그 학원에 바로 등록
+#   보안: 코드 공간이 100만 개라 무차별 대입을 막기 위해 '확인 실패' 를 계정별로 세어 5회 → 30분 잠금
+#         (자녀 연결·관리자 초대 코드와 같은 카운터). 코드는 만료일·사용 횟수 제한·즉시 폐기가 가능합니다.
+# ---------------------------------------------------------------------
+INVITE_ROLES = {"parent": "학부모", "staff": "직원"}
+MAX_ACTIVE_INVITES = 20
+
+
+class InviteCreate(BaseModel):
+    role: str = Field("parent", pattern="^(parent|staff)$")
+    expires_days: int = Field(7, ge=1, le=30)
+    max_uses: Optional[int] = Field(None, ge=1, le=1000)
+
+
+class InviteCodeIn(BaseModel):
+    code: str = Field(min_length=6, max_length=20)
+
+    @field_validator("code")
+    @classmethod
+    def _digits(cls, v):
+        digits = re.sub(r"\D", "", v)
+        if len(digits) != 6:
+            raise ValueError("초대 코드는 숫자 6자리입니다.")
+        return digits
+
+
+def _invite_active(inv: "FacilityInvite") -> bool:
+    return (not inv.revoked and inv.expires_at > _now()
+            and (inv.max_uses is None or (inv.use_count or 0) < inv.max_uses))
+
+
+def _invite_out(inv: "FacilityInvite") -> dict:
+    return {"invite_id": inv.invite_id, "code": inv.code, "role": inv.role, "role_label": INVITE_ROLES.get(inv.role, inv.role),
+            "max_uses": inv.max_uses, "use_count": inv.use_count or 0, "revoked": bool(inv.revoked),
+            "active": _invite_active(inv), "expires_at": inv.expires_at.isoformat(timespec="minutes"),
+            "created_at": inv.created_at.isoformat(timespec="minutes") if inv.created_at else None}
+
+
+def _find_invite(db: Session, code: str):
+    """사용 가능한 초대 코드 → (초대, 학원). 없으면 (None, None)"""
+    rows = (db.query(FacilityInvite, Facility).join(Facility, Facility.facility_id == FacilityInvite.facility_id)
+              .filter(FacilityInvite.code == code, FacilityInvite.revoked.is_(False),
+                      FacilityInvite.expires_at > _now(), Facility.deleted_at.is_(None))
+              .execution_options(all_facilities=True).all())
+    for inv, facility in rows:
+        if _invite_active(inv):
+            return inv, facility
+    return None, None
+
+
+def _checked_invite(db: Session, user: AppUser, code: str):
+    _ensure_not_locked(user)
+    inv, facility = _find_invite(db, code)
+    if not inv:
+        _record_failed_attempt(db, user)
+        raise HTTPException(404, "초대 코드가 올바르지 않거나 만료되었습니다. 학원에 새 코드를 요청하세요.")
+    return inv, facility
+
+
+@app.get("/api/invites")
+def list_invites(db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    since = _now() - timedelta(days=30)
+    rows = (db.query(FacilityInvite).filter(FacilityInvite.created_at >= since)
+              .order_by(FacilityInvite.created_at.desc(), FacilityInvite.invite_id.desc()).limit(100).all())
+    return [_invite_out(i) for i in rows]
+
+
+@app.post("/api/invites", status_code=201)
+def create_invite(payload: InviteCreate, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    active = [i for i in db.query(FacilityInvite).filter(FacilityInvite.revoked.is_(False),
+                                                         FacilityInvite.expires_at > _now()).all() if _invite_active(i)]
+    if len(active) >= MAX_ACTIVE_INVITES:
+        raise HTTPException(400, f"사용 중인 초대 코드가 {MAX_ACTIVE_INVITES}개입니다. 안 쓰는 코드를 폐기한 뒤 다시 만드세요.")
+    for _ in range(30):     # 모든 학원을 통틀어 '사용 중인' 코드와 겹치지 않게
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        if _find_invite(db, code)[0] is None:
+            break
+    else:
+        raise HTTPException(503, "초대 코드를 만들지 못했습니다. 잠시 후 다시 시도하세요.")
+    invite = FacilityInvite(code=code, role=payload.role, created_by=account.account_id, max_uses=payload.max_uses,
+                            expires_at=_now() + timedelta(days=payload.expires_days))
+    db.add(invite)
+    db.commit()
+    db.refresh(invite)
+    return _invite_out(invite)
+
+
+@app.delete("/api/invites/{invite_id}", status_code=204)
+def revoke_invite(invite_id: int, db: Session = Depends(get_db), account: AdminAccount = Depends(owner_account)):
+    invite = db.query(FacilityInvite).filter(FacilityInvite.invite_id == invite_id).first()
+    if not invite:
+        raise HTTPException(404, "초대 코드를 찾을 수 없습니다.")
+    invite.revoked = True
+    db.commit()
+
+
+@app.post("/api/auth/invite/preview")
+def preview_invite(payload: InviteCodeIn, request: Request, db: Session = Depends(get_db)):
+    """코드 확인 — 어느 학원에 어떤 역할로 등록되는지 먼저 보여 줌 (확인 실패도 시도 횟수에 포함)"""
+    _, user = _session_from_request(request, db)
+    inv, facility = _checked_invite(db, user, payload.code)
+    if inv.role == "parent":
+        already = bool(_membership(db, user, facility.facility_id))
+    else:
+        account = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == user.email.lower()).first()
+        already = bool(account and _my_staff_role(db, account, facility.facility_id))
+    return {"facility": {k: v for k, v in _facility_brief(facility).items() if k != "my_role"},
+            "role": inv.role, "role_label": INVITE_ROLES.get(inv.role, inv.role),
+            "expires_at": inv.expires_at.isoformat(timespec="minutes"), "already_member": already}
+
+
+@app.post("/api/auth/invite/redeem")
+def redeem_invite(payload: InviteCodeIn, request: Request, db: Session = Depends(get_db)):
+    """코드로 학원 등록 → 역할·학원을 바로 선택한 상태의 세션을 돌려줌"""
+    session, user = _session_from_request(request, db)
+    inv, facility = _checked_invite(db, user, payload.code)
+    _clear_failed_attempts(user)
+    facility_id = facility.facility_id
+    db.info["facility_id"] = facility_id          # 새 행(멤버·직원·알림·로그)이 이 학원으로 저장되도록
+    joined = False
+    who = user.display_name or user.name or user.email.split("@")[0]
+    if inv.role == "parent":
+        membership = _membership(db, user, facility_id)
+        if membership and membership.status == "BANNED":
+            raise HTTPException(403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다.")
+        if not membership:
+            db.add(_new_membership(user, facility_id))
+            joined = True
+        session.active_role = "parent"
+        target = "/parentportal"
+    else:
+        account = db.query(AdminAccount).filter(func.lower(AdminAccount.email) == user.email.lower()).first()
+        if account and not account.is_active:
+            raise HTTPException(403, "비활성화된 관리자 계정입니다. 학원에 문의하세요.")
+        if not account:
+            account = AdminAccount(email=user.email, username=who[:100], google_subject=user.google_subject,
+                                   provider="google", role="staff")
+            db.add(account)
+            db.flush()
+        role = _my_staff_role(db, account, facility_id)
+        if not role:
+            db.add(FacilityStaff(facility_id=facility_id, account_id=account.account_id, role="staff"))
+            role, joined = "staff", True
+        session.active_role = "admin"
+        target = "/dashboard" if role == "owner" else "/attendances"
+    session.facility_id = facility_id
+    if joined:
+        inv.use_count = (inv.use_count or 0) + 1
+        _log(db, inv.role if inv.role == "parent" else "admin", user.user_id, "invite.join", None, None,
+             f"초대 코드로 {INVITE_ROLES[inv.role]} 등록")
+        _notify_admins(db, "LINK", f"초대 코드로 {INVITE_ROLES[inv.role]} 등록",
+                       f"{who} 님이 초대 코드({inv.code})로 들어왔습니다.",
+                       "community?tab=members" if inv.role == "parent" else "dashboard")
+    db.commit()
+    return {"me": _me_out(db, session, user), "target": target, "already_member": not joined,
+            "facility_name": facility.name, "role": inv.role}
 
 
 @app.get("/api/admin/accounts")
@@ -2293,6 +2530,14 @@ class FacilityIn(BaseModel):
     principal: str = Field("", max_length=50)
     base_tuition_fee: Optional[int] = Field(None, ge=0, le=100_000_000)
     subjects: Optional[List[str]] = Field(None, max_length=12)     # 주요 과목 (쇼핑몰 추천에 사용). None = 바꾸지 않음
+    logo: Optional[str] = Field(None, max_length=LOGO_MAX_CHARS)  # v13 학원 프로필 사진. None = 그대로, "" = 삭제
+
+    @field_validator("logo")
+    @classmethod
+    def valid_logo(cls, v):
+        if v and not re.fullmatch(r"data:image/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+", v):
+            raise ValueError("학원 사진은 PNG/JPG/WEBP 이미지만 사용할 수 있습니다.")
+        return v
 
     @field_validator("subjects")
     @classmethod
@@ -2426,6 +2671,7 @@ def create_facility(payload: FacilityIn, request: Request, db: Session = Depends
     facility = Facility(name=payload.name.strip(), facility_type=payload.facility_type, branch=payload.branch.strip(),
                         region=payload.region.strip(), address=payload.address.strip(), phone=payload.phone.strip(),
                         description=payload.description.strip(), is_public=payload.is_public, created_by=user.user_id,
+                        logo=payload.logo or None,
                         settings_json=json.dumps({"principal": payload.principal.strip() or (user.name or ""),
                                                   "role": "원장", "weatherCity": "용인", "lateGraceMinutes": 10,
                                                   "subjects": payload.subjects or []},
@@ -2451,6 +2697,8 @@ def update_facility(facility_id: int, payload: FacilityIn, db: Session = Depends
     facility.branch, facility.region = payload.branch.strip(), payload.region.strip()
     facility.address, facility.phone = payload.address.strip(), payload.phone.strip()
     facility.description, facility.is_public = payload.description.strip(), payload.is_public
+    if payload.logo is not None:
+        facility.logo = payload.logo or None
     settings = _json_dict(facility.settings_json)
     if payload.principal.strip():
         settings["principal"] = payload.principal.strip()
@@ -6955,7 +7203,7 @@ def _require_linked(db: Session, user: AppUser, member_id: int) -> None:
 
 
 def _parent_display_name(user: AppUser) -> str:
-    name = (user.name or "").strip()
+    name = (user.display_name or user.name or "").strip()
     return f"{name[0]}** 학부모" if name else "학부모"
 
 
@@ -8868,9 +9116,14 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
                            .filter(Notification.is_read.is_(True), Notification.created_at < _now() - timedelta(days=90))
                            .delete(synchronize_session=False))
     old_logs = db.query(ActivityLog).filter(ActivityLog.created_at < _now() - timedelta(days=365)).delete(synchronize_session=False)
+    # v13: 만료·폐기 후 30일 지난 초대 코드 (목록에서도 30일까지만 보임)
+    old_invites = (db.query(FacilityInvite)
+                     .filter(or_(FacilityInvite.expires_at < _now() - timedelta(days=30),
+                                 and_(FacilityInvite.revoked.is_(True), FacilityInvite.created_at < _now() - timedelta(days=30))))
+                     .delete(synchronize_session=False))
     db.commit()
     return {**result, "expired_sessions_deleted": expired, "old_notifications_deleted": old_notifications,
-            "old_activity_logs_deleted": old_logs}
+            "old_activity_logs_deleted": old_logs, "old_invites_deleted": old_invites}
 
 
 # ---------------------------------------------------------------------
@@ -8880,7 +9133,7 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 #     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
 # ---------------------------------------------------------------------
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 
 def _tenant_tables() -> List[str]:
@@ -8922,6 +9175,9 @@ COLUMN_PATCHES = [
     ("community_comments", "is_anonymous", "BOOLEAN", None),
     ("community_comments", "like_count", "INTEGER", None),
     ("community_comments", "deleted_at", "TIMESTAMP", None),
+    # v13: 계정 설정 (앱 표시 이름·프로필 사진)
+    ("app_users", "display_name", "VARCHAR(50)", None),
+    ("app_users", "avatar", "TEXT", None),
 ]
 # 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼 — 여러 개면 "a, b")
 #   v10 성능 점검에서 추가: 자주 쓰는 조회 조건(폴링·목록·집계)에 맞춘 인덱스. 모두 CREATE INDEX IF NOT EXISTS (비파괴)
