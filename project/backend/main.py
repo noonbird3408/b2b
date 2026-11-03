@@ -722,7 +722,10 @@ class EnrollmentApplication(TenantMixin, Base):
     estimated_fee  = Column(Integer, nullable=False, default=0)
     message        = Column(String(500), nullable=False, default="")
     status         = Column(String(10), nullable=False, default="PENDING", index=True)  # PENDING/APPROVED/REJECTED/CANCELED
-    member_id      = Column(Integer)                       # 승인 후 만들어진 학생
+    member_id      = Column(Integer)                       # 승인 후 만들어진(또는 연결된) 학생
+    # v15 중복 방지: 같은 이름 + 같은 학부모 연락처의 기존 학생이 있으면 그 학생 번호와 학부모의 답(YES/NO)
+    match_member_id = Column(Integer)
+    match_answer    = Column(String(10))                    # YES = "우리 아이 맞아요" / NO = "다른 아이예요" / None = 후보 없음·미응답
     reject_reason  = Column(String(200))
     created_at     = Column(TIMESTAMP, default=_now, server_default=func.now())
     decided_at     = Column(TIMESTAMP)
@@ -1006,6 +1009,8 @@ class MemberCreate(BaseModel):
     mother_phone: Optional[str] = Field(None, max_length=20)
     address: Optional[str] = Field(None, max_length=200)
     photo_url: Optional[str] = None   # 새 사진: data:image/...;base64,... / 기존 사진 유지: 받은 URL 그대로
+    class_ids: List[int] = Field(default_factory=list, max_length=20)   # v15: 등록하면서 바로 수강할 수업
+    allow_duplicate: bool = False     # v15: 같은 이름·연락처 학생이 있어도 등록 (동명이인 등, 관리자가 확인한 경우)
 
     @field_validator("gender")
     @classmethod
@@ -3260,6 +3265,41 @@ class ApplicationIn(BaseModel):
     child_id: int
     class_ids: List[int] = Field(default_factory=list, max_length=20)
     message: str = Field("", max_length=500)
+    match_member_id: Optional[int] = None                       # v15: "이 학생이 맞습니까?" 에서 고른 학생
+    match_answer: Optional[str] = Field(None, pattern="^(YES|NO)$")
+
+
+class ApplicationCheckIn(BaseModel):
+    child_id: int
+
+
+def _apply_context(db: Session, user: AppUser, facility_id: int, child_id: int):
+    """신청·확인 공통: 학원 접근 가능 여부 + 내 자녀 프로필 + 이 학원으로 조회 제한"""
+    facility = _public_facility(db, facility_id)
+    membership = _membership(db, user, facility_id)
+    if membership and membership.status == "BANNED":
+        raise HTTPException(403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다.")
+    if not membership and not facility.is_public:
+        raise HTTPException(404, "학원을 찾을 수 없습니다.")
+    child = _own_child(db, user, child_id)
+    db.info["facility_id"] = facility_id
+    return facility, membership, child
+
+
+def _child_matches(db: Session, user: AppUser, child: ChildProfile) -> tuple:
+    """(이미 내 계정에 연결된 같은 학생이 있는지, 확실한 후보 목록) — 학부모에게는 '확실'만 보여 줌"""
+    matches = [x for x in _member_matches(db, child.name, child.parent_phone, child.age) if x["strong"]]
+    linked = _linked_member_ids(db, user)
+    return any(x["member"].member_id in linked for x in matches), [x for x in matches if x["member"].member_id not in linked]
+
+
+@app.post("/api/parent/facilities/{facility_id}/applications/check")
+def parent_check_application(facility_id: int, payload: ApplicationCheckIn, db: Session = Depends(get_db),
+                             user: AppUser = Depends(current_parent)):
+    """신청 전에 '학원에 이미 등록된 우리 아이' 가 있는지 확인 (이름 + 학부모 연락처가 모두 같을 때만)"""
+    _, _, child = _apply_context(db, user, facility_id, payload.child_id)
+    already_linked, matches = _child_matches(db, user, child)
+    return {"already_linked": already_linked, "matches": _match_out(db, matches, admin=False)}
 
 
 def _application_out(a: EnrollmentApplication, class_names: dict, facility_name: Optional[str] = None,
@@ -3277,6 +3317,7 @@ def _application_out(a: EnrollmentApplication, class_names: dict, facility_name:
             "classes": [{"class_id": cid, "name": class_names.get(cid, "(삭제된 수업)")} for cid in class_ids],
             "estimated_fee": a.estimated_fee, "message": a.message, "status": a.status,
             "member_id": a.member_id, "reject_reason": a.reject_reason,
+            "match_member_id": a.match_member_id, "match_answer": a.match_answer,
             "created_at": a.created_at.isoformat() if a.created_at else None,
             "decided_at": a.decided_at.isoformat() if a.decided_at else None}
 
@@ -3285,19 +3326,24 @@ def _application_out(a: EnrollmentApplication, class_names: dict, facility_name:
 def parent_apply(facility_id: int, payload: ApplicationIn, db: Session = Depends(get_db),
                  user: AppUser = Depends(current_parent)):
     """자녀 가입 신청: 고른 수업의 수강료를 서버가 계산(예상 비용)하고, 학원 원장에게 알림"""
-    facility = _public_facility(db, facility_id)
-    membership = _membership(db, user, facility_id)
-    if membership and membership.status == "BANNED":
-        raise HTTPException(403, "학원 관리자에 의해 이 학원 이용이 제한되었습니다.")
-    if not membership and not facility.is_public:
-        raise HTTPException(404, "학원을 찾을 수 없습니다.")
-    child = _own_child(db, user, payload.child_id)
-    db.info["facility_id"] = facility_id          # 이후 조회·저장은 이 학원으로 자동 제한
+    facility, membership, child = _apply_context(db, user, facility_id, payload.child_id)
     duplicate = (db.query(EnrollmentApplication)
                    .filter(EnrollmentApplication.child_id == child.child_id,
                            EnrollmentApplication.status.in_(("PENDING", "APPROVED"))).first())
     if duplicate:
         raise HTTPException(409, "이 자녀는 이미 이 학원에 신청했거나 등록되어 있습니다.")
+    # v15 중복 방지: 관리자가 먼저 등록한 같은 학생이 있는지
+    already_linked, matches = _child_matches(db, user, child)
+    if already_linked:
+        raise HTTPException(409, "이 자녀는 이미 이 학원 학생으로 연결되어 있습니다. '우리 아이' 탭에서 확인하세요.")
+    match_ids = [x["member"].member_id for x in matches]
+    match_id, answer = None, None
+    if payload.match_answer == "YES":
+        if payload.match_member_id not in match_ids:
+            raise HTTPException(400, "선택한 학생을 확인할 수 없습니다. 다시 신청해 주세요.")
+        match_id, answer = payload.match_member_id, "YES"
+    elif match_ids:
+        match_id, answer = match_ids[0], payload.match_answer       # NO 또는 미응답 → 관리자가 승인할 때 확인
     class_ids = list(dict.fromkeys(payload.class_ids))
     classes = {c.class_id: c for c in _open_classes(db, facility_id)}
     unknown = [cid for cid in class_ids if cid not in classes]
@@ -3308,12 +3354,16 @@ def parent_apply(facility_id: int, payload: ApplicationIn, db: Session = Depends
     if not membership:
         db.add(_new_membership(user, facility_id))
     row = EnrollmentApplication(user_id=user.user_id, child_id=child.child_id, snapshot=json.dumps(_child_out(child), ensure_ascii=False),
-                                class_ids=json.dumps(class_ids), estimated_fee=estimated, message=payload.message.strip())
+                                class_ids=json.dumps(class_ids), estimated_fee=estimated, message=payload.message.strip(),
+                                match_member_id=match_id, match_answer=answer)
     db.add(row)
     db.flush()
     names = ", ".join(classes[cid].name for cid in class_ids) or "수업 미선택"
-    _notify_admins(db, "APPLICATION", f"새 가입 신청: {child.name} ({child.age}세)",
-                   f"{names} · 예상 {estimated:,}원", "members?tab=applications")
+    _notify_admins(db, "APPLICATION",
+                   f"기존 학생 연결 요청: {child.name} ({child.age}세)" if answer == "YES" else f"새 가입 신청: {child.name} ({child.age}세)",
+                   f"{names} · 예상 {estimated:,}원" + (" · 학부모가 이미 등록된 학생으로 확인" if answer == "YES"
+                                                     else " · 같은 이름·연락처 학생 있음, 확인 필요" if match_id else ""),
+                   "members?tab=applications")
     _log(db, "parent", user.user_id, "application.create", "application", row.application_id, f"가입 신청 ({names})")
     db.commit()
     db.refresh(row)
@@ -4198,13 +4248,88 @@ def get_member_photo(member_id: int, db: Session = Depends(get_db)):
     return _image_response(mime, re.sub(r"\s", "", match.group(2)))
 
 
+# ---------------------------------------------------------------------
+# v15 같은 학생 찾기 — 관리자가 먼저 등록한 학생 ↔ 학부모 가입 신청이 두 명으로 갈라지지 않도록
+#   '확실' = 이름(띄어쓰기 무시)이 같고 학부모 연락처(숫자만)가 부·모 연락처 중 하나와 같음
+#   '가능' = 이름만 같고 나이가 ±1 이내 (관리자 화면에서만 참고로 보여 줌 — 학부모에게는 보이지 않음)
+# ---------------------------------------------------------------------
+def _digits(value: Optional[str]) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _member_matches(db: Session, name: str, phone: str = "", age: Optional[int] = None,
+                    exclude_ids: Optional[set] = None) -> List[dict]:
+    key = re.sub(r"\s+", "", name or "")
+    if not key:
+        return []
+    rows = db.query(Member).filter(func.replace(Member.name, " ", "") == key).limit(20).all()
+    phone = _digits(phone)
+    out = []
+    for m in rows:
+        if exclude_ids and m.member_id in exclude_ids:
+            continue
+        phone_match = bool(phone) and phone in {_digits(m.mother_phone), _digits(m.father_phone)}
+        if not phone_match and (age is None or abs((m.age or 0) - int(age or 0)) > 1):
+            continue
+        out.append({"member": m, "strong": phone_match})
+    out.sort(key=lambda x: (not x["strong"], x["member"].status != "ACTIVE", -x["member"].member_id))
+    return out
+
+
+def _match_out(db: Session, matches: List[dict], admin: bool) -> List[dict]:
+    """후보 학생 요약. 학부모에게는 이름 일부를 가리고 최소 정보만"""
+    if not matches:
+        return []
+    ids = [x["member"].member_id for x in matches]
+    classes = _member_class_overview(db, ids)
+    linked = {mid for (mid,) in db.query(ParentLink.member_id).filter(ParentLink.member_id.in_(ids)).all()}
+    out = []
+    for x in matches:
+        m = x["member"]
+        name = m.name if admin else (m.name[0] + "*" * max(1, len(m.name) - 2) + (m.name[-1] if len(m.name) > 2 else "")
+                                     if len(m.name) > 1 else m.name)
+        row = {"member_id": m.member_id, "name": name, "gender": m.gender, "age": m.age, "strong": x["strong"],
+               "status": m.status, "classes": [c["name"] for c in classes.get(m.member_id, [])],
+               "enrolled_since": m.enrollment_date.isoformat()[:7] if m.enrollment_date else None}
+        if admin:
+            row.update({"mother_phone": m.mother_phone, "father_phone": m.father_phone,
+                        "parent_linked": m.member_id in linked})
+        out.append(row)
+    return out
+
+
+def _enroll_classes(db: Session, member_id: int, class_ids: List[int]) -> List[int]:
+    """수강 등록 (이미 듣는 수업은 건너뜀) → 새로 등록한 수업 ID"""
+    class_ids = list(dict.fromkeys(class_ids))
+    if not class_ids:
+        return []
+    valid = {cid for (cid,) in db.query(Class.class_id).filter(Class.class_id.in_(class_ids)).all()}
+    if len(valid) != len(class_ids):
+        raise HTTPException(400, "존재하지 않는 수업이 포함되어 있습니다. 화면을 새로고침하세요.")
+    existing = {cid for (cid,) in db.query(Enrollment.class_id).filter(Enrollment.member_id == member_id).all()}
+    added = [cid for cid in class_ids if cid not in existing]
+    for cid in added:
+        db.add(Enrollment(member_id=member_id, class_id=cid))
+    return added
+
+
 @app.post("/api/members", response_model=MemberOut, status_code=201)
 def create_member(payload: MemberCreate, db: Session = Depends(get_db)):
-    data = payload.model_dump()
+    data = payload.model_dump(exclude={"class_ids", "allow_duplicate"})
+    if not payload.allow_duplicate:
+        same = [x for x in _member_matches(db, payload.name, payload.mother_phone or payload.father_phone or "")
+                if x["strong"]] or [x for x in _member_matches(db, payload.name, payload.father_phone or "") if x["strong"]]
+        if same:
+            m = same[0]["member"]
+            raise HTTPException(409, f"같은 이름·보호자 연락처의 학생이 이미 있습니다: {m.name} ({m.age}세, "
+                                     f"{'재원' if m.status == 'ACTIVE' else '퇴원'}). 동명이인이면 그래도 등록할 수 있습니다.")
     data["photo_url"] = _resolve_member_photo(data.get("photo_url"), None)
     m = Member(**data)
-    db.add(m); db.commit(); db.refresh(m)
-    return _member_out(m, bool(m.photo_url))
+    db.add(m)
+    db.flush()
+    _enroll_classes(db, m.member_id, payload.class_ids)
+    db.commit(); db.refresh(m)
+    return _member_out(m, bool(m.photo_url), (0, 0), _member_class_overview(db, [m.member_id]).get(m.member_id, []), False)
 
 
 @app.delete("/api/members/{member_id}", status_code=204)
@@ -4252,6 +4377,8 @@ class ApplicationDecision(BaseModel):
     enrollment_date: Optional[date] = None
     create_invoice: bool = False                                 # 승인과 함께 첫 달 청구서 발행
     reason: str = Field("", max_length=200)                      # 반려 사유
+    link_member_id: Optional[int] = None                         # v15: 새로 만들지 않고 이 기존 학생에 연결
+    create_new: bool = False                                     # v15: 같은 학생 후보가 있어도 새 학생으로 등록
 
 
 def _class_name_map(db: Session) -> dict:
@@ -4265,7 +4392,19 @@ def list_applications(status: Optional[str] = Query(None, max_length=10), db: Se
         query = query.filter(EnrollmentApplication.status == status)
     rows = query.order_by(EnrollmentApplication.status != "PENDING", EnrollmentApplication.created_at.desc()).limit(200).all()
     names = _class_name_map(db)
-    return [_application_out(a, names, admin=True) for a in rows]
+    out = []
+    for a in rows:
+        item = _application_out(a, names, admin=True)
+        if a.status == "PENDING":           # v15: 이미 등록된 같은 학생 후보 (확실 + 이름·나이 비슷)
+            snap = _json_dict(a.snapshot)
+            matches = _member_matches(db, snap.get("name") or "", snap.get("parent_phone") or "", snap.get("age"))
+            if a.match_member_id and a.match_member_id not in {x["member"].member_id for x in matches}:
+                extra = db.query(Member).filter(Member.member_id == a.match_member_id).first()
+                if extra:
+                    matches.insert(0, {"member": extra, "strong": True})
+            item["possible_matches"] = _match_out(db, matches, admin=True)
+        out.append(item)
+    return out
 
 
 def _pending_application(db: Session, application_id: int) -> EnrollmentApplication:
@@ -4292,15 +4431,40 @@ def approve_application(application_id: int, payload: ApplicationDecision, reque
         raise HTTPException(400, "존재하지 않는 수업이 포함되어 있습니다.")
     relation = snap.get("relation") or "모"
     phone, pname = snap.get("parent_phone") or "", snap.get("parent_name") or ""
-    member = Member(name=(snap.get("name") or "")[:50], gender=snap.get("gender") if snap.get("gender") in ("M", "F") else "M",
-                    age=int(snap.get("age") or 0), enrollment_date=payload.enrollment_date or _today(), status="ACTIVE",
-                    mother_name=pname if relation != "부" else None, mother_phone=phone if relation != "부" else None,
-                    father_name=pname if relation == "부" else None, father_phone=phone if relation == "부" else None,
-                    address=(snap.get("address") or "")[:200] or None)
-    db.add(member)
-    db.flush()
-    for cid in class_ids:
-        db.add(Enrollment(member_id=member.member_id, class_id=cid))
+    # v15: 기존 학생과 연결할지 결정 — 관리자 선택 > 학부모가 '맞아요' 한 학생 > (확실한 후보가 있는데 선택이 없으면 막음)
+    target_id = payload.link_member_id
+    if target_id is None and not payload.create_new:
+        if row.match_answer == "YES" and row.match_member_id:
+            target_id = row.match_member_id
+        elif any(x["strong"] for x in _member_matches(db, snap.get("name") or "", phone)):
+            raise HTTPException(409, "같은 이름·보호자 연락처의 학생이 이미 등록되어 있습니다. '기존 학생과 연결' 또는 '새 학생으로 등록' 중 하나를 고르세요.")
+    linked_existing = target_id is not None
+    if linked_existing:
+        member = db.query(Member).filter(Member.member_id == target_id).first()
+        if not member:
+            raise HTTPException(400, "연결할 학생을 찾을 수 없습니다.")
+        if member.status == "WITHDRAWN":             # 퇴원했던 학생이 다시 등록 → 재원으로
+            member.status, member.withdrawal_date = "ACTIVE", None
+            member.enrollment_date = payload.enrollment_date or _today()
+        # 비어 있는 보호자 정보만 신청서로 채움 (관리자가 입력한 값은 덮어쓰지 않음)
+        if relation == "부":
+            member.father_name = member.father_name or pname or None
+            member.father_phone = member.father_phone or phone or None
+        else:
+            member.mother_name = member.mother_name or pname or None
+            member.mother_phone = member.mother_phone or phone or None
+        member.address = member.address or (snap.get("address") or "")[:200] or None
+        _enroll_classes(db, member.member_id, class_ids)
+    else:
+        member = Member(name=(snap.get("name") or "")[:50], gender=snap.get("gender") if snap.get("gender") in ("M", "F") else "M",
+                        age=int(snap.get("age") or 0), enrollment_date=payload.enrollment_date or _today(), status="ACTIVE",
+                        mother_name=pname if relation != "부" else None, mother_phone=phone if relation != "부" else None,
+                        father_name=pname if relation == "부" else None, father_phone=phone if relation == "부" else None,
+                        address=(snap.get("address") or "")[:200] or None)
+        db.add(member)
+        db.flush()
+        for cid in class_ids:
+            db.add(Enrollment(member_id=member.member_id, class_id=cid))
     if not db.query(ParentLink).filter(ParentLink.user_id == row.user_id, ParentLink.member_id == member.member_id).first():
         db.add(ParentLink(user_id=row.user_id, member_id=member.member_id))
     if not db.query(FacilityMember).filter(FacilityMember.user_id == row.user_id).first():
@@ -4318,11 +4482,14 @@ def approve_application(application_id: int, payload: ApplicationDecision, reque
     row.status, row.member_id, row.decided_at = "APPROVED", member.member_id, _now()
     names = ", ".join(classes[c].name for c in class_ids) or "수업 미배정"
     db.add(Notification(user_id=row.user_id, audience="parent", kind="APPLICATION", member_id=member.member_id,
-                        title=f"{member.name} 학생 가입이 승인되었습니다", link="children",
+                        title=(f"{member.name} 학생이 우리 아이로 연결되었습니다" if linked_existing
+                               else f"{member.name} 학생 가입이 승인되었습니다"), link="children",
                         body=f"수강 수업: {names}" + (f" · 첫 달 청구서 {fee:,}원이 발행되었습니다." if payload.create_invoice and fee > 0 else "")))
-    _log(db, "admin", account.account_id, "application.approve", "member", member.member_id, f"가입 승인 ({names})")
+    _log(db, "admin", account.account_id, "application.approve", "member", member.member_id,
+         f"가입 승인 — {'기존 학생에 연결' if linked_existing else '새 학생 등록'} ({names})")
     db.commit()
-    return {"application_id": application_id, "status": "APPROVED", "member_id": member.member_id, "fee": fee}
+    return {"application_id": application_id, "status": "APPROVED", "member_id": member.member_id, "fee": fee,
+            "linked_existing": linked_existing}
 
 
 @app.post("/api/applications/{application_id}/reject")
@@ -9395,7 +9562,7 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 #     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
 # ---------------------------------------------------------------------
-SCHEMA_VERSION = "14"
+SCHEMA_VERSION = "15"
 
 
 def _tenant_tables() -> List[str]:
@@ -9440,6 +9607,9 @@ COLUMN_PATCHES = [
     # v13: 계정 설정 (앱 표시 이름·프로필 사진)
     ("app_users", "display_name", "VARCHAR(50)", None),
     ("app_users", "avatar", "TEXT", None),
+    # v15: 가입 신청 ↔ 관리자가 먼저 등록한 학생 중복 방지
+    ("enrollment_applications", "match_member_id", "INTEGER", None),
+    ("enrollment_applications", "match_answer", "VARCHAR(10)", None),
 ]
 # 기존 테이블에 추가할 인덱스 (이름, 테이블, 컬럼 — 여러 개면 "a, b")
 #   v10 성능 점검에서 추가: 자주 쓰는 조회 조건(폴링·목록·집계)에 맞춘 인덱스. 모두 CREATE INDEX IF NOT EXISTS (비파괴)

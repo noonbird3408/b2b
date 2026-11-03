@@ -271,6 +271,9 @@ export const updateChildProfile = (id, payload) => API.put(`/api/parent/child-pr
 export const deleteChildProfile = (id) => API.delete(`/api/parent/child-profiles/${id}`);
 /** 가입 신청 — 예상 비용은 서버가 수업 수강료로 계산 */
 export const applyToFacility = (facilityId, payload) => API.post(`/api/parent/facilities/${facilityId}/applications`, payload).then(data);
+/** v15 신청 전 확인 — 학원에 이미 등록된 같은 학생(이름 + 학부모 연락처 일치)이 있는지. {already_linked, matches:[...]} */
+export const checkApplicationMatch = (facilityId, childId) =>
+  API.post(`/api/parent/facilities/${facilityId}/applications/check`, { child_id: childId }).then(data);
 export const fetchParentApplications = () => API.get("/api/parent/applications").then(data);
 export const cancelParentApplication = (id) => API.post(`/api/parent/applications/${id}/cancel`).then(data);
 

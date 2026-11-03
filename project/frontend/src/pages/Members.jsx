@@ -11,6 +11,33 @@ import MemberDetailDashboard from "./MemberDetailDashboard";
 const errorMessage = (error, fallback) => errorText(error, fallback);
 const today = () => localToday();
 
+/** v15 학생 추가 — 같은 이름·보호자 연락처 학생이 이미 있으면(서버 409) 한 번 확인 후 그래도 등록 */
+async function createMemberChecked(payload) {
+  try {
+    return await createMember(payload);
+  } catch (e) {
+    if (e?.response?.status === 409 && window.confirm(`${errorText(e)}\n\n그래도 새 학생으로 등록할까요? (같은 아이라면 '취소' 후 기존 학생을 수정하세요)`)) {
+      return createMember({ ...payload, allow_duplicate: true });
+    }
+    throw e;
+  }
+}
+
+/** v15 수강 수업 고르기 (학생 추가·가입 승인 공통) */
+function ClassChips({ classes, value, onToggle, showFee = false }) {
+  if (!classes?.length) return <span className="muted">등록된 수업이 없습니다. '수업 관리'에서 먼저 수업을 만드세요.</span>;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {classes.map((c) => (
+        <button key={c.class_id} type="button" className={`chip${value.has(c.class_id) ? " active" : ""}`} aria-pressed={value.has(c.class_id)}
+          onClick={() => onToggle(c.class_id)}>
+          <span className="dot" style={{ background: value.has(c.class_id) ? "#fff" : c.color }} />{c.name}{showFee ? ` · ${won(c.fee)}` : ""}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 const STYLES = `
 .mem-table{min-width:620px;}
 .mem-table td{vertical-align:middle;}
@@ -28,6 +55,9 @@ const STYLES = `
 .app-card .head h4{margin:0;font-size:16px;}
 .app-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;}
 .app-kv{display:grid;grid-template-columns:72px 1fr;gap:4px 10px;font-size:13px;}
+.match-opt{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);border-radius:10px;cursor:pointer;font-size:13px;background:var(--surface);}
+.match-opt.on{border-color:var(--primary);background:var(--primary-soft);}
+.match-opt input{margin-top:3px;accent-color:var(--primary);}
 .app-kv span:nth-child(odd){color:var(--text-3);}
 .member-row-menu{position:absolute;right:0;z-index:10;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);padding:4px;min-width:90px;display:flex;flex-direction:column;}
 .member-row-menu button{background:none;border:0;padding:7px 12px;text-align:left;font-size:13px;border-radius:6px;color:var(--text);}
@@ -348,10 +378,10 @@ export default function Members() {
       )}
 
       {showModal && (
-        <MemberModal member={editingMember} onClose={() => { setShowModal(false); setEditingMember(null); }}
+        <MemberModal member={editingMember} classes={classes} onClose={() => { setShowModal(false); setEditingMember(null); }}
           onSaved={() => { setShowModal(false); setEditingMember(null); load(); }} />
       )}
-      {showOcrModal && <OcrMemberModal onClose={() => setShowOcrModal(false)} onSaved={() => { setShowOcrModal(false); load(); }} />}
+      {showOcrModal && <OcrMemberModal classes={classes} onClose={() => setShowOcrModal(false)} onSaved={() => { setShowOcrModal(false); load(); }} />}
       {bulkModal === "invoice" && (
         <BulkInvoiceModal members={selectedMembers} onClose={() => setBulkModal(null)}
           onDone={() => { setBulkModal(null); setSelectedIds(new Set()); load(); }} />
@@ -410,6 +440,16 @@ function ApplicationsPanel({ applications, classes, onChanged }) {
                   <span className="muted">{a.child.gender === "M" ? "남" : "여"} · {a.child.age}세{a.child.school ? ` · ${a.child.school}` : ""}</span>
                   <span className={`badge ${tone} no-dot`} style={{ marginLeft: "auto" }}>{label}</span>
                 </div>
+                {a.status === "PENDING" && a.match_answer === "YES" && (
+                  <div className="fl-banner info" style={{ margin: 0, fontSize: 12.5 }}>
+                    🔗 학부모가 <b>이미 등록된 학생</b>({(a.possible_matches || []).find((m) => m.member_id === a.match_member_id)?.name || a.child.name})으로 확인했어요. 승인하면 새로 만들지 않고 연결합니다.
+                  </div>
+                )}
+                {a.status === "PENDING" && a.match_answer !== "YES" && (a.possible_matches || []).length > 0 && (
+                  <div className="fl-banner warning" style={{ margin: 0, fontSize: 12.5 }}>
+                    ⚠️ 같은 이름의 학생이 이미 {a.possible_matches.length}명 있어요{a.match_answer === "NO" ? " (학부모는 '다른 아이'라고 답함)" : ""}. 승인할 때 확인하세요.
+                  </div>
+                )}
                 <div className="app-kv">
                   <span>보호자</span><span>{a.child.parent_name || "-"} ({a.child.relation}) {a.child.parent_phone}</span>
                   <span>신청 수업</span>
@@ -426,7 +466,7 @@ function ApplicationsPanel({ applications, classes, onChanged }) {
                 {a.status === "PENDING" && (
                   <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                     <button className="btn danger sm" onClick={() => reject(a)}>반려</button>
-                    <button className="btn sm" onClick={() => setApproving(a)}>승인하고 등록</button>
+                    <button className="btn sm" onClick={() => setApproving(a)}>{a.match_answer === "YES" ? "승인하고 연결" : "승인하고 등록"}</button>
                   </div>
                 )}
               </div>
@@ -443,6 +483,14 @@ function ApplicationsPanel({ applications, classes, onChanged }) {
 }
 
 function ApproveModal({ application, classes, onClose, onDone }) {
+  const matches = application.possible_matches || [];
+  // v15 기본 선택: 학부모가 '맞아요' 한 학생 → 그 학생 / 연락처까지 같은 학생이 있고 '다른 아이' 답이 아니면 → 그 학생 / 그 외 → 새로 등록
+  const [target, setTarget] = useState(() => {
+    if (application.match_answer === "YES" && application.match_member_id) return String(application.match_member_id);
+    const strong = matches.find((m) => m.strong);
+    return strong && application.match_answer !== "NO" ? String(strong.member_id) : "new";
+  });
+  const linking = target !== "new";
   const [classIds, setClassIds] = useState(() => new Set(application.class_ids));
   const [enrollmentDate, setEnrollmentDate] = useState(today());
   const [createInvoice, setCreateInvoice] = useState(true);
@@ -454,7 +502,10 @@ function ApproveModal({ application, classes, onClose, onDone }) {
   const submit = async () => {
     setBusy(true); setErr("");
     try {
-      await approveApplication(application.application_id, { class_ids: [...classIds], enrollment_date: enrollmentDate, create_invoice: createInvoice });
+      await approveApplication(application.application_id, {
+        class_ids: [...classIds], enrollment_date: enrollmentDate, create_invoice: createInvoice,
+        ...(linking ? { link_member_id: Number(target) } : { create_new: true }),
+      });
       onDone();
     } catch (e) {
       setErr(errorText(e, "승인하지 못했습니다."));
@@ -466,18 +517,41 @@ function ApproveModal({ application, classes, onClose, onDone }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>{application.child.name} 학생 등록</h3>
+        <h3>{application.child.name} 학생 {linking ? "연결" : "등록"}</h3>
         {err && <div className="fl-banner danger">{err}</div>}
-        <div className="form-row">
-          <label>수강 수업</label>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-            {classes.map((c) => (
-              <button key={c.class_id} type="button" className={`chip${classIds.has(c.class_id) ? " active" : ""}`} onClick={() => toggle(c.class_id)}>
-                <span className="dot" style={{ background: classIds.has(c.class_id) ? "#fff" : c.color }} />{c.name} · {won(c.fee)}
-              </button>
-            ))}
-            {!classes.length && <span className="muted">등록된 수업이 없습니다.</span>}
+        {matches.length > 0 && (
+          <div className="form-row">
+            <label>이미 등록된 같은 학생이 있나요?</label>
+            <div style={{ display: "grid", gap: 6 }}>
+              {matches.map((m) => (
+                <label key={m.member_id} className={`match-opt${target === String(m.member_id) ? " on" : ""}`}>
+                  <input type="radio" name="approve-target" checked={target === String(m.member_id)} onChange={() => setTarget(String(m.member_id))} />
+                  <span style={{ minWidth: 0 }}>
+                    <b>기존 학생과 연결 — {m.name}</b> ({m.gender === "F" ? "여" : "남"} · {m.age}세{m.status === "WITHDRAWN" ? " · 퇴원 → 재원으로" : ""})
+                    <span className="muted" style={{ display: "block" }}>
+                      {[m.mother_phone && `모 ${m.mother_phone}`, m.father_phone && `부 ${m.father_phone}`].filter(Boolean).join(" · ") || "보호자 연락처 없음"}
+                      {m.classes.length ? ` · 수강 ${m.classes.join(", ")}` : ""}{m.enrolled_since ? ` · ${m.enrolled_since} 등록` : ""}
+                    </span>
+                    <span style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 3 }}>
+                      {m.strong && <span className="badge success no-dot">이름·연락처 일치</span>}
+                      {!m.strong && <span className="badge gray no-dot">이름·나이만 비슷</span>}
+                      {application.match_member_id === m.member_id && application.match_answer === "YES" && <span className="badge primary no-dot">학부모가 '우리 아이' 확인</span>}
+                      {m.parent_linked && <span className="badge gray no-dot">다른 보호자 연결됨</span>}
+                    </span>
+                  </span>
+                </label>
+              ))}
+              <label className={`match-opt${target === "new" ? " on" : ""}`}>
+                <input type="radio" name="approve-target" checked={target === "new"} onChange={() => setTarget("new")} />
+                <span><b>새 학생으로 등록</b><span className="muted" style={{ display: "block" }}>동명이인 등 다른 아이인 경우</span></span>
+              </label>
+            </div>
+            {linking && <div className="muted" style={{ marginTop: 6 }}>기존 학생의 출결·결제 기록은 그대로 두고, 이 학부모 계정을 연결하고 아래 수업을 추가합니다.</div>}
           </div>
+        )}
+        <div className="form-row">
+          <label>{linking ? "추가로 수강할 수업" : "수강 수업"}</label>
+          <ClassChips classes={classes} value={classIds} onToggle={toggle} showFee />
         </div>
         <div className="form-row"><label>등록일</label>
           <input type="date" className="input" value={enrollmentDate} onChange={(e) => setEnrollmentDate(e.target.value)} /></div>
@@ -487,14 +561,16 @@ function ApproveModal({ application, classes, onClose, onDone }) {
         </label>
         <div className="modal-actions">
           <button className="btn ghost" onClick={onClose}>취소</button>
-          <button className="btn" onClick={submit} disabled={busy}>{busy ? "등록 중…" : "승인"}</button>
+          <button className="btn" onClick={submit} disabled={busy}>{busy ? "처리 중…" : linking ? "승인하고 연결" : "승인하고 새로 등록"}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function OcrMemberModal({ onClose, onSaved }) {
+function OcrMemberModal({ onClose, onSaved, classes = [] }) {
+  const [classIds, setClassIds] = useState(() => new Set());
+  const toggleClass = (id) => setClassIds((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   const [step, setStep] = useState("upload");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -575,7 +651,7 @@ function OcrMemberModal({ onClose, onSaved }) {
        return;
     }
     try {
-      await createMember({ ...formData, age: Number(formData.age) });
+      await createMemberChecked({ ...formData, age: Number(formData.age), class_ids: [...classIds] });
       onSaved();
     } catch (err) {
       setError(errorMessage(err, "학생 데이터 등록에 실패했습니다."));
@@ -697,6 +773,11 @@ function OcrMemberModal({ onClose, onSaved }) {
               <input className="input" value={formData.address} onChange={(e) => updateOcrData("address", e.target.value)} />
             </div>
 
+            <div className="form-row">
+              <label>수강 수업</label>
+              <ClassChips classes={classes} value={classIds} onToggle={toggleClass} />
+            </div>
+
             <div className="modal-actions" style={{ marginTop: "24px" }}>
               <button className="btn ghost" onClick={() => setStep("upload")}>다시 업로드</button>
               <button className="btn" onClick={submit} disabled={!formData.name || !formData.gender || !formData.age}>
@@ -711,8 +792,10 @@ function OcrMemberModal({ onClose, onSaved }) {
 }
 
 
-function MemberModal({ onClose, onSaved, member }) {
-  const isEdit = !!member; 
+function MemberModal({ onClose, onSaved, member, classes = [] }) {
+  const isEdit = !!member;
+  const [classIds, setClassIds] = useState(() => new Set());
+  const toggleClass = (id) => setClassIds((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
 
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
@@ -744,7 +827,7 @@ function MemberModal({ onClose, onSaved, member }) {
     setSubmitting(true); setErr(null);
     try {
       if (isEdit) await updateMember(member.member_id, { ...form, age: Number(form.age) });
-      else await createMember({ ...form, age: Number(form.age) });
+      else await createMemberChecked({ ...form, age: Number(form.age), class_ids: [...classIds] });
       onSaved();
     } catch (e) {
       setErr(errorMessage(e, "저장에 실패했습니다."));
@@ -870,6 +953,13 @@ function MemberModal({ onClose, onSaved, member }) {
           <label>주소</label>
           <input className="input" value={form.address} onChange={(e) => update("address", e.target.value)} />
         </div>
+
+        {!isEdit && (
+          <div className="form-row">
+            <label>수강 수업 <small className="muted" style={{ fontWeight: 400 }}>— 고르면 등록과 함께 바로 수강 등록 (나중에 '수업 관리'에서 바꿀 수 있어요)</small></label>
+            <ClassChips classes={classes} value={classIds} onToggle={toggleClass} />
+          </div>
+        )}
 
         <div className="modal-actions">
           <button className="btn ghost" onClick={onClose} disabled={submitting}>취소</button>

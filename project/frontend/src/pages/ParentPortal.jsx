@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
-  FACILITY_REQUIRED_EVENT, applyToFacility, assignmentFileUrl, cancelParentApplication, createChildProfile, createParentComment, likeParentComment,
+  FACILITY_REQUIRED_EVENT, applyToFacility, checkApplicationMatch, assignmentFileUrl, cancelParentApplication, createChildProfile, createParentComment, likeParentComment,
   createParentPost, deleteChildProfile, deleteParentAttachment, deleteParentComment, deleteParentPost, enterParentFacility, errorText,
   exitParentFacility, uploadParentAttachment,
   fetchChildProfiles, fetchFacilityDetail, fetchMe, fetchMyFacilities, fetchParentApplications, fetchParentAssignments,
@@ -327,6 +327,7 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [addingChild, setAddingChild] = useState(false);
+  const [matchPrompt, setMatchPrompt] = useState(null);     // v15: "이 학생이 맞습니까?" 후보 목록
 
   useEffect(() => {
     fetchFacilityDetail(facilityId).then(setF).catch((e) => setError(errorText(e, "학원 정보를 불러오지 못했습니다.")));
@@ -337,13 +338,16 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
   const estimate = (f?.classes || []).filter((c) => picked.has(c.class_id)).reduce((s, c) => s + (c.fee || 0), 0);
   const total = picked.size ? estimate : f?.base_tuition_fee || 0;
 
-  const apply = async () => {
-    if (!childId) return setError("신청할 자녀를 먼저 등록하세요.");
+  // v15: 신청 전에 학원이 먼저 등록해 둔 같은 학생이 있는지 확인 → 있으면 "이 학생이 맞습니까?"
+  const send = async (match) => {
     setBusy(true);
     setError("");
     try {
-      const res = await applyToFacility(facilityId, { child_id: Number(childId), class_ids: [...picked], message });
-      alert(`가입 신청을 보냈습니다.\n예상 월 비용 ${won(res.estimated_fee)} · 학원에서 승인하면 알림으로 알려 드립니다.`);
+      const res = await applyToFacility(facilityId, { child_id: Number(childId), class_ids: [...picked], message, ...(match || {}) });
+      setMatchPrompt(null);
+      alert(match?.match_answer === "YES"
+        ? "연결 요청을 보냈습니다.\n학원에서 확인하면 이미 등록된 학생 정보(출결·수강 기록)에 바로 연결됩니다."
+        : `가입 신청을 보냈습니다.\n예상 월 비용 ${won(res.estimated_fee)} · 학원에서 승인하면 알림으로 알려 드립니다.`);
       onApplied?.();
     } catch (e) {
       setError(errorText(e, "신청하지 못했습니다."));
@@ -351,9 +355,30 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
       setBusy(false);
     }
   };
+  const apply = async () => {
+    if (!childId) return setError("신청할 자녀를 먼저 등록하세요.");
+    setBusy(true);
+    setError("");
+    try {
+      const check = await checkApplicationMatch(facilityId, Number(childId));
+      if (check.already_linked) {
+        setError("이 자녀는 이미 이 학원 학생으로 연결되어 있습니다. 학원에 입장해 '우리 아이' 탭에서 확인하세요.");
+        return;
+      }
+      if (check.matches?.length) { setMatchPrompt(check.matches); return; }
+    } catch { /* 확인에 실패해도 신청은 진행 — 관리자가 승인할 때 한 번 더 확인 */ }
+    finally { setBusy(false); }
+    send(null);
+  };
 
+  const childName = childrenList.find((c) => String(c.child_id) === String(childId))?.name || "자녀";
   return (
     <div className="modal-backdrop" onClick={onClose}>
+      {matchPrompt && (
+        <MatchPrompt childName={childName} facilityName={f?.name} matches={matchPrompt} busy={busy}
+          onYes={(m) => send({ match_member_id: m.member_id, match_answer: "YES" })}
+          onNo={() => send({ match_answer: "NO" })} onCancel={() => setMatchPrompt(null)} />
+      )}
       <div className="modal" style={{ width: "min(640px,100%)" }} onClick={(e) => e.stopPropagation()}>
         {!f ? (error ? <div className="fl-banner danger">{error}</div> : <div className="fl-skeleton" style={{ height: 240 }} />) : (
           <>
@@ -419,6 +444,43 @@ function FacilityDetail({ facilityId, childrenList, onClose, onApplied, onEnter,
   );
 }
 const childList = (list) => list && list.length > 0;
+
+/* v15 "이 학생이 맞습니까?" — 학원이 먼저 등록해 둔 학생과 이름·학부모 연락처가 같을 때 */
+function MatchPrompt({ childName, facilityName, matches, busy, onYes, onNo, onCancel }) {
+  return (
+    <div className="modal-backdrop" style={{ zIndex: 2100 }} onClick={(e) => { e.stopPropagation(); onCancel(); }}>
+      <div className="modal" style={{ width: "min(440px,100%)" }} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="학생 확인">
+        <h3 style={{ marginTop: 0 }}>🔎 이 학생이 맞습니까?</h3>
+        <p style={{ fontSize: 13, color: "var(--text-2)", marginTop: 0, lineHeight: 1.6 }}>
+          {facilityName || "학원"}에 <b>{childName}</b>와(과) 이름·보호자 연락처가 같은 학생이 이미 등록되어 있어요.
+          우리 아이가 맞으면 새로 등록하지 않고 기존 기록(출결·수강·청구)에 연결합니다.
+        </p>
+        <div style={{ display: "grid", gap: 8 }}>
+          {matches.map((m) => (
+            <div key={m.member_id} className="pp-card" style={{ padding: 14, display: "grid", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 40, height: 40, borderRadius: "50%", background: "var(--primary-soft)", color: "var(--primary-text)",
+                  display: "grid", placeItems: "center", fontWeight: 800 }}>{m.name.charAt(0)}</div>
+                <div style={{ minWidth: 0 }}>
+                  <b style={{ fontSize: 15 }}>{m.name}</b>
+                  <div className="muted">{m.gender === "F" ? "여" : "남"} · {m.age}세{m.enrolled_since ? ` · ${m.enrolled_since.replace("-", "년 ")}월 등록` : ""}{m.status === "WITHDRAWN" ? " · 퇴원" : ""}</div>
+                  {m.classes.length > 0 && <div className="muted">수강: {m.classes.join(", ")}</div>}
+                </div>
+              </div>
+              <button type="button" className="btn" disabled={busy} style={{ justifyContent: "center" }} onClick={() => onYes(m)}>
+                {busy ? "보내는 중…" : "네, 우리 아이예요"}
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="modal-actions" style={{ marginTop: 12 }}>
+          <button type="button" className="btn ghost" onClick={onCancel} disabled={busy}>취소</button>
+          <button type="button" className="btn ghost" onClick={onNo} disabled={busy}>아니요, 다른 아이예요</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function ChildForm({ initial, onClose, onSaved }) {
   const [form, setForm] = useState(() => ({ ...EMPTY_CHILD, ...(initial || {}) }));
