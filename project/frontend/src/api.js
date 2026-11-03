@@ -71,6 +71,12 @@ export const fetchInvites = () => API.get("/api/invites").then(data);
 /** payload: {role: "parent"|"staff", expires_days: 1~30, max_uses?: number} */
 export const createInvite = (payload) => API.post("/api/invites", payload).then(data);
 export const revokeInvite = (inviteId) => API.delete(`/api/invites/${inviteId}`);
+// ----- v14 휴대폰 푸시 알림 (Web Push) — 학부모·관리자 공통 -----
+export const fetchPushConfig = () => API.get("/api/auth/push/config").then(data);
+/** subscription: PushSubscription.toJSON() 결과 {endpoint, keys:{p256dh, auth}} */
+export const subscribePush = (subscription, device = "") => API.post("/api/auth/push/subscribe", { ...subscription, device }).then(data);
+export const unsubscribePush = (endpoint) => API.post("/api/auth/push/unsubscribe", { endpoint }).then(data);
+export const testPush = (endpoint) => API.post("/api/auth/push/test", { endpoint }).then(data);
 export const fetchAdminAccounts = () => API.get("/api/admin/accounts").then(data);
 export const createAdminAccount = (payload) => API.post("/api/admin/accounts", payload).then(data);
 export const updateAdminAccount = (accountId, payload) => API.patch(`/api/admin/accounts/${accountId}`, payload).then(data);

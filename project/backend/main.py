@@ -25,7 +25,7 @@ import logging
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Optional, List, Union
+from typing import Optional, List, Tuple, Union
 from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 import requests  # 카카오페이 / Google / 쇼핑몰 REST 호출용
@@ -47,6 +47,10 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, D
 from sqlalchemy.pool import NullPool
 
 import shop_market as _shop_market   # noqa: E402  (제휴몰·상품 시드·과목 감지·가격 계산 — 순수 모듈)
+try:
+    import webpush as _webpush       # noqa: E402  (v14 휴대폰 푸시 알림 — RFC 8291/8292 순수 구현, cryptography 필요)
+except ImportError:                  # cryptography 가 없으면 푸시만 끄고 나머지는 정상 동작
+    _webpush = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("facility")
@@ -738,6 +742,21 @@ class FacilityInvite(TenantMixin, Base):
     expires_at = Column(TIMESTAMP, nullable=False, index=True)
     revoked    = Column(Boolean, nullable=False, default=False)
     created_at = Column(TIMESTAMP, default=_now, server_default=func.now())
+
+
+class PushSubscription(Base):
+    """v14: 휴대폰·PC 브라우저 푸시 구독 (기기 1대 = 1행). 학원과 무관하게 사용자 단위 — 어느 학원 알림이든 그 사람의 기기로 보냄."""
+    __tablename__ = "push_subscriptions"
+    sub_id        = Column(Integer, primary_key=True, autoincrement=True)
+    user_id       = Column(Integer, ForeignKey("app_users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    endpoint_hash = Column(String(64), nullable=False, unique=True)     # 긴 주소 대신 해시로 중복 확인
+    endpoint      = Column(Text, nullable=False)
+    p256dh        = Column(String(200), nullable=False)
+    auth          = Column(String(100), nullable=False)
+    device        = Column(String(120), nullable=False, default="")    # "Android · Chrome" 같은 표시용
+    failures      = Column(Integer, nullable=False, default=0)
+    created_at    = Column(TIMESTAMP, default=_now, server_default=func.now())
+    last_sent_at  = Column(TIMESTAMP)
 
 
 class AppMeta(Base):
@@ -1585,6 +1604,8 @@ _PUBLIC_API_PATHS = {
     "/api/auth/logout", "/api/auth/me", "/api/auth/role",
     # v13: 계정 설정·초대 코드는 역할(학부모/관리자) 선택 전에도 쓰므로 미들웨어 대신 핸들러가 로그인 세션을 직접 확인
     "/api/auth/profile", "/api/auth/invite/preview", "/api/auth/invite/redeem",
+    # v14: 휴대폰 알림 구독 — 학부모·관리자 공통이라 핸들러가 로그인 세션을 직접 확인 (config 는 공개키만 내려줌)
+    "/api/auth/push/config", "/api/auth/push/subscribe", "/api/auth/push/unsubscribe", "/api/auth/push/test",
     "/api/payments/kakao/status",
     "/api/payments/kakao-success", "/api/payments/kakao-cancel", "/api/payments/kakao-fail",
     "/api/cron/cleanup", "/api/health",
@@ -1943,7 +1964,9 @@ def _me_out(db: Session, session: UserSession, user: AppUser) -> dict:
         "can_create_facility": bool(account and account.role == "owner"),
         "can_edit_pricing": bool(account and account.email.lower() in PLATFORM_ADMIN_EMAILS),
         "is_platform_admin": bool(account and account.email.lower() in PLATFORM_ADMIN_EMAILS),
-        "facility": _facility_brief(facility, my_role) if facility else None,
+        # 성능: 학원 사진(최대 ~450KB)은 이 응답에서 빼고 '있는지'만 — 화면을 열 때마다 받는 응답이라 가볍게 유지
+        #       (사진이 필요한 학원 목록·학부모 요약·초대 확인 API 는 그대로 사진을 내려줌)
+        "facility": {**_facility_brief(facility, my_role), "logo": "", "has_logo": bool(facility.logo)} if facility else None,
     }
 
 
@@ -2294,6 +2317,245 @@ def redeem_invite(payload: InviteCodeIn, request: Request, db: Session = Depends
     db.commit()
     return {"me": _me_out(db, session, user), "target": target, "already_member": not joined,
             "facility_name": facility.name, "role": inv.role}
+
+
+# ---------------------------------------------------------------------
+# v14 휴대폰 푸시 알림 (Web Push 표준)
+#   흐름: 화면에서 '알림 켜기' → 브라우저가 푸시 주소+키 발급 → /api/auth/push/subscribe 로 저장
+#         → 알림(notifications) 행이 DB 에 '커밋되면' 그 사용자의 모든 기기로 암호화해서 발송 (_after_commit_push)
+#   - 이벤트 발행은 커밋 성공 이후에만 (롤백되면 보내지 않음)
+#   - 앱이 열려 있으면 서비스 워커가 OS 알림을 생략하고 화면 안 토스트만 (중복 방지)
+#   - VAPID 키: 환경변수(VAPID_PRIVATE_KEY) 우선, 없으면 처음 한 번 만들어 DB(app_meta)에 저장 → 설정 없이 바로 동작
+#   - SSRF 방지: 서버가 POST 하는 주소이므로 알려진 브라우저 푸시 서비스 도메인만 허용
+# ---------------------------------------------------------------------
+PUSH_ENABLED = os.getenv("PUSH_ENABLED", "true").lower() == "true" and _webpush is not None
+VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:push@ssukssuk.kr").strip()
+PUSH_MAX_PER_COMMIT = 200          # 공지 전체 발송 등 대량 알림도 요청이 너무 길어지지 않도록 상한
+PUSH_HOST_SUFFIXES = (".googleapis.com", ".mozilla.com", ".mozaws.net", ".push.apple.com", ".notify.windows.com")
+_vapid_cache: dict = {}
+
+
+def _vapid_keys(db: Optional[Session] = None) -> Optional[Tuple[str, str]]:
+    """(비공개키, 공개키). 처음 호출 때 env → DB → 새로 생성 순으로 정하고 캐시"""
+    if not PUSH_ENABLED:
+        return None
+    if "keys" in _vapid_cache:
+        return _vapid_cache["keys"]
+    env_private = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+    if env_private:
+        _vapid_cache["keys"] = (env_private, _webpush.public_key_of(env_private))
+        return _vapid_cache["keys"]
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        row = db.query(AppMeta).filter(AppMeta.meta_key == "vapid_private").first()
+        if not row:
+            private, public = _webpush.generate_vapid_keys()
+            try:
+                db.add(AppMeta(meta_key="vapid_private", meta_value=private))
+                db.commit()
+            except Exception:          # 동시에 두 서버가 만들었으면 먼저 저장된 키를 사용
+                db.rollback()
+            row = db.query(AppMeta).filter(AppMeta.meta_key == "vapid_private").first()
+        _vapid_cache["keys"] = (row.meta_value, _webpush.public_key_of(row.meta_value))
+        return _vapid_cache["keys"]
+    finally:
+        if own:
+            db.close()
+
+
+def _push_target_url(n: dict) -> str:
+    """알림을 누르면 열 주소 — /open 화면이 학원을 맞춰 들어간 뒤 해당 화면으로 이동"""
+    from urllib.parse import urlencode
+    params = {"a": n["audience"], "f": n.get("facility_id") or "", "k": n.get("kind") or "", "l": n.get("link") or "",
+              "m": n.get("member_id") or ""}
+    return "/open?" + urlencode({k: v for k, v in params.items() if v != ""})
+
+
+def _send_push(jobs: List[tuple], db: Session) -> dict:
+    """[(구독, payload dict)] 병렬 발송. 만료(404/410)·반복 실패 구독은 정리"""
+    keys = _vapid_keys(db)
+    if not keys or not jobs:
+        return {"sent": 0, "failed": 0}
+    from concurrent.futures import ThreadPoolExecutor
+    private, _ = keys
+    jobs = jobs[:PUSH_MAX_PER_COMMIT]
+
+    def one(job):
+        sub, payload = job
+        try:
+            return _webpush.send({"endpoint": sub.endpoint, "p256dh": sub.p256dh, "auth": sub.auth},
+                                 payload, private, VAPID_SUBJECT, timeout=5)
+        except Exception as exc:       # 네트워크 오류 등 — 다른 기기 발송은 계속
+            logger.warning("푸시 발송 실패(sub=%s): %s", sub.sub_id, exc)
+            return 0
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = list(pool.map(one, jobs))
+    sent = failed = 0
+    outcome: dict = {}                 # 기기별 최종 결과 (한 기기에 여러 건 보낸 경우 하나라도 성공하면 성공)
+    for (sub, _), status in zip(jobs, statuses):
+        if 200 <= status < 300:
+            sent += 1
+            outcome[sub.sub_id] = (sub, "ok")
+        else:
+            failed += 1
+            if status in (400, 401, 403):
+                logger.warning("푸시 서버가 요청을 거부했습니다(status=%s) — VAPID 키·구독을 확인하세요.", status)
+            if outcome.get(sub.sub_id, (None, ""))[1] != "ok":
+                outcome[sub.sub_id] = (sub, "gone" if status in (404, 410) else "fail")
+    for sub, result in outcome.values():
+        if result == "ok":
+            sub.failures, sub.last_sent_at = 0, _now()
+        elif result == "gone":         # 사용자가 알림을 끄거나 앱을 지움 → 구독 삭제
+            db.delete(sub)
+        else:
+            sub.failures = (sub.failures or 0) + 1
+            if sub.failures >= 5:
+                db.delete(sub)
+    db.commit()
+    return {"sent": sent, "failed": failed}
+
+
+def _dispatch_notification_push(items: List[dict]) -> None:
+    """커밋된 알림들을 받는 사람의 기기로 발송 (요청과 별도 DB 세션)"""
+    db = SessionLocal()
+    try:
+        user_ids = {n["user_id"] for n in items}
+        subs = db.query(PushSubscription).filter(PushSubscription.user_id.in_(user_ids)).all()
+        if not subs:
+            return
+        facility_ids = {n["facility_id"] for n in items if n.get("facility_id")}
+        names = dict(db.query(Facility.facility_id, Facility.name).filter(Facility.facility_id.in_(facility_ids or {-1}))
+                       .execution_options(all_facilities=True).all())
+        by_user: dict = {}
+        for n in items:
+            by_user.setdefault(n["user_id"], []).append(n)
+        jobs = []
+        for sub in subs:
+            for n in by_user.get(sub.user_id, [])[-3:]:      # 한 번에 몰리면 사람당 최근 3건만
+                facility = names.get(n.get("facility_id"), "")
+                jobs.append((sub, {
+                    "title": n["title"][:120],
+                    "body": (f"{facility} · " if facility else "") + (n.get("body") or "")[:240],
+                    "url": _push_target_url(n), "tag": f"n{n['notification_id']}", "kind": n.get("kind"),
+                    "facility": facility, "audience": n["audience"],
+                }))
+        result = _send_push(jobs, db)
+        if result["sent"] or result["failed"]:
+            logger.info("푸시 알림 발송: %s", result)
+    except Exception as exc:
+        logger.error("푸시 알림 처리 실패: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
+
+
+@event.listens_for(Session, "after_flush")
+def _collect_push(session, flush_context):
+    if not PUSH_ENABLED:
+        return
+    for obj in session.new:
+        if isinstance(obj, Notification):
+            session.info.setdefault("push_queue", []).append({
+                "notification_id": obj.notification_id, "user_id": obj.user_id, "audience": obj.audience,
+                "kind": obj.kind, "title": obj.title, "body": obj.body, "link": obj.link,
+                "member_id": obj.member_id, "facility_id": obj.facility_id})
+
+
+@event.listens_for(Session, "after_commit")
+def _after_commit_push(session):
+    queue = session.info.pop("push_queue", None)
+    if queue:
+        _dispatch_notification_push(queue)
+
+
+@event.listens_for(Session, "after_rollback")
+def _clear_push(session):
+    session.info.pop("push_queue", None)
+
+
+class PushKeys(BaseModel):
+    p256dh: str = Field(min_length=80, max_length=200)
+    auth: str = Field(min_length=16, max_length=100)
+
+
+class PushSubscribeIn(BaseModel):
+    endpoint: str = Field(min_length=20, max_length=1000)
+    keys: PushKeys
+    device: str = Field("", max_length=120)
+
+    @field_validator("endpoint")
+    @classmethod
+    def _known_push_service(cls, v):
+        from urllib.parse import urlparse
+        u = urlparse(v)
+        host = (u.hostname or "").lower()
+        if u.scheme != "https" or not any(host == s.lstrip(".") or host.endswith(s) for s in PUSH_HOST_SUFFIXES):
+            raise ValueError("지원하지 않는 푸시 서비스 주소입니다.")
+        return v
+
+
+class PushEndpointIn(BaseModel):
+    endpoint: str = Field(min_length=20, max_length=1000)
+
+
+@app.get("/api/auth/push/config")
+def push_config(db: Session = Depends(get_db)):
+    keys = _vapid_keys(db)
+    return {"enabled": bool(keys), "public_key": keys[1] if keys else None}
+
+
+@app.post("/api/auth/push/subscribe")
+def push_subscribe(payload: PushSubscribeIn, request: Request, db: Session = Depends(get_db)):
+    _, user = _session_from_request(request, db)
+    if not _vapid_keys(db):
+        raise HTTPException(503, "이 서버에서는 휴대폰 알림을 쓸 수 없습니다.")
+    digest = hashlib.sha256(payload.endpoint.encode()).hexdigest()
+    sub = db.query(PushSubscription).filter(PushSubscription.endpoint_hash == digest).first()
+    if not sub:
+        if db.query(func.count(PushSubscription.sub_id)).filter(PushSubscription.user_id == user.user_id).scalar() >= 10:
+            oldest = (db.query(PushSubscription).filter(PushSubscription.user_id == user.user_id)
+                        .order_by(PushSubscription.created_at.asc()).first())
+            db.delete(oldest)              # 한 사람 기기는 최대 10대 — 가장 오래된 기기부터 정리
+        sub = PushSubscription(endpoint_hash=digest, endpoint=payload.endpoint)
+        db.add(sub)
+    sub.user_id = user.user_id             # 같은 기기에서 다른 계정으로 로그인했으면 새 계정으로 옮김
+    sub.p256dh, sub.auth = payload.keys.p256dh, payload.keys.auth
+    sub.device, sub.failures = payload.device.strip()[:120], 0
+    db.commit()
+    return {"ok": True, "devices": db.query(func.count(PushSubscription.sub_id))
+            .filter(PushSubscription.user_id == user.user_id).scalar()}
+
+
+@app.post("/api/auth/push/unsubscribe")
+def push_unsubscribe(payload: PushEndpointIn, request: Request, db: Session = Depends(get_db)):
+    """이 기기 알림 끄기 (로그아웃 때도 호출 — 공용 기기에 다른 사람 알림이 오지 않도록)"""
+    raw = request.cookies.get(AUTH_COOKIE_NAME)
+    session, user = _resolve_user_session(db, raw)
+    digest = hashlib.sha256(payload.endpoint.encode()).hexdigest()
+    query = db.query(PushSubscription).filter(PushSubscription.endpoint_hash == digest)
+    if user:
+        query = query.filter(PushSubscription.user_id == user.user_id)
+    removed = query.delete(synchronize_session=False)
+    db.commit()
+    return {"removed": removed}
+
+
+@app.post("/api/auth/push/test")
+def push_test(payload: PushEndpointIn, request: Request, db: Session = Depends(get_db)):
+    """이 기기로 테스트 알림 1건"""
+    _, user = _session_from_request(request, db)
+    digest = hashlib.sha256(payload.endpoint.encode()).hexdigest()
+    sub = (db.query(PushSubscription)
+             .filter(PushSubscription.endpoint_hash == digest, PushSubscription.user_id == user.user_id).first())
+    if not sub:
+        raise HTTPException(404, "이 기기는 아직 알림이 켜져 있지 않습니다.")
+    result = _send_push([(sub, {"title": "🔔 알림 테스트", "url": "/", "tag": "push-test",
+                                "body": "휴대폰 알림이 잘 도착했어요. 출결·결제·공지 알림이 이렇게 옵니다."})], db)
+    if not result["sent"]:
+        raise HTTPException(502, "테스트 알림을 보내지 못했습니다. 알림을 껐다가 다시 켜 보세요.")
+    return result
 
 
 @app.get("/api/admin/accounts")
@@ -9133,7 +9395,7 @@ def cron_cleanup(request: Request, db: Session = Depends(get_db)):
 #     (v8 까지는 매 콜드 스타트마다 스키마 조회 + ALTER 를 실행해 첫 요청이 느리고 잠금이 생길 수 있었음)
 #   권장: Supabase SQL Editor 에서 저장소 루트의 setup.sql 을 한 번 실행.
 # ---------------------------------------------------------------------
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 
 
 def _tenant_tables() -> List[str]:

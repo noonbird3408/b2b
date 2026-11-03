@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useOutletContext, useSearchParams } from "react-router-dom";
 import {
   cancelShopOrder, connectShopMall, createShopOrder, createShopProduct, deactivateShopProduct, disconnectShopMall, errorText,
   fetchMe, fetchShopInfo, fetchShopMalls, fetchShopOrders, fetchShopProducts, fetchShopRecommendations, logShopClick,
@@ -40,7 +40,11 @@ const SHOP_CSS = `
 .shop-reasons{margin:4px 0 0;padding:0;list-style:none;display:grid;gap:3px;}
 .shop-reasons li{font-size:11px;color:var(--text-2);padding-left:14px;position:relative;line-height:1.5;}
 .shop-reasons li:before{content:"✓";position:absolute;left:0;color:var(--success);font-weight:700;}
-.shop-foot{display:flex;align-items:flex-end;justify-content:space-between;gap:8px;padding:10px 14px 12px;border-top:1px solid var(--border);}
+.shop-foot{display:grid;gap:8px;padding:10px 14px 12px;border-top:1px solid var(--border);}
+.shop-buy{display:flex;align-items:center;gap:6px;}
+.shop-buy .btn{flex:1;justify-content:center;min-width:0;height:32px;}
+.shop-buy .shop-qty input{width:34px;}
+.tabs button .cnt{display:inline-grid;place-items:center;min-width:18px;height:18px;padding:0 5px;margin-left:5px;border-radius:9px;background:var(--danger);color:#fff;font-size:11px;font-weight:700;}
 .shop-price{font-weight:800;font-size:15px;font-variant-numeric:tabular-nums;}
 .shop-list{font-size:12px;color:var(--text-3);text-decoration:line-through;margin-right:4px;}
 .shop-member{font-size:11.5px;color:var(--success-text,#15803D);font-weight:700;}
@@ -153,7 +157,7 @@ const SHOP_CSS = `
 `;
 
 const TABS = [["home", "쇼핑"], ["malls", "제휴몰"], ["cart", "장바구니"], ["orders", "주문 내역"]];
-const NAV_TABS = TABS.filter(([k]) => k !== "cart");   // 장바구니는 오른쪽 아래 버튼으로 이동
+const NAV_TABS = TABS;   // 장바구니는 탭 + 오른쪽 아래 버튼 둘 다로 열 수 있음
 const ICONS = { "교재": "📘", "문구·사무": "✏️", "수업 교구": "🧩", "미술·음악": "🎨", "체육·무도 용품": "🥋", "상장·기념품": "🏅", "단체복·굿즈": "🧥" };
 const ORDER_TONE = { PENDING_APPROVAL: "warning", PENDING_PAYMENT: "primary", PAID: "primary", RECEIVED: "success", CANCELED: "gray" };
 const MATCH_LABEL = { name: "상품명", tags: "태그", category: "분류", description: "설명" };
@@ -227,6 +231,9 @@ function QtyInput({ value, onChange, min = 1, onRemove }) {
 function ProductCard({ product, context, onAdd, onDetail }) {
   const color = product.mall?.color || "#64748B";
   const open = () => onDetail(product, context);
+  const minQty = product.min_quantity || 1;
+  const [qty, setQty] = useState(minQty);
+  const stop = (e) => e.stopPropagation();          // 수량·담기 조작이 카드 클릭(상세 열기)으로 번지지 않도록
   return (
     <article className="shop-card" role="button" tabIndex={0} onClick={open}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } }} aria-label={`${product.name} 상세 보기`}>
@@ -243,8 +250,11 @@ function ProductCard({ product, context, onAdd, onDetail }) {
       <div className="shop-foot">
         <PriceBlock product={product} />
         {product.purchasable && (
-          <button className="btn sm" type="button" aria-label={`${product.name} 담기`}
-            onClick={(e) => { e.stopPropagation(); onAdd(product, product.min_quantity || 1, context); }}>담기</button>
+          <div className="shop-buy" onClick={stop} onKeyDown={stop}>
+            <QtyInput value={qty} onChange={setQty} min={minQty} />
+            <button className="btn sm" type="button" aria-label={`${product.name} ${qty}${product.unit || "개"} 담기`}
+              onClick={() => { onAdd(product, qty, context); setQty(minQty); }}>담기</button>
+          </div>
         )}
       </div>
     </article>
@@ -386,7 +396,10 @@ export default function Shop() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = TABS.some(([k]) => k === searchParams.get("tab")) ? searchParams.get("tab") : "home";
   const setTab = (next) => setSearchParams(next === "home" ? {} : { tab: next }, { replace: true });
-  const [me, setMe] = useState(null);
+  // 관리자 화면(Layout)이 이미 확인한 로그인 정보를 그대로 사용 — 쇼핑몰을 열 때마다 /api/auth/me 를 다시 부르지 않음
+  const outlet = useOutletContext() || {};
+  const [fallbackMe, setMe] = useState(null);
+  const me = outlet.me || fallbackMe;
   const [info, setInfo] = useState({ name: "DDM", base_url: "https://ddmmall77.com", categories: [] });
   const [recs, setRecs] = useState(null);
   const [malls, setMalls] = useState(null);
@@ -441,7 +454,7 @@ export default function Shop() {
   };
 
   useEffect(() => {
-    fetchMe().then(setMe).catch(() => navigate("/"));
+    if (!outlet.me) fetchMe().then(setMe).catch(() => navigate("/"));
     fetchShopInfo().then(setInfo).catch(() => {});
     loadRecommendations();
     loadMalls();
@@ -504,7 +517,9 @@ export default function Shop() {
 
       <div className="tabs">
         {NAV_TABS.map(([k, v]) => (
-          <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>{v}</button>
+          <button key={k} className={tab === k ? "active" : ""} onClick={() => setTab(k)}>
+            {k === "cart" ? "🛒 " : ""}{v}{k === "cart" && cartCount > 0 && <span className="cnt" aria-label={`${cartCount}개`}>{cartCount}</span>}
+          </button>
         ))}
       </div>
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { errorText, updateProfile } from "../api";
 import { resizeImageFile } from "../utils/image";
+import PushSettings from "./PushSettings.jsx";
 
 // =====================================================================
 // v13 계정 설정 — 앱에서 쓰는 이름·프로필 사진 (학부모·관리자 공통)
@@ -135,6 +136,10 @@ export default function AccountModal({ me, onClose, onSaved, roleHint }) {
           <button type="button" className="btn ghost sm" onClick={onClose} aria-label="닫기">✕</button>
         </div>
         <AccountForm me={me} onSaved={onSaved} roleHint={roleHint} />
+        <section style={{ marginTop: 18, paddingTop: 16, borderTop: "1px solid var(--border)" }}>
+          <h4 style={{ margin: "0 0 10px", fontSize: 14 }}>📱 휴대폰 알림</h4>
+          <PushSettings compact />
+        </section>
       </div>
     </div>
   );

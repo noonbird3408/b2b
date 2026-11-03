@@ -16,6 +16,8 @@ import { DAY_LABELS, STATUS_LABEL, STATUS_TONE, announceDataChanged, won } from 
 import Checkout from "./Checkout";
 import AccountModal, { UserAvatar } from "../components/AccountSettings.jsx";
 import JoinByCode from "../components/JoinByCode.jsx";
+import { PushNudge } from "../components/PushSettings.jsx";
+import { PUSH_EVENT, forgetPushOnThisDevice, syncPushSubscription } from "../utils/push";
 
 /* =====================================================================
    학부모 포털
@@ -121,6 +123,7 @@ export default function ParentPortal() {
     .catch(() => { navigate("/", { replace: true }); return null; }), [navigate]);
 
   useEffect(() => { reloadMe(); }, [reloadMe]);
+  useEffect(() => { if (me) syncPushSubscription(); }, [me?.user?.email]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const onRequired = () => reloadMe();       // 강퇴·학원 삭제 등으로 학원 접근이 끊기면 허브로
     window.addEventListener(FACILITY_REQUIRED_EVENT, onRequired);
@@ -128,6 +131,7 @@ export default function ParentPortal() {
   }, [reloadMe]);
 
   const logout = async () => {
+    await forgetPushOnThisDevice();      // 공용 기기에 이전 계정 알림이 계속 오지 않도록
     try { await signOut(); } finally { navigate("/", { replace: true }); }
   };
 
@@ -579,7 +583,10 @@ function FacilityHome({ me, onExit, onLogout, onReload, onMeChange }) {
     loadKids();
     refreshSummary();
     fetchChildProfiles().then(setChildProfiles).catch(() => setChildProfiles([]));
-    return startVisiblePolling(refreshSummary, 7000);
+    const onPush = () => refreshSummary();       // 앱을 보고 있을 때 휴대폰 알림 도착 → 바로 갱신
+    window.addEventListener(PUSH_EVENT, onPush);
+    const stop = startVisiblePolling(refreshSummary, 7000);
+    return () => { stop(); window.removeEventListener(PUSH_EVENT, onPush); };
   }, [loadKids, refreshSummary]);
 
   const openPanel = async () => {
@@ -622,6 +629,7 @@ function FacilityHome({ me, onExit, onLogout, onReload, onMeChange }) {
         </div>
         {panelOpen && (
           <div className="notif-panel" role="dialog" aria-label="알림">
+            <PushNudge />
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
               <b>알림</b>
               {unread > 0 && <button className="btn ghost sm" onClick={readAll}>모두 읽음</button>}

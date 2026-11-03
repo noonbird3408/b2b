@@ -1,11 +1,24 @@
 {
+  "id": "/",
   "name": "쑥쑥 · 학원 운영 도우미",
   "short_name": "쑥쑥",
   "description": "학원 운영 도우미 — 출결 알림, 수납, 학부모 소통, 재고·물품 구매",
-  "start_url": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#0f172a",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
   "theme_color": "#3B82F6",
   "lang": "ko",
-  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+  "categories": ["education", "productivity"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "shortcuts": [
+    { "name": "출석 체크", "url": "/attendances", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] },
+    { "name": "학부모 포털", "url": "/parentportal", "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }] }
+  ]
 }

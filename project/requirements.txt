@@ -12,3 +12,5 @@ requests>=2.31.0
 google-genai>=1.0.0
 tzdata>=2024.1
 apscheduler>=3.10.0
+# 휴대폰 푸시 알림(Web Push 암호화·VAPID 서명)
+cryptography>=42.0

@@ -13,6 +13,7 @@ import Brand from "./Brand.jsx";
 import AccountModal, { UserAvatar } from "./AccountSettings.jsx";
 import JoinByCode from "./JoinByCode.jsx";
 import { resizeImageFile } from "../utils/image";
+import { PUSH_EVENT, forgetPushOnThisDevice, syncPushSubscription } from "../utils/push";
 
 // =====================================================================
 // 메인(/) : 로그인 → 역할 선택(학부모/관리자) → 관리자는 학원 선택·생성·수정·삭제
@@ -373,7 +374,10 @@ function useAllFacilityNotifications(enabled) {
   useEffect(() => {
     if (!enabled) return undefined;
     refresh();
-    return startVisiblePolling(refresh, MAIN_NOTIFY_INTERVAL);
+    syncPushSubscription();
+    window.addEventListener(PUSH_EVENT, refresh);
+    const stop = startVisiblePolling(refresh, MAIN_NOTIFY_INTERVAL);
+    return () => { stop(); window.removeEventListener(PUSH_EVENT, refresh); };
   }, [enabled, refresh]);
   return [state, refresh, setState];
 }
@@ -631,6 +635,7 @@ export default function FacilityManagerUI() {
     setScreen("facilities");
   }, "관리자 권한을 확인하지 못했습니다.");
   const handleLogout = () => run(async () => {
+    await forgetPushOnThisDevice();
     try { await signOut(); } finally {
       window.google?.accounts?.id?.disableAutoSelect?.();
       ["app_academy_info", "app_payment_settings", "dashboard_notified_keys"].forEach((k) => { try { localStorage.removeItem(k); } catch { /* 무시 */ } });

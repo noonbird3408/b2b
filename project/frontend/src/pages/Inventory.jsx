@@ -4,7 +4,7 @@
 //   지표: 부족 = 현재 수량 ≤ 안전 재고, 품절 = 0, 권장 구매 수량 = 안전 재고 × 2 − 현재 수량
 // =====================================================================
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams, useOutletContext } from "react-router-dom";
 import {
   adjustInventory, cancelPurchaseRequest, createInventoryItem, createPurchaseRequest, decidePurchaseRequest, deleteInventoryItem,
   errorText, fetchB2BProducts, fetchInventory, fetchInventoryLogs, fetchMe, fetchPurchaseCheck, fetchPurchaseRequests,
@@ -54,7 +54,9 @@ export default function Inventory() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = TABS.some(([k]) => k === searchParams.get("tab")) ? searchParams.get("tab") : "stock";
-  const [me, setMe] = useState(null);
+  const outlet = useOutletContext() || {};          // 관리자 화면이 이미 확인한 로그인 정보 재사용
+  const [fallbackMe, setMe] = useState(null);
+  const me = outlet.me || fallbackMe;
   const [data, setData] = useState(null);
   const [check, setCheck] = useState(null);
   const [requests, setRequests] = useState(null);
@@ -70,7 +72,7 @@ export default function Inventory() {
   const [busy, setBusy] = useState(false);
   const isOwner = me?.facility?.my_role === "owner";
 
-  useEffect(() => { fetchMe().then(setMe).catch(() => navigate("/")); }, [navigate]);
+  useEffect(() => { if (!outlet.me) fetchMe().then(setMe).catch(() => navigate("/")); }, [navigate, outlet.me]);
   const setTab = (next) => setSearchParams(next === "stock" ? {} : { tab: next }, { replace: true });
 
   const loadStock = useCallback(() => fetchInventory({ q: q || undefined, category: category === "전체" ? undefined : category, status: status || undefined })

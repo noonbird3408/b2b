@@ -12,6 +12,8 @@ import Brand from "./Brand.jsx";
 import SubjectPicker from "./SubjectPicker.jsx";
 import { AccountForm, UserAvatar } from "./AccountSettings.jsx";
 import InviteManager from "./InviteManager.jsx";
+import PushSettings, { PushNudge } from "./PushSettings.jsx";
+import { PUSH_EVENT, forgetPushOnThisDevice, syncPushSubscription } from "../utils/push";
 import { BRAND } from "../utils/brand";
 
 const SETTINGS_STYLES = `
@@ -184,6 +186,16 @@ export default function Layout() {
     }
   }, [refreshSummary]);
 
+  // v14: 이미 알림을 허용한 기기면 지금 계정으로 조용히 다시 연결
+  useEffect(() => { if (me) syncPushSubscription(); }, [me?.user?.email]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // v14: 앱을 보고 있을 때 휴대폰 알림이 도착 → OS 알림 대신 화면을 바로 갱신(토스트 포함)
+  useEffect(() => {
+    const onPush = () => { refreshSummary(); checkVersion(); };
+    window.addEventListener(PUSH_EVENT, onPush);
+    return () => window.removeEventListener(PUSH_EVENT, onPush);
+  }, [refreshSummary, checkVersion]);
+
   useEffect(() => {
     if (!me) return undefined;
     refreshSummary();
@@ -306,6 +318,7 @@ export default function Layout() {
   };
 
   const handleLogout = async () => {
+    await forgetPushOnThisDevice();      // 공용 기기에 이전 계정 알림이 계속 오지 않도록
     try { await signOut(); } catch { /* 이미 만료된 세션 */ }
     ["app_academy_info", "app_payment_settings", "dashboard_todos", "dashboard_notifications", "dashboard_notified_keys"]
       .forEach((key) => { try { localStorage.removeItem(key); } catch { /* 무시 */ } });
@@ -454,7 +467,7 @@ export default function Layout() {
   const visibleMenu = isOwner ? menuOrder : menuOrder.filter((item) => STAFF_PATHS.includes(item.to));
   const menuHasBadge = visibleMenu.some((item) => NAV_BADGES[item.id] && NAV_BADGES[item.id](summary?.badges || {}) > 0);
   const setA = (key) => (e) => setAcademyInfo((prev) => ({ ...prev, [key]: e.target.type === "checkbox" ? e.target.checked : e.target.value }));
-  const tabs = isOwner ? ["화면", "내 계정", "기관 정보", "수납", "직원 계정", "초대", "데이터"] : ["화면", "내 계정"];
+  const tabs = isOwner ? ["화면", "내 계정", "알림", "기관 정보", "수납", "직원 계정", "초대", "데이터"] : ["화면", "내 계정", "알림"];
 
   return (
     <div className="app-shell app-shell-responsive">
@@ -509,6 +522,7 @@ export default function Layout() {
               </button>
               {isDropdownOpen && (
                 <div className="notification-dropdown">
+                  <PushNudge onOpenSettings={() => { setIsDropdownOpen(false); openSettings("알림"); }} />
                   <div className="notification-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                     <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
                       <span className="fac-dot" style={{ background: facilityColor(facility.facility_id) }} />
@@ -626,6 +640,16 @@ export default function Layout() {
               )}
 
               {activeTab === "초대" && isOwner && <InviteManager />}
+
+              {activeTab === "알림" && (
+                <div style={{ display: "grid", gap: 12 }}>
+                  <section className="settings-section">
+                    <h4>휴대폰 알림</h4>
+                    <p>기기마다 따로 켭니다. 원장·직원 모두 자기 휴대폰에서 켜 두면 등원·결제·가입 신청 같은 알림을 바로 받을 수 있어요.</p>
+                    <PushSettings />
+                  </section>
+                </div>
+              )}
 
               {activeTab === "기관 정보" && (academyInfo ? (
                 <div>

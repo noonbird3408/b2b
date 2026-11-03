@@ -254,6 +254,7 @@ def quote(lines: List[dict], connected: Iterable[str]) -> dict:
         line_total = unit_price * qty
         g["items"].append({**{k: line.get(k) for k in line if k != "product"},
                            "product_id": p["product_id"], "name": p["name"], "unit": p.get("unit") or "개",
+                           "min_quantity": max(1, p.get("min_quantity") or 1),   # 장바구니 수량 조절 하한
                            "quantity": qty, "list_price": list_unit, "price": int(p["price"]), "unit_price": unit_price,
                            "discount_rate": discount_rate(list_unit, unit_price), "line_total": line_total,
                            "list_total": list_unit * qty})
