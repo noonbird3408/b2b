@@ -1,3 +1,6 @@
+# 쑥쑥 — 학원 운영 도우미
+
+React·Vite 프론트엔드와 FastAPI·SQLAlchemy 백엔드로 구성됩니다. [설치·배포·테스트 안내](project/README.md)는 project/ 폴더를 기준으로 작성했습니다.
 
 ## 주요 기능 및 서비스 화면
 
@@ -12,8 +15,6 @@
 ---
 
 ### 01. 통합 대시보드 (Dashboard)
-
-![통합 대시보드](./assets/dashboard.png)
 
 **기능 개요**
 
@@ -48,8 +49,6 @@
 
 ### 02. 학생 통합 관리 (Student Management)
 
-![학생 관리 화면](./assets/students.png)
-
 **기능 개요**
 
 시설에 등록된 학생의 기본 정보와 수업,
@@ -80,8 +79,6 @@
 ---
 
 ### 03. 교육 물품 쇼핑몰 (Shopping Mall)
-
-![쇼핑몰 화면](./assets/shopping.png)
 
 **기능 개요**
 
@@ -118,8 +115,6 @@
 ---
 
 ### 04. 교육 물품 재고 관리 (Inventory Management)
-
-![재고 관리 화면](./assets/inventory.png)
 
 **기능 개요**
 
