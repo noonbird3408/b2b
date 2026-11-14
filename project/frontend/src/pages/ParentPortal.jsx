@@ -769,14 +769,16 @@ function ChildAttendance({ child }) {
   const byClass = useMemo(() => {
     const items = att?.items || [];
     if (!items.length) return [];
-    const map = {};
-    items.forEach((a) => {
-      if (!a.class_name) return;
-      map[a.class_name] = map[a.class_name] || { total: 0, ok: 0 };
-      map[a.class_name].total += 1;
-      if (a.status !== "ABSENT") map[a.class_name].ok += 1;
-    });
-    const all = { total: items.length, ok: items.filter((a) => a.status !== "ABSENT").length, isTotal: true };
+    const map = Object.create(null);
+    const all = { total: items.length, ok: 0, isTotal: true };
+    for (const record of items) {
+      const attended = Number(record.status !== "ABSENT");
+      all.ok += attended;
+      if (!record.class_name) continue;
+      const counts = (map[record.class_name] ??= { total: 0, ok: 0 });
+      counts.total += 1;
+      counts.ok += attended;
+    }
     const classes = Object.entries(map);
     // 수업이 하나뿐이고 모든 기록이 그 수업이면 '전체'와 같으므로 수업 막대만
     return classes.length === 1 && classes[0][1].total === all.total ? classes : [["전체", all], ...classes];
